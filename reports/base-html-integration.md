@@ -62,6 +62,14 @@ Two independent reviews followed: one of the core, and one of the `base-html` mi
 | The adapter duplicated core defaults, and nothing tested standalone manifests or command and task equivalence. | Defaults are resolved only in the core; the adapter's tests cover both. |
 | Layout, such as environment size and executable path, can bias every process of one subject the same way. | A cleared environment, equal-length staged paths, seeded stack padding, several replicas, and an exact sign test. Stabilizer-style runtime re-randomization and Coz causal profiling are deferred; see [architecture](../context/architecture.md). |
 
+### Screening with layout controls
+
+On the same host, with the workstation still in use, the `list` scenario was re-run with two layout replicas, seven rounds, seed 20261107, pinned to CPU 2, and stack padding enabled. As before, this is tooling evidence only.
+
+- Every variant comparison, in the baseline and both replicas, moved both ways across rounds. Medians were +0.1% to +0.4% and sign tests 0.45 to 1.0, and each was warned about as inconclusive.
+- User and system CPU time were reported as below resolution in every round, rather than as percentages.
+- 6 of 21 `reference` processes ran at about 19.7 µs per operation against a median of about 16.0; no `engine` process did. The slow processes appeared in the baseline and in both replicas, and showed no simple relation to the padding length, which ASLR also offsets. With padding, the effect is spread across subjects instead of being fixed to one build.
+
 ## Remaining limits
 
 - `base-html` and `bake-benchmark` depend on `base-benchmark`, and `base-html` on `bake-benchmark`, through local path dependencies outside their repositories. Cargo loads every workspace member, so `base-html`'s own CI and publishing fail until these become pinned Git dependencies or crates.io releases.

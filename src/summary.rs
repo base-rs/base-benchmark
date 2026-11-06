@@ -635,8 +635,10 @@ fn report_pair_metric(text: &mut String, metric: &PairMetric) {
         ),
         (_, None, None) => return,
     };
+    // With no round better or worse, the test says nothing; omit it.
     let sign = metric
         .sign_test_p
+        .filter(|_| metric.improved + metric.regressed > 0)
         .map(|p| format!(", sign test p={p:.3}"))
         .unwrap_or_default();
     let unresolved = if metric.unresolved > 0 && metric.unit != Unit::Count {

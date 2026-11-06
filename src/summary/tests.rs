@@ -533,3 +533,43 @@ fn smoke_summaries_contain_no_comparisons() {
     assert!(report.contains("pair comparisons are omitted from smoke reports"));
     assert!(!report.contains("-50.00%"));
 }
+
+#[test]
+fn sign_tests_are_reported_only_when_rounds_moved() {
+    let plan = pinned(&[("baseline", ArtifactRole::Baseline)], &["slow", "fast"]);
+    let entries = vec![
+        entry(
+            "baseline/slow",
+            1,
+            vec![
+                wall(1000),
+                Metric::total("switches", Unit::Count, 1).lower_is_better(),
+            ],
+            Vec::new(),
+        ),
+        entry(
+            "baseline/fast",
+            1,
+            vec![
+                wall(900),
+                Metric::total("switches", Unit::Count, 1).lower_is_better(),
+            ],
+            Vec::new(),
+        ),
+    ];
+    let summary = summarize(&plan, &entries);
+    let report = summary.report();
+    let line = |name: &str| {
+        report
+            .lines()
+            .find(|line| line.trim_start().starts_with(name))
+            .unwrap()
+            .to_owned()
+    };
+    assert!(line("wall_time").contains("sign test p=1.000"), "{report}");
+    assert!(!line("switches").contains("sign test"), "{report}");
+    assert_eq!(
+        metric(pair(&summary, PairKind::Variant), "switches").sign_test_p,
+        Some(1.0)
+    );
+}
