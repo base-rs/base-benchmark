@@ -101,4 +101,4 @@ Read warnings first. Interpret a candidate change against:
 
 A change within the replicas' range, a variant result that reverses in the replica, or a metric that moves both ways is not evidence of improvement. Differences smaller than a metric's resolution count as ties. A percentage change is shown only when every round's baseline is at least 100 resolution quanta; otherwise the metric is reported as unresolved, with differences only. Counts are never shown as percentages. The sign test is the exact two-sided probability of a split at least as uneven if better and worse rounds were equally likely; it ignores magnitudes and is not corrected for the many metrics in one report. With five rounds it cannot fall below 0.0625.
 
-Screening results are triage. Recorded results still need the predeclared rule and an investigation record, kept alongside the campaign directory.
+Screening results are triage. Recorded results still need the predeclared rule and an investigation record, kept alongside the campaign directory. Before committing a campaign directory, check `metadata.json`: it records the collector's `PATH`, host name, and invocation.

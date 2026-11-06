@@ -3,10 +3,13 @@
 
 use super::Cancellation;
 use nix::errno::Errno;
+use nix::fcntl::OFlag;
 use nix::fcntl::{Flock, FlockArg};
+use nix::sys::stat::Mode;
 use std::fs::{File, Permissions};
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -74,20 +77,40 @@ impl HostLock {
 #[cfg(test)]
 mod tests;
 
-/// Open or create the lock file read-only, since `flock` needs no write access and a sticky `/tmp` may forbid opening another user's file for writing.
+/// Open or create the lock file read-only, since `flock` needs no write access.
 ///
-/// The path is shared with every user, so it is never followed as a symbolic link. A created lock is made usable by every user despite the umask, but only when it has a single link: a planted hard link to someone's file must never have its permissions changed.
+/// The path is shared with every user, so it is never followed as a symbolic link. An existing lock is opened without `O_CREAT`, which Linux's `fs.protected_regular` forbids for another user's file in a sticky `/tmp`. A missing lock is created exclusively, and only that new file is made usable by every user despite the umask.
 fn open(path: &Path) -> io::Result<File> {
-    use nix::fcntl::OFlag;
-    let flags = OFlag::O_RDONLY | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    let file = File::from(nix::fcntl::open(
-        path,
-        flags,
-        nix::sys::stat::Mode::from_bits_truncate(0o666),
-    )?);
-    if file.metadata().is_ok_and(|metadata| metadata.nlink() == 1) {
-        // Fails harmlessly for another user's lock.
-        let _ = file.set_permissions(Permissions::from_mode(0o666));
+    open_with(path, |path| {
+        let flags =
+            OFlag::O_RDONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        nix::fcntl::open(path, flags, Mode::from_bits_truncate(0o666))
+    })
+}
+
+/// `create` makes a new lock file exclusively, replaceable so tests can lose the creation race.
+fn open_with(
+    path: &Path,
+    mut create: impl FnMut(&Path) -> nix::Result<OwnedFd>,
+) -> io::Result<File> {
+    loop {
+        match nix::fcntl::open(
+            path,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Err(Errno::ENOENT) => {}
+            opened => return Ok(File::from(opened?)),
+        }
+        match create(path) {
+            // Another process created it first; open theirs.
+            Err(Errno::EEXIST) => {}
+            created => {
+                let file = File::from(created?);
+                // Without this, the lock still works for this user; others would fail to open it with a clear error.
+                let _ = file.set_permissions(Permissions::from_mode(0o666));
+                return Ok(file);
+            }
+        }
     }
-    Ok(file)
 }

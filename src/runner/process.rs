@@ -86,7 +86,7 @@ impl Cancellation {
 
     /// Cancel when the process receives SIGINT, SIGTERM, or SIGHUP, until the guard is dropped.
     ///
-    /// The first signal cancels every guarded campaign, so workloads are killed before locks are released. A signal while nothing is guarded, or a second signal, exits the process with status 128 plus the signal number. The handler stays installed for the life of the process. Signals already ignored when it is installed, as under `nohup`, stay ignored.
+    /// The first signal cancels every guarded campaign, so workloads are killed before locks are released. A signal while nothing is guarded, or a second signal, exits the process with status 128 plus the signal number. The handler stays installed for the life of the process. On Linux, signals already ignored when it is installed, as under `nohup`, stay ignored.
     pub fn on_termination_signals(&self) -> SignalGuard {
         HANDLER.call_once(|| {
             use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};

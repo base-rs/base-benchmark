@@ -151,7 +151,9 @@ fn recorded_campaigns_report_every_missing_prerequisite() {
         Mode::Recorded,
     );
     options.rounds = Some(5);
+    options.artifacts.artifacts[0].source.dirty = Some(true);
     options.artifacts.artifacts[1].source.dirty = Some(true);
+    options.artifacts.artifacts[1].source.path_dependencies = None;
     options.artifacts.artifacts[1].build.toolchain = "other".to_owned();
     options.artifacts.artifacts[1].build.configuration = vec![crate::artifact::ConfigurationFile {
         path: PathBuf::from("/.cargo/config.toml"),
@@ -163,7 +165,8 @@ fn recorded_campaigns_report_every_missing_prerequisite() {
         "explicit CPU placement",
         "decision rule",
         "idle-host",
-        "unmodified source and path dependencies for candidate",
+        "unmodified source and path dependencies for baseline,",
+        "unmodified source and path dependencies for candidate (Cargo metadata could not be read",
         "layout replica",
         "same toolchain",
     ] {

@@ -101,3 +101,20 @@ fn planted_links_are_never_followed_or_changed() {
         0o600
     );
 }
+
+#[test]
+fn losing_the_creation_race_opens_the_winners_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("raced.lock");
+    let file = open_with(&path, |path| {
+        std::fs::write(path, "").unwrap();
+        Err(Errno::EEXIST)
+    })
+    .unwrap();
+    assert!(file.metadata().unwrap().is_file());
+    let error = open_with(&directory.path().join("denied.lock"), |_| {
+        Err(Errno::EACCES)
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+}

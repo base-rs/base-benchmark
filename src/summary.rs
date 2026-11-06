@@ -316,6 +316,10 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
                         continue;
                     }
                     let (Some(before), Some(after)) = (base.value, other.value) else { continue };
+                    // Describe the comparison by a round whose baseline measured the metric.
+                    if slot.base.value.is_none() {
+                        slot.base = base;
+                    }
                     let quantum = base.quantum.max(other.quantum);
                     let difference = after - before;
                     slot.differences.push(difference);

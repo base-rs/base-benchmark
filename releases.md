@@ -23,7 +23,7 @@
 - Split the runner into a default `runner` feature so workloads link only records and `Interval`.
 - Use the fixed, shared host lock `/tmp/base-benchmark-host.lock`, write metadata atomically, fail samples whose escaped descendants hold the output open, retry busy executables, and handle signals process-wide: the first cancels guarded work, including preparation between builds, and a second exits.
 - Take the scenario positionally in `base-benchmark run`, and reject a repeated `--manifest-path`.
-- Never follow a symbolic link at the shared lock path, and widen permissions only on a lock file with a single link.
+- Never follow a symbolic link at the shared lock path, open an existing lock without `O_CREAT` so other users can share it under `fs.protected_regular`, and widen permissions only on a lock file created exclusively.
 - Compute sign tests in logarithms, so long campaigns do not underflow to zero.
 - Record path dependencies as unknown when Cargo metadata cannot be read, and reject them in recorded mode; filter metadata to the host platform, and include `~/.cargo` configuration when `$CARGO_HOME` is unset.
-- Leave signals that were ignored at startup alone, and treat unavailable values as compatible with any statistic of the same metric.
+- Leave signals that were ignored at startup alone on Linux, and treat unavailable values as compatible with any statistic of the same metric.

@@ -328,8 +328,13 @@ impl Plan {
         for artifact in artifacts.iter().filter(|artifact| {
             artifact.role != ArtifactRole::LayoutReplica && !artifact.source.is_frozen()
         }) {
+            let reason = if artifact.source.path_dependencies.is_none() {
+                " (Cargo metadata could not be read during preparation, so its path dependencies are unknown)"
+            } else {
+                ""
+            };
             missing.push(format!(
-                "committed, unmodified source and path dependencies for {}",
+                "committed, unmodified source and path dependencies for {}{reason}",
                 artifact.label
             ));
         }

@@ -645,8 +645,10 @@ fn unavailable_values_are_not_redefinitions() {
         ),
         (Statistic::Mean, 1, 600.0)
     );
+    let compared = metric(pair(&summary, PairKind::Variant), "latency");
     assert_eq!(
-        metric(pair(&summary, PairKind::Variant), "latency").rounds,
-        1
+        (compared.rounds, compared.statistic),
+        (1, Statistic::Mean),
+        "pairs are described by a measured round"
     );
 }
