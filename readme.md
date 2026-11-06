@@ -2,23 +2,32 @@
 
 Bake-independent Rust measurement and experiment tooling for Base projects.
 
-**Status: planning scaffold, not a working benchmark library or CLI.** No crates.io release, shared runner, phase-matched hardware counters, or downstream migration exists yet. The first release awaits implementation and review; repository setup does not publish a crate.
+Workloads stay project-owned: a workload binary measures its own operations and writes one process record. `base-benchmark` does the rest:
 
-## Findings and direction
+- builds labelled source trees into frozen executables with build and dependency provenance, plus same-source layout replicas;
+- runs every subject in seeded random rounds under a host-wide lock, from equal-length paths with a controlled environment and random stack padding, with CPU placement, deadlines, and process-group cleanup;
+- rejects malformed or inconsistent evidence, including subjects that did different work;
+- summarizes paired changes with explicit metric scopes, resolution-aware ratios, sign tests, and interpretation warnings.
 
-- [Organization-wide benchmarking audit](reports/benchmarking-landscape.md): 19 repositories and 64 current Rust packages, inspected before these two repositories were created.
-- [Architecture and initial implementation plan](context/architecture.md).
-- [Current architectural requirements](design/architecture.md).
-- [Scheduler consumer feedback and response](reports/external-review-response.md).
-- [Follow-up: comparable historical data, graphs, and analysis](context/history.md).
-- [Standard investigation records, including rejected attempts](context/investigations.md) and [template](templates/investigation.md).
-- [`bake-benchmark`](https://github.com/base-rs/bake-benchmark): the separate Bake adapter.
+The `base-benchmark` command and the [`bake-benchmark`](https://github.com/base-rs/bake-benchmark) tasks call the same operations. No Python is involved.
 
-`base-benchmark` will own one Rust implementation of measurement records, resource accounting, collection, process supervision, validation, evidence journals, provenance, and summaries. Any standalone CLI and the Bake adapter will use that implementation. Normal workflows must not require Python. Workloads, correctness oracles, protocol semantics, and acceptance budgets remain project-specific.
+**Status:** an initial, unreleased implementation, validated by migrating the `base-html` rendering benchmark. Multi-process server/client roles, downstream patch preparation, and phase-matched hardware counters are not implemented yet; see [architecture](context/architecture.md).
+
+## Usage
+
+See [Using the Shared Benchmark Tooling](context/usage.md) for writing a workload, declaring scenarios in Cargo metadata, and running smoke, screening, and recorded campaigns. Run `base-benchmark help` for command options. Workloads depend on the crate with `default-features = false`, which provides only records and `Interval`.
+
+## Design and findings
+
+- [Architecture](context/architecture.md) and [requirements](design/architecture.md).
+- [`base-html` integration review](reports/base-html-integration.md): what the first migration exposed and what changed.
+- [Organization-wide benchmarking audit](reports/benchmarking-landscape.md), and the [scheduler consumer feedback and response](reports/external-review-response.md).
+- [Investigation records, including rejected attempts](context/investigations.md), with a [template](templates/investigation.md).
+- [Follow-up: comparable historical data and analysis](context/history.md).
 
 ## Development
 
-Install the [Bake launcher](https://github.com/base-rs/bake), then run `cargo bake test`. The private `bake/` workspace member supplies shared Base development tasks; it is not a dependency of the library. The empty library intentionally exposes no placeholder API. Passing scaffold checks is not evidence that the proposed benchmark behavior exists.
+Install the [Bake launcher](https://github.com/base-rs/bake), then run `cargo bake test`, or `cargo bake test:coverage --all-targets true` for the coverage gate. Integration tests build small fixture workspaces with Cargo and run shell workloads; they need Linux, `cargo`, `rustc`, and `git`. The private `bake/` workspace member supplies shared Base development tasks and is not a dependency of the library.
 
 ## Releases
 
