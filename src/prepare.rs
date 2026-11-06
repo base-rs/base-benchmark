@@ -108,7 +108,7 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
             dirty: baseline.source.dirty,
             lockfile_sha256: None,
             replica_of: Some(baseline.label.clone()),
-            path_dependencies: Vec::new(),
+            path_dependencies: baseline.source.path_dependencies.clone(),
         };
         artifacts.push(build(
             options,
@@ -283,14 +283,15 @@ fn build(
     // The frozen copy is all that collection uses; the build directory is only disk space.
     let _ = std::fs::remove_dir_all(&target);
     source.lockfile_sha256 = sha256_file(&tree.join("Cargo.lock")).ok();
-    if role != ArtifactRole::LayoutReplica {
-        source.path_dependencies = path_dependencies(&options.cargo, tree);
-    }
     let version = |program: &Path| {
         capture(Command::new(program).arg("-Vv").current_dir(tree)).ok_or_else(|| {
             io::Error::other(format!("{label}: could not run {} -Vv", program.display()))
         })
     };
+    let toolchain = version(&options.rustc)?;
+    if role != ArtifactRole::LayoutReplica {
+        source.path_dependencies = path_dependencies(&options.cargo, tree, host(&toolchain));
+    }
     Ok(Artifact {
         label: label.to_owned(),
         role,
@@ -299,12 +300,12 @@ fn build(
         source,
         build: BuildIdentity {
             command,
-            toolchain: version(&options.rustc)?,
+            toolchain,
             cargo: version(&options.cargo)?,
             environment: build_environment(std::env::vars()),
             configuration: configuration_files(
                 tree,
-                std::env::var_os("CARGO_HOME").map(PathBuf::from),
+                cargo_home(std::env::var_os("CARGO_HOME"), std::env::var_os("HOME")),
             ),
         },
     })
@@ -366,23 +367,31 @@ pub(crate) fn configuration_files(
         .collect()
 }
 
-/// Path dependencies outside `tree`, each with its Git state. They are listed only when Cargo metadata can be read.
-fn path_dependencies(cargo: &Path, tree: &Path) -> Vec<DependencyIdentity> {
-    let metadata = capture(
-        Command::new(cargo)
-            .args([
-                "metadata",
-                "--format-version",
-                "1",
-                "--locked",
-                "--offline",
-                "--manifest-path",
-            ])
-            .arg(tree.join("Cargo.toml")),
-    )
-    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-    .unwrap_or_default();
-    external_path_packages(&metadata, tree)
+/// Path dependencies outside `tree`, each with its Git state, or `None` when Cargo metadata cannot be read.
+///
+/// Metadata is filtered to the host platform when it is known, so it needs no packages beyond those a host build can use.
+fn path_dependencies(
+    cargo: &Path,
+    tree: &Path,
+    host: Option<&str>,
+) -> Option<Vec<DependencyIdentity>> {
+    let mut command = Command::new(cargo);
+    command
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(tree.join("Cargo.toml"));
+    if let Some(host) = host {
+        command.args(["--filter-platform", host]);
+    }
+    let metadata =
+        capture(&mut command).and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+    let dependencies = external_path_packages(&metadata, tree)
         .into_iter()
         .map(|(name, path)| DependencyIdentity {
             revision: git(&path, &["rev-parse", "--verify", "HEAD"]),
@@ -390,7 +399,25 @@ fn path_dependencies(cargo: &Path, tree: &Path) -> Vec<DependencyIdentity> {
             name,
             path,
         })
-        .collect()
+        .collect();
+    Some(dependencies)
+}
+
+/// The host target triple from `rustc -Vv`.
+pub(crate) fn host(toolchain: &str) -> Option<&str> {
+    toolchain
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+}
+
+/// Cargo's home directory: `$CARGO_HOME`, or `.cargo` in the home directory.
+pub(crate) fn cargo_home(
+    cargo_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    cargo_home
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".cargo")))
 }
 
 /// Packages without a registry or Git source whose directory is outside `tree`.
@@ -421,7 +448,7 @@ fn source_identity(path: &Path) -> SourceIdentity {
         dirty: git(path, &["status", "--porcelain"]).map(|status| !status.is_empty()),
         lockfile_sha256: None,
         replica_of: None,
-        path_dependencies: Vec::new(),
+        path_dependencies: None,
     }
 }
 

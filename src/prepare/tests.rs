@@ -181,7 +181,7 @@ fn out_of_tree_path_dependencies_are_identified() {
         .manifest
         .artifacts
         .remove(0);
-    let [dependency_identity] = &artifact.source.path_dependencies[..] else {
+    let [dependency_identity] = artifact.source.path_dependencies.as_deref().unwrap() else {
         panic!("{:?}", artifact.source.path_dependencies)
     };
     assert_eq!(
@@ -491,4 +491,42 @@ fn replicas_are_hidden_siblings_unique_to_the_process() {
             std::process::id()
         ))
     );
+}
+
+#[test]
+fn unreadable_metadata_leaves_path_dependencies_unknown() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = tree(directory.path(), "base");
+    commit(&base.path);
+    let cargo = fake_cargo(directory.path(), "cargo", ":", "not json");
+    let mut options = options(directory.path(), vec![base], cargo);
+    options.replicas = Some(1);
+    let artifacts = prepared(&options).unwrap().manifest.artifacts;
+    assert_eq!(artifacts[0].source.path_dependencies, None);
+    assert!(
+        !artifacts[0].source.is_frozen(),
+        "unknown path dependencies are not frozen"
+    );
+    assert_eq!(
+        artifacts[1].source.path_dependencies, None,
+        "a replica repeats its baseline's"
+    );
+}
+
+#[test]
+fn hosts_and_cargo_homes_are_resolved() {
+    assert_eq!(
+        host("rustc 1.99.1\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1"),
+        Some("x86_64-unknown-linux-gnu")
+    );
+    assert_eq!(host("-Vv"), None);
+    assert_eq!(
+        cargo_home(Some("/cargo".into()), Some("/home".into())),
+        Some(PathBuf::from("/cargo"))
+    );
+    assert_eq!(
+        cargo_home(None, Some("/home".into())),
+        Some(PathBuf::from("/home/.cargo"))
+    );
+    assert_eq!(cargo_home(None, None), None);
 }

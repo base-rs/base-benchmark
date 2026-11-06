@@ -40,7 +40,7 @@ pub fn artifact(label: &str, role: ArtifactRole, executable: &Path) -> Artifact 
             dirty: Some(false),
             lockfile_sha256: None,
             replica_of: (role == ArtifactRole::LayoutReplica).then(|| "baseline".to_owned()),
-            path_dependencies: Vec::new(),
+            path_dependencies: Some(Vec::new()),
         },
         build: BuildIdentity {
             command: vec!["cargo".to_owned(), "build".to_owned()],

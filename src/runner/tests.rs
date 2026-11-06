@@ -522,7 +522,7 @@ fn workloads_start_from_equal_length_staged_paths_with_stack_padding() {
 #[test]
 fn escaped_descendants_fail_the_campaign() {
     let directory = tempfile::tempdir().unwrap();
-    let (plan, output) = campaign(directory.path(), "setsid sleep 10 & sleep 0.3; echo '{}'");
+    let (plan, output) = campaign(directory.path(), "setsid sleep 10 & sleep 1; echo '{}'");
     let error = run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap_err();
     assert!(
         error

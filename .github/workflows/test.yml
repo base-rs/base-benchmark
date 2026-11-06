@@ -26,6 +26,10 @@ jobs:
         run: cargo install cargo-llvm-cov --locked
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Check the workload-only build that projects use with `default-features = false`
+        run: |
+          cargo clippy --all-targets --no-default-features --locked -- -D warnings
+          cargo test --no-default-features --locked
       - name: Run tests and require complete source-region coverage
         run: cargo bake --locked test:coverage --all-targets true
 

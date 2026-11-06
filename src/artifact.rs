@@ -63,7 +63,7 @@ impl ArtifactManifest {
                     dirty: None,
                     lockfile_sha256: None,
                     replica_of: None,
-                    path_dependencies: Vec::new(),
+                    path_dependencies: None,
                 },
                 build: BuildIdentity {
                     command: Vec::new(),
@@ -183,8 +183,8 @@ pub struct SourceIdentity {
     pub dirty: Option<bool>,
     pub lockfile_sha256: Option<String>,
     pub replica_of: Option<String>,
-    /// Path dependencies outside the tree. `Cargo.lock` does not pin them, so each is identified by its own Git state.
-    pub path_dependencies: Vec<DependencyIdentity>,
+    /// Path dependencies outside the tree. `Cargo.lock` does not pin them, so each is identified by its own Git state. `None` when Cargo metadata could not be read, so they are unknown and the source is not frozen. A replica repeats its baseline's.
+    pub path_dependencies: Option<Vec<DependencyIdentity>>,
 }
 
 impl SourceIdentity {
@@ -194,8 +194,8 @@ impl SourceIdentity {
             && self.dirty == Some(false)
             && self
                 .path_dependencies
-                .iter()
-                .all(DependencyIdentity::is_frozen)
+                .as_ref()
+                .is_some_and(|dependencies| dependencies.iter().all(DependencyIdentity::is_frozen))
     }
 }
 

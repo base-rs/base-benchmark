@@ -77,3 +77,27 @@ fn locks_are_shared_between_users() {
         assert!(HostLock::acquire(&path, &Cancellation::new(), &mut Vec::new()).is_err());
     }
 }
+
+#[test]
+fn planted_links_are_never_followed_or_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let victim = directory.path().join("victim");
+    let symlink = directory.path().join("symlink.lock");
+    std::os::unix::fs::symlink(&victim, &symlink).unwrap();
+    assert!(HostLock::acquire(&symlink, &Cancellation::new(), &mut Vec::new()).is_err());
+    assert!(
+        !victim.exists(),
+        "a dangling symbolic link must not create its target"
+    );
+
+    std::fs::write(&victim, "secret").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let hard = directory.path().join("hard.lock");
+    std::fs::hard_link(&victim, &hard).unwrap();
+    drop(HostLock::acquire(&hard, &Cancellation::new(), &mut Vec::new()).unwrap());
+    assert_eq!(
+        std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}

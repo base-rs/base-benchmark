@@ -27,6 +27,11 @@
 mod record;
 mod usage;
 
+#[cfg(all(feature = "runner", not(unix)))]
+compile_error!(
+    "the `runner` feature supports Unix only; workloads on other platforms can use `default-features = false`"
+);
+
 #[cfg(feature = "runner")]
 mod artifact;
 #[cfg(feature = "runner")]
@@ -78,4 +83,4 @@ pub use summary::{
     SUMMARY_SCHEMA, SUMMARY_VERSION, Statistic, SubjectSummary, Summary, sign_test, summarize,
 };
 #[cfg(feature = "runner")]
-pub use workspace::{RunRequest, Workspace};
+pub use workspace::{DEFAULT_TIMEOUT, RunRequest, Workspace};

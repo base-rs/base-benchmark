@@ -127,7 +127,7 @@ pub struct PairMetric {
     pub difference: Option<Distribution>,
     /// `candidate / baseline - 1`, from rounds whose baseline is resolvable.
     pub change: Option<Distribution>,
-    /// Rounds without a ratio: the baseline was zero or within [`RESOLUTION_FACTOR`] measurement quanta.
+    /// Rounds without a ratio: every round of a count metric, and rounds whose baseline was zero or within [`RESOLUTION_FACTOR`] measurement quanta.
     pub unresolved: usize,
     /// Two-sided exact sign test over rounds that moved, ignoring ties and magnitudes. Descriptive only: no correction for the many metrics and pairs in one summary.
     pub sign_test_p: Option<f64>,
@@ -147,9 +147,9 @@ struct ProcessValue {
 }
 
 impl ProcessValue {
-    /// Values can be compared only under the same definition.
+    /// Values can be compared only under the same definition. An unavailable value has no statistic of its own, so only its unit, phase, and source must agree.
     fn compatible(&self, other: &Self) -> bool {
-        self.statistic == other.statistic
+        (self.statistic == other.statistic || self.value.is_none() || other.value.is_none())
             && self.metric.unit == other.metric.unit
             && self.metric.phase == other.metric.phase
             && self.metric.source == other.metric.source
@@ -250,13 +250,19 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
             let mut metrics: BTreeMap<&str, (&ProcessValue, Vec<f64>, usize)> = BTreeMap::new();
             for (_, values) in processes {
                 for (name, value) in values {
-                    let slot = metrics.entry(name.as_str()).or_insert((value, Vec::new(), 0));
                     if value.conflict {
                         warnings.push(format!("{}: metric {name} has conflicting definitions within a process and is not summarized", subject.label));
-                    } else if !slot.0.compatible(value) {
+                        continue;
+                    }
+                    let slot = metrics.entry(name.as_str()).or_insert((value, Vec::new(), 0));
+                    if !slot.0.compatible(value) {
                         // The first definition is summarized; later processes that redefine the metric are excluded.
                         warnings.push(format!("{}: metric {name} changes definition between processes; differing processes are excluded", subject.label));
                         continue;
+                    }
+                    // Describe the metric by a process that measured it.
+                    if slot.0.value.is_none() && value.value.is_some() {
+                        slot.0 = value;
                     }
                     match value.value {
                         Some(number) => slot.1.push(number),
@@ -394,13 +400,19 @@ impl Comparison<'_> {
 pub fn sign_test(improved: usize, regressed: usize) -> f64 {
     let rounds = improved + regressed;
     let smaller = improved.min(regressed);
-    // Accumulate C(rounds, k) / 2^rounds for k = 0..=smaller without forming large binomial coefficients.
-    let mut term = 0.5_f64.powi(i32::try_from(rounds).unwrap_or(i32::MAX));
-    let mut tail = 0.0;
+    // Sum C(rounds, k) / 2^rounds for k = 0..=smaller in logarithms: 2^-rounds underflows long before the tail is negligible. The terms grow up to k = smaller, so the last is the largest and scales the others.
+    let mut logarithms = Vec::with_capacity(smaller + 1);
+    let mut logarithm = -(rounds as f64) * std::f64::consts::LN_2;
     for k in 0..=smaller {
-        tail += term;
-        term *= (rounds - k) as f64 / (k + 1) as f64;
+        logarithms.push(logarithm);
+        logarithm += ((rounds - k) as f64 / (k + 1) as f64).ln();
     }
+    let largest = logarithms[smaller];
+    let tail = largest.exp()
+        * logarithms
+            .iter()
+            .map(|value| (value - largest).exp())
+            .sum::<f64>();
     (2.0 * tail).min(1.0)
 }
 

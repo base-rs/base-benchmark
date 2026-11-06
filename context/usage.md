@@ -4,7 +4,7 @@ Use this guide to add a workload to a Base project and collect it with `base-ben
 
 ## Write a workload binary
 
-Put the workload in an unpublished `benchmarks/<subject>/` workspace package, named `<project>-benchmark-<subject>`, that depends on the measured library and on `base-benchmark` with `default-features = false`. That provides records and `Interval` without linking the runner into the measured binary. Tests that drive the binary through the runner can enable the default `runner` feature as a dev-dependency.
+Put the workload in an unpublished `benchmarks/<subject>/` workspace package, named `<project>-benchmark-<subject>`, that depends on the measured library and on `base-benchmark` with `default-features = false`. That provides records and `Interval` without linking the runner into the measured binary. Tests that drive the binary through the runner can enable the default `runner` feature as a dev-dependency. This relies on Cargo's feature resolver 2 or later, the default since edition 2021, which keeps dev-dependency features out of ordinary builds.
 
 ```toml
 [dependencies]

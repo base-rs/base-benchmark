@@ -89,6 +89,11 @@ fn sign_tests_are_exact_and_two_sided() {
     assert_eq!(sign_test(3, 3), 1.0);
     assert!((sign_test(9, 1) - 0.021_484_375).abs() < 1e-12);
     assert!(sign_test(2000, 0) < 1e-300);
+    // Balanced rounds stay insignificant however many there are.
+    assert_eq!(sign_test(538, 538), 1.0);
+    assert_eq!(sign_test(100_000, 100_000), 1.0);
+    // Exact: 2 * sum(C(1000, k), k <= 470) / 2^1000 = 0.0620231950983631...
+    assert!((sign_test(530, 470) - 0.062_023_195_098_363).abs() < 1e-10);
 }
 
 #[test]
@@ -571,5 +576,77 @@ fn sign_tests_are_reported_only_when_rounds_moved() {
     assert_eq!(
         metric(pair(&summary, PairKind::Variant), "switches").sign_test_p,
         Some(1.0)
+    );
+}
+
+#[test]
+fn unavailable_values_are_not_redefinitions() {
+    let plan = pinned(&[("baseline", ArtifactRole::Baseline)], &["slow", "fast"]);
+    let unavailable = || {
+        Metric::unavailable("latency", Unit::Nanoseconds, "no samples")
+            .with_phase(Phase::Process)
+            .lower_is_better()
+    };
+    let latency = |value| {
+        Metric::mean("latency", Unit::Nanoseconds, value)
+            .with_phase(Phase::Process)
+            .lower_is_better()
+    };
+    let entries = vec![
+        entry(
+            "baseline/slow",
+            1,
+            vec![wall(1000), unavailable()],
+            Vec::new(),
+        ),
+        entry(
+            "baseline/fast",
+            1,
+            vec![wall(900), latency(500.0)],
+            Vec::new(),
+        ),
+        entry(
+            "baseline/slow",
+            2,
+            vec![wall(1000), latency(600.0)],
+            Vec::new(),
+        ),
+        entry(
+            "baseline/fast",
+            2,
+            vec![wall(900), latency(500.0)],
+            Vec::new(),
+        ),
+    ];
+    let summary = summarize(&plan, &entries);
+    assert!(
+        !summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("latency")),
+        "{:?}",
+        summary.warnings
+    );
+    let slow = summary
+        .subjects
+        .iter()
+        .find(|subject| subject.label == "baseline/slow")
+        .unwrap();
+    let described = slow
+        .metrics
+        .iter()
+        .find(|metric| metric.name == "latency")
+        .unwrap();
+    assert_eq!(
+        (
+            described.statistic,
+            described.unavailable,
+            described.distribution.unwrap().median
+        ),
+        (Statistic::Mean, 1, 600.0)
+    );
+    assert_eq!(
+        metric(pair(&summary, PairKind::Variant), "latency").rounds,
+        1
     );
 }

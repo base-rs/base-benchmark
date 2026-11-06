@@ -86,11 +86,16 @@ impl Cancellation {
 
     /// Cancel when the process receives SIGINT, SIGTERM, or SIGHUP, until the guard is dropped.
     ///
-    /// The first signal cancels every guarded campaign, so workloads are killed before locks are released. A signal while nothing is guarded, or a second signal, exits the process with status 128 plus the signal number. The handler stays installed for the life of the process.
+    /// The first signal cancels every guarded campaign, so workloads are killed before locks are released. A signal while nothing is guarded, or a second signal, exits the process with status 128 plus the signal number. The handler stays installed for the life of the process. Signals already ignored when it is installed, as under `nohup`, stay ignored.
     pub fn on_termination_signals(&self) -> SignalGuard {
         HANDLER.call_once(|| {
             use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-            let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])
+            let ignored =
+                ignored_signals(std::fs::read_to_string("/proc/self/status").ok().as_deref());
+            let handled = [SIGINT, SIGTERM, SIGHUP]
+                .into_iter()
+                .filter(|signal| ignored & (1 << (signal - 1)) == 0);
+            let mut signals = signal_hook::iterator::Signals::new(handled)
                 .expect("termination signals are not forbidden signals");
             std::thread::spawn(move || {
                 for signal in signals.forever() {
@@ -128,6 +133,14 @@ impl Cancellation {
     }
 }
 
+/// The mask of signals ignored by this process, from the `SigIgn` line of `/proc/self/status`, or none where that is unavailable.
+fn ignored_signals(status: Option<&str>) -> u64 {
+    status
+        .and_then(|status| status.lines().find_map(|line| line.strip_prefix("SigIgn:")))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .unwrap_or(0)
+}
+
 fn guarded() -> std::sync::MutexGuard<'static, Vec<Cancellation>> {
     GUARDED
         .lock()
@@ -158,7 +171,13 @@ pub struct SignalGuard {
 
 impl Drop for SignalGuard {
     fn drop(&mut self) {
-        guarded().retain(|cancellation| !Arc::ptr_eq(&cancellation.0, &self.cancellation.0));
+        // Remove one registration, so another guard of the same cancellation still holds.
+        let mut guarded = guarded();
+        let index = guarded
+            .iter()
+            .position(|cancellation| Arc::ptr_eq(&cancellation.0, &self.cancellation.0))
+            .expect("a guard's cancellation is registered until it drops");
+        guarded.remove(index);
     }
 }
 

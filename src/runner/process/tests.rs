@@ -104,7 +104,7 @@ fn escaped_descendants_fail_the_sample_instead_of_hanging() {
     let started = Instant::now();
     // Give the background process time to leave the group before the leader exits.
     let execution = run(
-        "setsid sleep 10 & sleep 0.3; echo done",
+        "setsid sleep 10 & sleep 1; echo done",
         Duration::from_secs(20),
         &Cancellation::new(),
     );
@@ -138,7 +138,7 @@ fn the_first_termination_signal_cancels_guarded_campaigns() {
     let guard = cancellation.on_termination_signals();
     let other = Cancellation::new();
     drop(other.on_termination_signals());
-    nix::sys::signal::raise(Signal::SIGHUP).unwrap();
+    nix::sys::signal::raise(Signal::SIGTERM).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !cancellation.is_cancelled() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -264,4 +264,33 @@ fn readers_bound_output() {
     assert_eq!(read_head(Failing, 4), (Vec::new(), false));
     assert_eq!(read_tail(&vec![1; 20_000][..], 10), vec![1; 10]);
     assert!(read_tail(Failing, 10).is_empty());
+}
+
+#[test]
+fn signals_ignored_at_start_are_left_alone() {
+    assert_eq!(
+        ignored_signals(Some("Name:\tx\nSigIgn:\t0000000000000001\n")),
+        1,
+        "SIGHUP is bit 0"
+    );
+    assert_eq!(ignored_signals(Some("SigIgn:\tzz\n")), 0);
+    assert_eq!(ignored_signals(None), 0);
+}
+
+#[test]
+fn each_guard_releases_only_its_own_registration() {
+    let cancellation = Cancellation::new();
+    let first = cancellation.on_termination_signals();
+    let second = cancellation.on_termination_signals();
+    let count = || {
+        guarded()
+            .iter()
+            .filter(|guarded| Arc::ptr_eq(&guarded.0, &cancellation.0))
+            .count()
+    };
+    assert_eq!(count(), 2);
+    drop(first);
+    assert_eq!(count(), 1);
+    drop(second);
+    assert_eq!(count(), 0);
 }
