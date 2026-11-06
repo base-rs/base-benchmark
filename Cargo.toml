@@ -1,0 +1,16 @@
+[package]
+name = "base-benchmark"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT"
+description = "Bake-independent benchmark measurement and experiment tooling for Base projects"
+repository = "https://github.com/base-rs/base-benchmark"
+readme = "readme.md"
+
+[workspace]
+members = ["bake"]
+resolver = "3"
+
+[workspace.metadata.bake.release]
+reviewers = ["base-rs/maintainers"]
