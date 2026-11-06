@@ -4,10 +4,10 @@ Bake-independent Rust measurement and experiment tooling for Base projects.
 
 Workloads stay project-owned: a workload binary measures its own operations and writes one process record. `base-benchmark` does the rest:
 
-- builds labelled source trees into frozen executables, including a same-source layout replica;
-- runs every subject in seeded random rounds under a host-wide lock, with CPU placement, deadlines, and process-group cleanup;
-- rejects malformed or inconsistent evidence;
-- summarizes paired changes with explicit metric scopes and interpretation warnings.
+- builds labelled source trees into frozen executables with build and dependency provenance, plus same-source layout replicas;
+- runs every subject in seeded random rounds under a host-wide lock, from equal-length paths with a controlled environment and random stack padding, with CPU placement, deadlines, and process-group cleanup;
+- rejects malformed or inconsistent evidence, including subjects that did different work;
+- summarizes paired changes with explicit metric scopes, resolution-aware ratios, sign tests, and interpretation warnings.
 
 The `base-benchmark` command and the [`bake-benchmark`](https://github.com/base-rs/bake-benchmark) tasks call the same operations. No Python is involved.
 
@@ -15,7 +15,7 @@ The `base-benchmark` command and the [`bake-benchmark`](https://github.com/base-
 
 ## Usage
 
-See [Using the Shared Benchmark Tooling](context/usage.md) for writing a workload, declaring scenarios in Cargo metadata, and running smoke, screening, and recorded campaigns. Run `base-benchmark help` for command options.
+See [Using the Shared Benchmark Tooling](context/usage.md) for writing a workload, declaring scenarios in Cargo metadata, and running smoke, screening, and recorded campaigns. Run `base-benchmark help` for command options. Workloads depend on the crate with `default-features = false`, which provides only records and `Interval`.
 
 ## Design and findings
 

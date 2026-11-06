@@ -13,3 +13,13 @@
 - Run seeded random rounds under a host-wide lock with CPU placement, deadlines, bounded output, signal cancellation, and process-group cleanup; journal every sample and record completion state.
 - Summarize per-round paired differences and resolution-aware ratios, and warn about missing placement, inconsistent directions, and changes within or reversed by the layout replica.
 - Add the `base-benchmark` command with `list`, `prepare`, `smoke`, `run`, and `summarize`.
+- Control launch layout: stage executables under equal-length paths, clear the workload environment to `PATH` and `LC_ALL=C`, start in the workspace root, and add seeded random stack padding to every sample.
+- Build any number of layout replicas with `--replicas N`, and warn when variant comparisons have no replica or an unresolved one.
+- Report exact two-sided sign tests, count differences below a metric's resolution as ties, show percentage changes only when every round resolves, never show counts as percentages, and compare metrics only under identical definitions.
+- Add a microsecond-resolution `cpu_time` total, and declare the tick-sampled user and system split at 10 ms.
+- Reject campaigns whose records differ in workload or signature, or whose artifacts run a variant with different parameters.
+- Record `cargo -Vv`, build-affecting environment variables, Cargo configuration files, and the Git state of out-of-tree path dependencies; recorded mode requires all of them to match and be committed.
+- Add `measure-arguments` for screening and recorded runs, show resolved baseline variants, and add `Workspace::smoke_executable`.
+- Split the runner into a default `runner` feature so workloads link only records and `Interval`.
+- Use the fixed, shared host lock `/tmp/base-benchmark-host.lock`, write metadata atomically, fail samples whose escaped descendants hold the output open, retry busy executables, and handle signals process-wide: the first cancels guarded work, including preparation between builds, and a second exits.
+- Take the scenario positionally in `base-benchmark run`, and reject a repeated `--manifest-path`.

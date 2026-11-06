@@ -11,7 +11,7 @@ On 7 November 2026, the local, unpublished `base-html` rendering benchmark was m
 - workload parameters;
 - exact-output and frame-boundary preflights;
 - the operation boundary;
-- record construction, about 15 lines with `Interval` and `ProcessRecord`.
+- record construction, about 35 lines with `Interval` and `ProcessRecord`.
 
 Preparation, rounds, locking, cleanup, validation, and summaries come from the shared core, through `cargo bake benchmark:*`. Scenarios are declared in the benchmark package's Cargo metadata. The workload's tests now include one that runs the real binary through the shared runner for every scenario. The published `base-html` library has no dependency on either package.
 
@@ -39,10 +39,32 @@ Host `aiko`, AMD Ryzen 9 9950X3D, Linux 7.2.14, workstation in use. `list` scena
 - In the layout replica's variant comparison, the sign was opposite: -0.2%.
 - The same binary's `reference` processes alternated between about 16 and 20 µs per operation, even when pinned.
 
-"Better in 5 of 5 rounds" was therefore produced by uncontrolled placement and layout, not by the engine. The revised report now warns about exactly these cases. The per-process bimodality is an open question for `base-html`, to be pursued as an investigation; this report draws no conclusion about it or about engine performance.
+The unpinned "better in 5 of 5 rounds" was therefore not reproduced under pinning, and the pinned changes were within layout-replica variation: in the second pinned campaign, the replica alone moved `engine` by -3.1% (better in 4 of 5 rounds) and `reference` by +1.0% (worse in 5 of 5). The revised report warns about exactly these cases. The per-process bimodality is an open question for `base-html`, to be pursued as an investigation; this report draws no conclusion about it or about engine performance.
+
+## Review of the integration
+
+Two independent reviews followed: one of the core, and one of the `base-html` migration and the Bake adapter. Their findings, and Emery Berger's "Performance Matters" talk on layout effects, led to these further changes.
+
+| Finding | Change |
+| --- | --- |
+| The resolution rule applied only to declared resolutions. Ratios still appeared in `summary.json` for counts, and ratios computed from only the resolvable rounds selected large baselines. | Every metric has a quantum, by default one unit. Percentages require every round to resolve, counts are never ratios, and differences below the quantum count as ties. |
+| Pairs compared metrics with different units, phases, or sources without warning; metrics redefined between processes were still merged. | Pairs require identical definitions and warn about incompatible or missing metrics; redefining processes are excluded. |
+| Smoke `summary.json` still contained pairs. | Smoke summaries have no pairs. |
+| Variant pairs without a replica, and replica checks that could not be resolved, were silent. | Both are warnings. |
+| A descendant that escaped the process group could hang the runner while it held the lock; a dropped signal guard left signals ignored, and a second Ctrl-C could not exit. | Samples fail after a 2 s output grace period. A process-wide handler cancels guarded work on the first signal and exits on the next. |
+| A replica copy was created after the builds, could collide with a concurrent run, and leaked on interrupt; preparation ignored signals. | Copies are created exclusively, with a per-process name, before building; preparation is signal-guarded and checks cancellation between builds. |
+| Provenance missed path dependencies outside the tree, Cargo configuration, and most build-affecting environment variables. | All are recorded, and recorded mode requires them to be committed and identical. |
+| Nothing checked that subjects ran the same workload with the same parameters, so a changed default in a candidate tree went unnoticed. | Records must share workload and signature, and each variant's parameters must match across artifacts. |
+| Scenarios could not pin iteration counts without colliding with smoke arguments. | `measure-arguments` apply only outside smoke runs. |
+| The "host-wide" lock followed `$TMPDIR`, and other users could not open it. | `/tmp/base-benchmark-host.lock`, opened read-only when present and created world-writable. |
+| Workload binaries linked the whole runner. | A default `runner` feature; workloads use `default-features = false`. |
+| User and system CPU time are tick-sampled on Linux, so 1 µs resolution overstated them. | A precise `cpu_time` total, and a 10 ms split. |
+| The adapter duplicated core defaults, and nothing tested standalone manifests or command and task equivalence. | Defaults are resolved only in the core; the adapter's tests cover both. |
+| Layout, such as environment size and executable path, can bias every process of one subject the same way. | A cleared environment, equal-length staged paths, seeded stack padding, several replicas, and an exact sign test. Stabilizer-style runtime re-randomization and Coz causal profiling are deferred; see [architecture](../context/architecture.md). |
 
 ## Remaining limits
 
-- `base-html`, and `bake-benchmark` itself, depend on `base-benchmark` through local path dependencies. Before `bake-benchmark` can pass CI or be published, `base-benchmark` must be available from its Git repository or crates.io.
+- `base-html` and `bake-benchmark` depend on `base-benchmark`, and `base-html` on `bake-benchmark`, through local path dependencies outside their repositories. Cargo loads every workspace member, so `base-html`'s own CI and publishing fail until these become pinned Git dependencies or crates.io releases.
 - Only single-sample, single-process workloads have been exercised. Multi-sample batches, multi-process roles, downstream patch preparation, and phase-matched counters remain unimplemented; see [architecture](../context/architecture.md).
 - The `base-html` tree has no commits, so recorded mode cannot be used there yet. The tooling rejects it, as intended.
+- The per-process bimodality seen in `reference` remains unexplained.
