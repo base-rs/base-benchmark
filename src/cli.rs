@@ -2,7 +2,6 @@
 // Copyright, 2026, by Samuel Williams.
 
 //! The `base-benchmark` command. It parses arguments and calls [`Workspace`] operations, exactly as the Bake tasks do.
-
 use crate::config::invalid_input;
 use crate::plan::parse_cpus;
 use crate::prepare::Tree;

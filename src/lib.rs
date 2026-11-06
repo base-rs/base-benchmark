@@ -23,7 +23,6 @@
 //! ```
 //!
 //! The same operations are available through the `base-benchmark` command and, separately, the `bake-benchmark` task library. Records and `Interval` are always available; preparation, collection, summaries, and the command need the default `runner` feature, so workloads can depend on the crate with `default-features = false`. The runner supports Unix, and is tested on Linux.
-
 mod record;
 mod usage;
 

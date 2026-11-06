@@ -2,7 +2,6 @@
 // Copyright, 2026, by Samuel Williams.
 
 //! Fixtures for unit tests: shell workloads and hand-built plans.
-
 use crate::artifact::{
     Artifact, ArtifactManifest, ArtifactRole, BuildIdentity, MANIFEST_SCHEMA, MANIFEST_VERSION,
     SourceIdentity, sha256_file,

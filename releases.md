@@ -1,6 +1,6 @@
 # Releases
 
-## Unreleased
+## v0.1.0
 
 - Establish the repository and shared Base development tooling.
 - Record the organization-wide benchmarking audit and the two-repository Rust architecture.

@@ -11,7 +11,7 @@ Workloads stay project-owned: a workload binary measures its own operations and 
 
 The `base-benchmark` command and the [`bake-benchmark`](https://github.com/base-rs/bake-benchmark) tasks call the same operations. No Python is involved.
 
-**Status:** an initial, unreleased implementation, validated by migrating the `base-html` rendering benchmark. Multi-process server/client roles, downstream patch preparation, and phase-matched hardware counters are not implemented yet; see [architecture](context/architecture.md).
+**Status:** an initial release, validated by migrating the `base-html` rendering benchmark. Multi-process server/client roles, downstream patch preparation, and phase-matched hardware counters are not implemented yet; see [architecture](context/architecture.md).
 
 ## Usage
 
@@ -31,7 +31,7 @@ Install the [Bake launcher](https://github.com/base-rs/bake), then run `cargo ba
 
 ## Releases
 
-See [releases.md](releases.md). No releases yet.
+See [releases.md](releases.md).
 
 ## Contributing
 
