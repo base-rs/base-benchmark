@@ -41,6 +41,39 @@ impl ArtifactManifest {
         write_json(path, self)
     }
 
+    /// Describe an executable built outside [`crate::prepare`], such as a test binary, as the only baseline artifact.
+    ///
+    /// Its source and build are unknown, so it can be used for smoke and screening runs but never satisfies recorded prerequisites.
+    pub fn unprepared(suite: &crate::config::Suite, executable: &Path) -> io::Result<Self> {
+        Ok(Self {
+            schema: MANIFEST_SCHEMA.to_owned(),
+            version: MANIFEST_VERSION,
+            package: suite.package.clone(),
+            binary: suite.binary.clone(),
+            profile: "unknown".to_owned(),
+            features: Vec::new(),
+            artifacts: vec![Artifact {
+                label: "unprepared".to_owned(),
+                role: ArtifactRole::Baseline,
+                sha256: sha256_file(executable)?,
+                executable: executable.to_owned(),
+                source: SourceIdentity {
+                    path: executable.to_owned(),
+                    revision: None,
+                    dirty: None,
+                    lockfile_sha256: None,
+                    replica_of: None,
+                },
+                build: BuildIdentity {
+                    command: Vec::new(),
+                    toolchain: "unknown".to_owned(),
+                    rustflags: None,
+                    encoded_rustflags: None,
+                },
+            }],
+        })
+    }
+
     pub fn baseline(&self) -> &Artifact {
         self.artifacts
             .iter()

@@ -104,3 +104,16 @@ fn hashing_reports_read_errors() {
     std::fs::write(&big, vec![7; 200_000]).unwrap();
     assert_eq!(sha256_file(&big).unwrap().len(), 64);
 }
+
+#[test]
+fn unprepared_executables_are_unfrozen_baselines() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("tool");
+    std::fs::write(&executable, "one").unwrap();
+    let suite = crate::test_support::suite(&executable, &[]);
+    let manifest = ArtifactManifest::unprepared(&suite, &executable).unwrap();
+    manifest.validate().unwrap();
+    assert_eq!(manifest.baseline().label, "unprepared");
+    assert!(!manifest.baseline().source.is_frozen());
+    assert!(ArtifactManifest::unprepared(&suite, &directory.path().join("missing")).is_err());
+}

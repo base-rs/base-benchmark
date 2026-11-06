@@ -192,3 +192,43 @@ fn tools_come_from_the_environment_or_path() {
         PathBuf::from("/opt/rustc")
     );
 }
+
+#[test]
+fn package_defaults_apply_to_scenarios_that_do_not_replace_them() {
+    let configuration = json!({
+        "arguments": ["--common"],
+        "smoke-arguments": ["--iterations", "1"],
+        "variants": [{ "name": "reference" }, { "name": "engine", "arguments": ["--engine"] }],
+        "baseline": "engine",
+        "scenario": [
+            { "name": "inherited", "arguments": ["--own"] },
+            { "name": "replaced", "smoke-arguments": [], "variants": [{ "name": "only" }] },
+            { "name": "rebased", "baseline": "reference" },
+        ],
+    });
+    let suite = parse_metadata(&metadata(configuration, &["workload"]))
+        .unwrap()
+        .remove(0);
+    let inherited = suite.scenario("inherited").unwrap();
+    assert_eq!(inherited.arguments, ["--common", "--own"]);
+    assert_eq!(inherited.smoke_arguments, ["--iterations", "1"]);
+    assert_eq!(inherited.baseline_variant().unwrap().name, "engine");
+    let replaced = suite.scenario("replaced").unwrap();
+    assert!(replaced.smoke_arguments.is_empty());
+    assert_eq!(
+        (
+            replaced.variants.len(),
+            replaced.baseline_variant().unwrap().name.as_str()
+        ),
+        (1, "only")
+    );
+    assert_eq!(
+        suite
+            .scenario("rebased")
+            .unwrap()
+            .baseline_variant()
+            .unwrap()
+            .name,
+        "reference"
+    );
+}

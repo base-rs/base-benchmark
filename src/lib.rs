@@ -49,6 +49,7 @@ pub use artifact::{
 pub use config::{METADATA_KEY, Scenario, Suite, Variant, cargo_program, discover, select};
 pub use plan::{
     Mode, PLAN_SCHEMA, PLAN_VERSION, Pair, PairKind, Plan, PlanOptions, Subject, default_lock_path,
+    parse_cpus,
 };
 pub use prepare::{PrepareOptions, Prepared, Tree, prepare};
 pub use record::{

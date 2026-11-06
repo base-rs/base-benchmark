@@ -71,12 +71,32 @@ pub struct SampleEntry {
 }
 
 /// A finished campaign directory and its summary.
+///
+/// Serialized results are deliberately compact: the directory, evidence class, and warnings. The complete summary is in `summary.json`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Campaign {
     pub output: PathBuf,
+    pub summary_path: PathBuf,
+    pub evidence: String,
+    pub warnings: Vec<String>,
+    #[serde(skip)]
     pub summary: Summary,
     /// The human-readable summary also printed by the CLI.
+    #[serde(skip)]
     pub report: String,
+}
+
+impl Campaign {
+    fn new(output: &Path, summary: Summary) -> Self {
+        Self {
+            output: output.to_owned(),
+            summary_path: output.join("summary.json"),
+            evidence: summary.evidence.clone(),
+            warnings: summary.warnings.clone(),
+            report: summary.report(),
+            summary,
+        }
+    }
 }
 
 /// Run every subject once per round, in a seeded random order, under the host lock.
@@ -104,11 +124,7 @@ pub fn run(
     match collect(&journal, cancellation, progress) {
         Ok(summary) => {
             journal.complete(&summary)?;
-            Ok(Campaign {
-                output: output.to_owned(),
-                report: summary.report(),
-                summary,
-            })
+            Ok(Campaign::new(output, summary))
         }
         Err(error) => {
             let status = if cancellation.is_cancelled() {
@@ -134,11 +150,7 @@ pub fn summarize_directory(output: &Path) -> io::Result<Campaign> {
     let entries = read_entries(&output.join("samples.jsonl"))?;
     let summary = summarize(&metadata.plan, &entries);
     write_json(&output.join("summary.json"), &summary)?;
-    Ok(Campaign {
-        output: output.to_owned(),
-        report: summary.report(),
-        summary,
-    })
+    Ok(Campaign::new(output, summary))
 }
 
 pub fn read_metadata(output: &Path) -> io::Result<CampaignMetadata> {

@@ -93,13 +93,10 @@ fn prepares_trees_with_a_layout_replica_and_compares_them() {
         .find(|pair| pair.kind == PairKind::Variant)
         .unwrap();
     assert_eq!(variant.metrics[0].improved, 2);
-    assert!(
-        campaign
-            .summary
-            .warnings
-            .iter()
-            .all(|warning| warning.contains("within the layout replica's range"))
-    );
+    assert!(campaign.summary.warnings.iter().all(|warning| {
+        warning.contains("within the layout replica's range")
+            || warning.starts_with("no CPU placement")
+    }));
     assert_eq!(
         read_metadata(&campaign.output).unwrap().status,
         CampaignStatus::Complete

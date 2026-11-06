@@ -346,6 +346,30 @@ impl Plan {
     }
 }
 
+/// Parse a CPU list such as `0,2,4-6` into sorted, unique CPU numbers.
+pub fn parse_cpus(value: &str) -> io::Result<Vec<usize>> {
+    let invalid = || invalid_input(format!("invalid CPU list {value:?}"));
+    let mut cpus = Vec::new();
+    for part in value.split(',') {
+        match part.split_once('-') {
+            Some((first, last)) => {
+                let (first, last): (usize, usize) = (
+                    first.parse().map_err(|_| invalid())?,
+                    last.parse().map_err(|_| invalid())?,
+                );
+                if first > last {
+                    return Err(invalid());
+                }
+                cpus.extend(first..=last);
+            }
+            None => cpus.push(part.parse().map_err(|_| invalid())?),
+        }
+    }
+    cpus.sort_unstable();
+    cpus.dedup();
+    Ok(cpus)
+}
+
 fn seed_from_clock() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

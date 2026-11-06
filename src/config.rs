@@ -106,6 +106,7 @@ pub struct Variant {
     pub arguments: Vec<String>,
 }
 
+/// `[package.metadata.base-benchmark]`. Package-level `arguments` are prepended to every scenario's; `smoke-arguments`, `variants`, and `baseline` are defaults a scenario can replace.
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct PackageConfiguration {
@@ -115,7 +116,55 @@ struct PackageConfiguration {
     #[serde(default)]
     features: Vec<String>,
     #[serde(default)]
-    scenario: Vec<Scenario>,
+    arguments: Vec<String>,
+    #[serde(default)]
+    smoke_arguments: Vec<String>,
+    #[serde(default)]
+    variants: Vec<Variant>,
+    baseline: Option<String>,
+    #[serde(default)]
+    scenario: Vec<ScenarioConfiguration>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct ScenarioConfiguration {
+    name: String,
+    #[serde(default)]
+    arguments: Vec<String>,
+    smoke_arguments: Option<Vec<String>>,
+    variants: Option<Vec<Variant>>,
+    baseline: Option<String>,
+}
+
+impl PackageConfiguration {
+    /// Resolve package-level defaults into each scenario.
+    fn scenarios(&self) -> Vec<Scenario> {
+        self.scenario
+            .iter()
+            .map(|scenario| Scenario {
+                name: scenario.name.clone(),
+                arguments: self
+                    .arguments
+                    .iter()
+                    .chain(&scenario.arguments)
+                    .cloned()
+                    .collect(),
+                smoke_arguments: scenario
+                    .smoke_arguments
+                    .clone()
+                    .unwrap_or_else(|| self.smoke_arguments.clone()),
+                variants: scenario
+                    .variants
+                    .clone()
+                    .unwrap_or_else(|| self.variants.clone()),
+                baseline: match &scenario.variants {
+                    Some(_) => scenario.baseline.clone(),
+                    None => scenario.baseline.clone().or_else(|| self.baseline.clone()),
+                },
+            })
+            .collect()
+    }
 }
 
 fn release() -> String {
@@ -175,7 +224,7 @@ pub(crate) fn parse_metadata(metadata: &Value) -> io::Result<Vec<Suite>> {
             })
             .filter_map(|target| target["name"].as_str())
             .collect();
-        let binary = match configuration.binary {
+        let binary = match configuration.binary.clone() {
             Some(binary) if binaries.contains(&binary.as_str()) => binary,
             Some(binary) => {
                 return Err(invalid_input(format!(
@@ -190,8 +239,9 @@ pub(crate) fn parse_metadata(metadata: &Value) -> io::Result<Vec<Suite>> {
                 )));
             }
         };
+        let scenarios = configuration.scenarios();
         let mut scenario_names = BTreeSet::new();
-        for scenario in &configuration.scenario {
+        for scenario in &scenarios {
             scenario.validate(&name)?;
             if !scenario_names.insert(scenario.name.as_str()) {
                 return Err(invalid_input(format!(
@@ -207,7 +257,7 @@ pub(crate) fn parse_metadata(metadata: &Value) -> io::Result<Vec<Suite>> {
             binary,
             profile: configuration.profile,
             features: configuration.features,
-            scenarios: configuration.scenario,
+            scenarios,
         });
     }
     Ok(suites)

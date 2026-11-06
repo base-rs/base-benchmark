@@ -4,7 +4,7 @@
 //! The `base-benchmark` command. It parses arguments and calls [`Workspace`] operations, exactly as the Bake tasks do.
 
 use crate::config::invalid_input;
-use crate::plan::{Mode, default_lock_path};
+use crate::plan::{Mode, default_lock_path, parse_cpus};
 use crate::prepare::Tree;
 use crate::runner::{Cancellation, summarize_directory};
 use crate::workspace::{RunRequest, Workspace};
@@ -135,30 +135,6 @@ fn print_json(out: &mut dyn Write, value: &impl serde::Serialize) -> io::Result<
     let mut text = serde_json::to_vec_pretty(value).expect("command results serialize");
     text.push(b'\n');
     out.write_all(&text)
-}
-
-/// Parse `0,2,4-6`.
-pub(crate) fn parse_cpus(value: &str) -> io::Result<Vec<usize>> {
-    let invalid = || invalid_input(format!("invalid CPU list {value:?}"));
-    let mut cpus = Vec::new();
-    for part in value.split(',') {
-        match part.split_once('-') {
-            Some((first, last)) => {
-                let (first, last): (usize, usize) = (
-                    first.parse().map_err(|_| invalid())?,
-                    last.parse().map_err(|_| invalid())?,
-                );
-                if first > last {
-                    return Err(invalid());
-                }
-                cpus.extend(first..=last);
-            }
-            None => cpus.push(part.parse().map_err(|_| invalid())?),
-        }
-    }
-    cpus.sort_unstable();
-    cpus.dedup();
-    Ok(cpus)
 }
 
 /// `--name value` pairs and positional arguments. Unknown and repeated single-valued options are errors.
