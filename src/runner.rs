@@ -10,11 +10,13 @@ pub use host::{CpuIdentity, HostIdentity};
 pub use process::{Cancellation, SignalGuard};
 
 use crate::artifact::write_json;
-use crate::plan::{Plan, Shuffle, Subject};
+use crate::plan::{Plan, STACK_PADDING_LIMIT, STACK_PADDING_VARIABLE, Shuffle, Subject};
 use crate::record::{Metric, ProcessRecord, invalid};
 use crate::summary::{Summary, summarize};
 use lock::HostLock;
+use process::Launch;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +33,8 @@ pub struct CampaignMetadata {
     pub version: u32,
     pub status: CampaignStatus,
     pub evidence: String,
+    /// The tool version that collected the campaign.
+    pub generator: String,
     pub plan: Plan,
     pub host: HostIdentity,
     pub started_unix_ms: u64,
@@ -57,6 +61,8 @@ pub struct SampleEntry {
     pub subject: String,
     pub command: Vec<String>,
     pub cpus: Vec<usize>,
+    /// The length of the random stack-padding variable, when padding is enabled.
+    pub stack_padding: Option<usize>,
     pub executable_sha256: String,
     pub duration_ns: u64,
     pub exit_code: Option<i32>,
@@ -114,6 +120,7 @@ pub fn run(
         version: CAMPAIGN_VERSION,
         status: CampaignStatus::InProgress,
         evidence: plan.mode.evidence().to_owned(),
+        generator: crate::summary::GENERATOR.to_owned(),
         host: HostIdentity::capture(&plan.cpus),
         plan,
         started_unix_ms: unix_ms(),
@@ -181,9 +188,18 @@ fn collect(
     progress: &mut dyn Write,
 ) -> io::Result<Summary> {
     let plan = journal.metadata.plan.clone();
+    let staged = stage(&plan, &journal.output)?;
     let _lock = HostLock::acquire(&plan.lock, cancellation, progress)?;
+    let collection = Collection {
+        plan: &plan,
+        output: &journal.output,
+        staged: &staged,
+        cancellation,
+    };
     let mut shuffle = Shuffle::new(plan.seed);
-    let mut signature = None;
+    // A separate stream, so padding does not change the round order of a given seed.
+    let mut padding = Shuffle::new(plan.seed ^ 0x5851_f42d_4c95_7f2d);
+    let mut expected = Expectations::default();
     let mut entries = Vec::new();
     let count = plan.subjects.len();
     for round in 1..=plan.rounds {
@@ -199,15 +215,10 @@ fn collect(
                 position + 1,
                 subject.label
             );
-            let entry = sample(
-                &plan,
-                subject,
-                round,
-                position,
-                &journal.output,
-                cancellation,
-                &mut signature,
-            );
+            let stack_padding = plan
+                .stack_padding
+                .then(|| padding.below(STACK_PADDING_LIMIT));
+            let entry = collection.sample(subject, round, position, stack_padding, &mut expected);
             journal.append(&entry)?;
             if let Some(error) = &entry.error {
                 if cancellation.is_cancelled() {
@@ -224,117 +235,200 @@ fn collect(
     Ok(summarize(&plan, &entries))
 }
 
-fn sample(
-    plan: &Plan,
-    subject: &Subject,
-    round: u32,
-    position: usize,
-    output: &Path,
-    cancellation: &Cancellation,
-    signature: &mut Option<String>,
-) -> SampleEntry {
-    let mut entry = SampleEntry {
-        round,
-        position,
-        subject: subject.label.clone(),
-        command: Vec::new(),
-        cpus: plan.cpus.clone(),
-        executable_sha256: String::new(),
-        duration_ns: 0,
-        exit_code: None,
-        signal: None,
-        timed_out: false,
-        error: None,
-        stderr: String::new(),
-        record: None,
-        process_metrics: Vec::new(),
-    };
-    if let Err(error) = collect_sample(plan, subject, output, cancellation, signature, &mut entry) {
-        entry.error = Some(error.to_string());
-    }
-    entry
+/// Link every frozen executable into `bin/` under equal-length names, falling back to a copy.
+///
+/// The executable path is copied onto each process's initial stack, so artifacts with labels of different lengths would otherwise start with differently aligned stacks.
+fn stage(plan: &Plan, output: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
+    let directory = output.join("bin");
+    let width = plan.artifacts.artifacts.len().to_string().len();
+    std::fs::create_dir(&directory).and_then(|()| {
+        plan.artifacts
+            .artifacts
+            .iter()
+            .enumerate()
+            .map(|(index, artifact)| {
+                let path = directory.join(format!("{index:0width$}"));
+                std::fs::hard_link(&artifact.executable, &path)
+                    .or_else(|_| std::fs::copy(&artifact.executable, &path).map(drop))
+                    .map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "{}: cannot stage {}: {error}",
+                                artifact.label,
+                                artifact.executable.display()
+                            ),
+                        )
+                    })?;
+                Ok((artifact.label.clone(), path))
+            })
+            .collect()
+    })
 }
 
-fn collect_sample(
-    plan: &Plan,
-    subject: &Subject,
-    output: &Path,
-    cancellation: &Cancellation,
-    signature: &mut Option<String>,
-    entry: &mut SampleEntry,
-) -> io::Result<()> {
-    let artifact = plan
-        .artifacts
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.label == subject.artifact)
-        .expect("plans only name their own artifacts");
-    entry.executable_sha256 = artifact.sha256.clone();
-    artifact.verify()?;
-    let counters = output.join(format!("perf-{}-{}.csv", entry.round, entry.position));
-    let (program, arguments) = if plan.perf_events.is_empty() {
-        (subject.program.clone(), subject.arguments.clone())
-    } else {
-        perf::wrap(
-            &plan.perf_program,
-            &plan.perf_events,
-            &counters,
-            &subject.program,
-            &subject.arguments,
-        )
-    };
-    entry.command = std::iter::once(program.display().to_string())
-        .chain(arguments.iter().cloned())
-        .collect();
-    let execution = process::execute(
-        &program,
-        &arguments,
-        &plan.cpus,
-        Duration::from_millis(plan.timeout_ms),
-        cancellation,
-    )?;
-    entry.duration_ns = execution.duration_ns;
-    entry.exit_code = execution.code;
-    entry.signal = execution.signal;
-    entry.timed_out = execution.timed_out;
-    entry.stderr = String::from_utf8_lossy(&execution.stderr).into_owned();
-    if execution.cancelled {
-        return Err(cancelled());
+/// The fixed context of one campaign's samples.
+struct Collection<'a> {
+    plan: &'a Plan,
+    output: &'a Path,
+    staged: &'a BTreeMap<String, PathBuf>,
+    cancellation: &'a Cancellation,
+}
+
+impl Collection<'_> {
+    fn sample(
+        &self,
+        subject: &Subject,
+        round: u32,
+        position: usize,
+        stack_padding: Option<usize>,
+        expected: &mut Expectations,
+    ) -> SampleEntry {
+        let mut entry = SampleEntry {
+            round,
+            position,
+            subject: subject.label.clone(),
+            command: Vec::new(),
+            cpus: self.plan.cpus.clone(),
+            stack_padding,
+            executable_sha256: String::new(),
+            duration_ns: 0,
+            exit_code: None,
+            signal: None,
+            timed_out: false,
+            error: None,
+            stderr: String::new(),
+            record: None,
+            process_metrics: Vec::new(),
+        };
+        if let Err(error) = self.collect_sample(subject, expected, &mut entry) {
+            entry.error = Some(error.to_string());
+        }
+        entry
     }
-    if execution.timed_out {
-        return Err(invalid(format!("timed out after {} ms", plan.timeout_ms)));
+
+    fn collect_sample(
+        &self,
+        subject: &Subject,
+        expected: &mut Expectations,
+        entry: &mut SampleEntry,
+    ) -> io::Result<()> {
+        let plan = self.plan;
+        let artifact = plan
+            .artifacts
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.label == subject.artifact)
+            .expect("plans only name their own artifacts");
+        let executable = &self.staged[&subject.artifact];
+        entry.executable_sha256 = artifact.sha256.clone();
+        artifact.verify_at(executable)?;
+        let counters = self
+            .output
+            .join(format!("perf-{}-{}.csv", entry.round, entry.position));
+        let (program, arguments) = if plan.perf_events.is_empty() {
+            (executable.clone(), subject.arguments.clone())
+        } else {
+            perf::wrap(
+                &plan.perf_program,
+                &plan.perf_events,
+                &counters,
+                executable,
+                &subject.arguments,
+            )
+        };
+        entry.command = std::iter::once(program.display().to_string())
+            .chain(arguments.iter().cloned())
+            .collect();
+        let mut environment = plan.environment.clone();
+        if let Some(length) = entry.stack_padding {
+            environment.insert(STACK_PADDING_VARIABLE.to_owned(), "x".repeat(length));
+        }
+        let launch = Launch {
+            program: &program,
+            arguments: &arguments,
+            environment: &environment,
+            directory: &plan.working_directory,
+            cpus: &plan.cpus,
+        };
+        let execution = process::execute(
+            &launch,
+            Duration::from_millis(plan.timeout_ms),
+            self.cancellation,
+        )?;
+        entry.duration_ns = execution.duration_ns;
+        entry.exit_code = execution.code;
+        entry.signal = execution.signal;
+        entry.timed_out = execution.timed_out;
+        entry.stderr = String::from_utf8_lossy(&execution.stderr).into_owned();
+        if execution.cancelled {
+            return Err(cancelled());
+        }
+        if execution.timed_out {
+            return Err(invalid(format!("timed out after {} ms", plan.timeout_ms)));
+        }
+        if execution.escaped {
+            return Err(invalid(
+                "a descendant that left the workload's process group kept its output open; it was not killed and may still be running",
+            ));
+        }
+        if !execution.succeeded() {
+            return Err(invalid(format!(
+                "workload failed with exit code {:?}, signal {:?}",
+                execution.code, execution.signal
+            )));
+        }
+        if execution.stdout_truncated {
+            return Err(invalid("workload stdout exceeded the record size limit"));
+        }
+        let record: ProcessRecord = serde_json::from_slice(&execution.stdout).map_err(|error| {
+            invalid(format!("stdout is not exactly one process record: {error}"))
+        })?;
+        record.validate()?;
+        entry.record = Some(record);
+        let record = entry.record.as_ref().expect("the record was just stored");
+        expected.check(subject, record)?;
+        if !plan.perf_events.is_empty() {
+            let text = std::fs::read_to_string(&counters)
+                .map_err(|error| invalid(format!("perf stat wrote no counters: {error}")))?;
+            entry.process_metrics = perf::parse(&text, &plan.perf_events)?;
+        }
+        Ok(())
     }
-    if !execution.succeeded() {
-        return Err(invalid(format!(
-            "workload failed with exit code {:?}, signal {:?}",
-            execution.code, execution.signal
-        )));
-    }
-    if execution.stdout_truncated {
-        return Err(invalid("workload stdout exceeded the record size limit"));
-    }
-    let record: ProcessRecord = serde_json::from_slice(&execution.stdout)
-        .map_err(|error| invalid(format!("stdout is not exactly one process record: {error}")))?;
-    record.validate()?;
-    entry.record = Some(record);
-    let record = entry.record.as_ref().expect("the record was just stored");
-    if let Some(actual) = &record.signature {
-        match signature {
-            Some(expected) if expected != actual => {
+}
+
+/// What every later record of the campaign must match: the first record's workload and signature, and each variant's parameters.
+#[derive(Default)]
+struct Expectations {
+    identity: Option<(String, Option<String>)>,
+    parameters: BTreeMap<Option<String>, serde_json::Value>,
+}
+
+impl Expectations {
+    fn check(&mut self, subject: &Subject, record: &ProcessRecord) -> io::Result<()> {
+        let identity = (record.workload.clone(), record.signature.clone());
+        match &self.identity {
+            Some(expected) if *expected != identity => {
                 return Err(invalid(format!(
-                    "output signature {actual:?} differs from {expected:?}: the subjects did not do equivalent work"
+                    "workload {:?} with signature {:?} differs from {:?} with {:?}: the subjects did not do equivalent work",
+                    identity.0, identity.1, expected.0, expected.1
                 )));
             }
             Some(_) => {}
-            None => *signature = Some(actual.clone()),
+            None => self.identity = Some(identity),
         }
+        // Every artifact must run a variant with the same parameters, or a changed default would be compared silently.
+        let parameters = self
+            .parameters
+            .entry(subject.variant.clone())
+            .or_insert_with(|| record.parameters.clone());
+        if *parameters != record.parameters {
+            return Err(invalid(format!(
+                "{}: parameters differ from another run of the same variant: {} versus {parameters}",
+                subject.label, record.parameters
+            )));
+        }
+        Ok(())
     }
-    if !plan.perf_events.is_empty() {
-        let text = std::fs::read_to_string(&counters)
-            .map_err(|error| invalid(format!("perf stat wrote no counters: {error}")))?;
-        entry.process_metrics = perf::parse(&text, &plan.perf_events)?;
-    }
-    Ok(())
 }
 
 fn cancelled() -> io::Error {

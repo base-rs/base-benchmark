@@ -131,7 +131,7 @@ fn only_measured_totals_are_normalized_by_operations() {
         Metric::mean("b", Unit::Nanoseconds, 3.0)
             .with_phase(Phase::Process)
             .per_operation(4),
-        Some(3.0)
+        None
     );
     let unavailable = Metric::unavailable("c", Unit::Count, "denied")
         .with_source(Source::PerfStat)

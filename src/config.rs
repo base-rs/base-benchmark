@@ -56,9 +56,12 @@ pub struct Scenario {
     /// Arguments appended only for smoke runs, typically small iteration counts.
     #[serde(default)]
     pub smoke_arguments: Vec<String>,
+    /// Arguments appended only for screening and recorded runs, such as pinned iteration counts that smoke arguments would otherwise duplicate.
+    #[serde(default)]
+    pub measure_arguments: Vec<String>,
     #[serde(default)]
     pub variants: Vec<Variant>,
-    /// The variant other variants are compared with; defaults to the first.
+    /// The variant other variants are compared with, resolved to the first when not configured.
     #[serde(default)]
     pub baseline: Option<String>,
 }
@@ -106,7 +109,7 @@ pub struct Variant {
     pub arguments: Vec<String>,
 }
 
-/// `[package.metadata.base-benchmark]`. Package-level `arguments` are prepended to every scenario's; `smoke-arguments`, `variants`, and `baseline` are defaults a scenario can replace.
+/// `[package.metadata.base-benchmark]`. Package-level `arguments` are prepended to every scenario's; `smoke-arguments`, `measure-arguments`, `variants`, and `baseline` are defaults a scenario can replace.
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct PackageConfiguration {
@@ -119,6 +122,8 @@ struct PackageConfiguration {
     arguments: Vec<String>,
     #[serde(default)]
     smoke_arguments: Vec<String>,
+    #[serde(default)]
+    measure_arguments: Vec<String>,
     #[serde(default)]
     variants: Vec<Variant>,
     baseline: Option<String>,
@@ -133,6 +138,7 @@ struct ScenarioConfiguration {
     #[serde(default)]
     arguments: Vec<String>,
     smoke_arguments: Option<Vec<String>>,
+    measure_arguments: Option<Vec<String>>,
     variants: Option<Vec<Variant>>,
     baseline: Option<String>,
 }
@@ -154,6 +160,10 @@ impl PackageConfiguration {
                     .smoke_arguments
                     .clone()
                     .unwrap_or_else(|| self.smoke_arguments.clone()),
+                measure_arguments: scenario
+                    .measure_arguments
+                    .clone()
+                    .unwrap_or_else(|| self.measure_arguments.clone()),
                 variants: scenario
                     .variants
                     .clone()
@@ -239,16 +249,19 @@ pub(crate) fn parse_metadata(metadata: &Value) -> io::Result<Vec<Suite>> {
                 )));
             }
         };
-        let scenarios = configuration.scenarios();
+        let mut scenarios = configuration.scenarios();
         let mut scenario_names = BTreeSet::new();
-        for scenario in &scenarios {
+        for scenario in &mut scenarios {
             scenario.validate(&name)?;
-            if !scenario_names.insert(scenario.name.as_str()) {
+            if !scenario_names.insert(scenario.name.clone()) {
                 return Err(invalid_input(format!(
                     "{name}: duplicate scenario {:?}",
                     scenario.name
                 )));
             }
+            scenario.baseline = scenario
+                .baseline_variant()
+                .map(|variant| variant.name.clone());
         }
         suites.push(Suite {
             manifest_path: PathBuf::from(package["manifest_path"].as_str().unwrap_or_default()),

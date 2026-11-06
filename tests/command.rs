@@ -1,11 +1,13 @@
 // Released under the MIT License.
 // Copyright, 2026, by Samuel Williams.
 
+#![cfg(feature = "runner")]
+
 mod support;
 
 use base_benchmark::{CampaignStatus, read_metadata};
 use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 fn command(arguments: &[&str]) -> (ExitCode, String, String) {
@@ -47,13 +49,13 @@ fn every_command_uses_the_shared_workspace_operations() {
         &manifest,
         "--package",
         "fixture",
-        "--replica",
-        "false",
+        "--replicas",
+        "1",
         "--output",
         &prepared,
     ]);
     assert_eq!(code, ExitCode::SUCCESS, "{errors}");
-    assert!(out.contains("artifacts.json"));
+    assert!(out.contains("current-replica"));
     let (code, _, errors) = command(&[
         "prepare",
         "--manifest-path",
@@ -70,12 +72,11 @@ fn every_command_uses_the_shared_workspace_operations() {
     let campaign = text(&directory.path().join("campaign"));
     let (code, out, errors) = command(&[
         "run",
+        "work",
         "--manifest-path",
         &manifest,
         "--package",
         "fixture",
-        "--scenario",
-        "work",
         "--artifacts",
         &artifacts,
         "--mode",
@@ -96,6 +97,8 @@ fn every_command_uses_the_shared_workspace_operations() {
         "descriptive",
         "--idle-host",
         "false",
+        "--stack-padding",
+        "true",
     ]);
     assert_eq!(code, ExitCode::SUCCESS, "{errors}");
     assert!(out.contains("screening: paired triage"), "{out}");
@@ -123,35 +126,34 @@ fn every_command_uses_the_shared_workspace_operations() {
     assert!(out.contains("smoke: correctness"));
 }
 
-#[test]
-fn the_binary_stops_and_records_cancelled_campaigns_on_sigterm() {
-    let directory = tempfile::tempdir().unwrap();
+/// Start the binary waiting for a lock this test holds, so signals arrive while the campaign is guarded.
+fn waiting_campaign(directory: &Path, scenario: &str) -> (Child, std::path::PathBuf) {
     let manifest = support::workspace(
-        &directory.path().join("project"),
+        &directory.join("project"),
         "\n[[package.metadata.base-benchmark.scenario]]\nname = \"slow\"\narguments = [\"slow\"]\n",
     );
+    let prepared = directory.join("prepared");
     let (code, _, errors) = command(&[
         "prepare",
         "--manifest-path",
         &text(&manifest),
         "--output",
-        &text(&directory.path().join("prepared")),
+        &text(&prepared),
     ]);
     assert_eq!(code, ExitCode::SUCCESS, "{errors}");
-    let campaign = directory.path().join("campaign");
+    let campaign = directory.join("campaign");
     let child = Command::new(env!("CARGO_BIN_EXE_base-benchmark"))
         .args([
             "run",
+            scenario,
             "--manifest-path",
             &text(&manifest),
-            "--scenario",
-            "slow",
             "--artifacts",
-            &text(&directory.path().join("prepared/artifacts.json")),
+            &text(&prepared.join("artifacts.json")),
         ])
         .args([
             "--lock",
-            &text(&directory.path().join("lock")),
+            &text(&directory.join("lock")),
             "--output",
             &text(&campaign),
         ])
@@ -170,22 +172,46 @@ fn the_binary_stops_and_records_cancelled_campaigns_on_sigterm() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(child.id() as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    )
-    .unwrap();
+    (child, campaign)
+}
+
+fn signal(child: &Child, signal: nix::sys::signal::Signal) {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.id() as i32), signal).unwrap();
+}
+
+#[test]
+fn the_binary_stops_and_records_cancelled_campaigns_on_sigterm() {
+    let directory = tempfile::tempdir().unwrap();
+    let (child, campaign) = waiting_campaign(directory.path(), "slow");
+    let started = Instant::now();
+    signal(&child, nix::sys::signal::Signal::SIGTERM);
     let output = child.wait_with_output().unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
     assert!(
         started.elapsed() < Duration::from_secs(20),
         "the slow workload was not killed"
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("received signal"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("stopping the campaign"));
     assert_eq!(
         read_metadata(&campaign).unwrap().status,
         CampaignStatus::Cancelled
     );
+}
+
+#[test]
+fn a_second_signal_exits_immediately() {
+    let directory = tempfile::tempdir().unwrap();
+    let lock = std::fs::File::create(directory.path().join("lock")).unwrap();
+    let _held = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusive).unwrap();
+    let (child, _) = waiting_campaign(directory.path(), "work");
+    // Different signals are not merged while pending, so both reach the handler before the lock wait notices either.
+    signal(&child, nix::sys::signal::Signal::SIGTERM);
+    signal(&child, nix::sys::signal::Signal::SIGINT);
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Pending signals are delivered in signal-number order, so either can be the second.
+    assert!(matches!(output.status.code(), Some(130 | 143)), "{stderr}");
+    assert!(stderr.contains("exiting"));
 }
 
 struct Rejecting;

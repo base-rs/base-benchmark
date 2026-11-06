@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::test_support::{SHELL, artifact, manifest, suite};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn options(roles: &[(&str, ArtifactRole)], variants: &[&str], mode: Mode) -> PlanOptions {
     let artifacts = manifest(
@@ -31,7 +31,10 @@ fn modes_parse_and_describe_their_evidence() {
         [1, 5, 10]
     );
     assert!("fast".parse::<Mode>().is_err());
-    assert!(default_lock_path().ends_with("base-benchmark-host.lock"));
+    assert_eq!(
+        default_lock_path(),
+        PathBuf::from("/tmp/base-benchmark-host.lock")
+    );
 }
 
 #[test]
@@ -108,7 +111,10 @@ fn scenarios_without_variants_use_artifact_labels() {
     options.rounds = Some(3);
     let plan = Plan::new(options).unwrap();
     assert_eq!(plan.subjects[0].label, "baseline");
-    assert_eq!(plan.subjects[0].arguments, ["/work.sh"]);
+    assert_eq!(plan.subjects[0].arguments, ["/work.sh", "measure"]);
+    assert!(plan.stack_padding);
+    assert_eq!(plan.working_directory, PathBuf::from("/"));
+    assert_eq!(plan.environment["LC_ALL"], "C");
     assert!(plan.pairs.is_empty());
     assert_eq!(plan.rounds, 3);
 }
@@ -147,13 +153,17 @@ fn recorded_campaigns_report_every_missing_prerequisite() {
     options.rounds = Some(5);
     options.artifacts.artifacts[1].source.dirty = Some(true);
     options.artifacts.artifacts[1].build.toolchain = "other".to_owned();
+    options.artifacts.artifacts[1].build.configuration = vec![crate::artifact::ConfigurationFile {
+        path: PathBuf::from("/.cargo/config.toml"),
+        sha256: "0".repeat(64),
+    }];
     let error = Plan::new(options).unwrap_err().to_string();
     for missing in [
         "at least 10 rounds",
         "explicit CPU placement",
         "decision rule",
         "idle-host",
-        "unmodified revision for candidate",
+        "unmodified source and path dependencies for candidate",
         "layout replica",
         "same toolchain",
     ] {
@@ -184,4 +194,15 @@ fn shuffles_are_seeded_permutations() {
     sorted.sort_unstable();
     assert_eq!(sorted, (0..10).collect::<Vec<_>>());
     assert!(Shuffle::new(1).order(0).is_empty());
+}
+
+#[test]
+fn launches_use_a_minimal_recorded_environment() {
+    assert_eq!(launch_environment(Some("/bin".to_owned()))["PATH"], "/bin");
+    assert_eq!(
+        launch_environment(None)["PATH"],
+        "/usr/local/bin:/usr/bin:/bin"
+    );
+    let mut shuffle = Shuffle::new(9);
+    assert!((0..100).all(|_| shuffle.below(STACK_PADDING_LIMIT) < STACK_PADDING_LIMIT));
 }

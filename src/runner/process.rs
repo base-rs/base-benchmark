@@ -6,23 +6,50 @@ use nix::sched::{CpuSet, sched_getaffinity, sched_setaffinity};
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::wait::{Id, WaitPidFlag, waitid};
 use nix::unistd::Pid;
+use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 /// Workload stdout beyond this size is a malformed record.
 pub(crate) const STDOUT_LIMIT: usize = 16 * 1024 * 1024;
 /// Only the end of stderr is retained as diagnostic evidence.
 pub(crate) const STDERR_LIMIT: usize = 64 * 1024;
+/// How long to wait for output after the workload and its process group are gone.
+pub(crate) const OUTPUT_GRACE: Duration = Duration::from_secs(2);
+/// Attempts to start a program whose file is briefly open for writing elsewhere, such as a just-staged copy.
+const BUSY_ATTEMPTS: usize = 50;
+
+enum Output {
+    Stdout((Vec<u8>, bool)),
+    Stderr(Vec<u8>),
+}
+
+/// Spawn, retrying `ETXTBSY`: another thread may have forked while the executable was still open for writing, and that descriptor closes when its child execs.
+fn spawn(command: &mut Command) -> io::Result<std::process::Child> {
+    let mut attempts = 1;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy
+                    && attempts < BUSY_ATTEMPTS =>
+            {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
 
 /// Stops a running campaign: the active workload process group is killed and no further samples start.
 ///
-/// Every process the runner starts leads its own process group, so wrapper descendants such as a `perf` child are killed with it. The lock is released only after that cleanup.
+/// Every process the runner starts leads its own process group, so wrapper descendants such as a `perf` child are killed with it. The lock is released only after that cleanup. A cancellation tracks one workload process at a time.
 #[derive(Clone, Default)]
 pub struct Cancellation(Arc<CancellationState>);
 
@@ -31,6 +58,10 @@ struct CancellationState {
     cancelled: AtomicBool,
     active: Mutex<Option<Pid>>,
 }
+
+/// Cancellations guarded against termination signals, shared with the process-wide handler thread.
+static GUARDED: Mutex<Vec<Cancellation>> = Mutex::new(Vec::new());
+static HANDLER: Once = Once::new();
 
 impl Cancellation {
     pub fn new() -> Self {
@@ -54,21 +85,22 @@ impl Cancellation {
     }
 
     /// Cancel when the process receives SIGINT, SIGTERM, or SIGHUP, until the guard is dropped.
+    ///
+    /// The first signal cancels every guarded campaign, so workloads are killed before locks are released. A signal while nothing is guarded, or a second signal, exits the process with status 128 plus the signal number. The handler stays installed for the life of the process.
     pub fn on_termination_signals(&self) -> SignalGuard {
-        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])
-            .expect("termination signals are not forbidden signals");
-        let handle = signals.handle();
-        let cancellation = self.clone();
-        let thread = std::thread::spawn(move || {
-            if let Some(signal) = signals.forever().next() {
-                eprintln!("base-benchmark: received signal {signal}; stopping the campaign");
-                cancellation.cancel();
-            }
+        HANDLER.call_once(|| {
+            use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+            let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])
+                .expect("termination signals are not forbidden signals");
+            std::thread::spawn(move || {
+                for signal in signals.forever() {
+                    respond(signal);
+                }
+            });
         });
+        guarded().push(self.clone());
         SignalGuard {
-            handle,
-            thread: Some(thread),
+            cancellation: self.clone(),
         }
     }
 
@@ -96,16 +128,37 @@ impl Cancellation {
     }
 }
 
-/// Restores signal delivery to the rest of the process when dropped.
+fn guarded() -> std::sync::MutexGuard<'static, Vec<Cancellation>> {
+    GUARDED
+        .lock()
+        .expect("the signal registry is never poisoned")
+}
+
+/// Cancel guarded campaigns on the first signal; otherwise exit as the default action would.
+fn respond(signal: i32) {
+    let guarded = guarded();
+    if guarded
+        .iter()
+        .any(|cancellation| !cancellation.is_cancelled())
+    {
+        eprintln!(
+            "base-benchmark: received signal {signal}; stopping the campaign (signal again to exit immediately)"
+        );
+        guarded.iter().for_each(Cancellation::cancel);
+    } else {
+        eprintln!("base-benchmark: received signal {signal}; exiting");
+        std::process::exit(128 + signal);
+    }
+}
+
+/// Stops guarding a campaign. The process-wide handler remains, and exits on the next signal if nothing else is guarded.
 pub struct SignalGuard {
-    handle: signal_hook::iterator::Handle,
-    thread: Option<std::thread::JoinHandle<()>>,
+    cancellation: Cancellation,
 }
 
 impl Drop for SignalGuard {
     fn drop(&mut self) {
-        self.handle.close();
-        let _ = self.thread.take().map(std::thread::JoinHandle::join);
+        guarded().retain(|cancellation| !Arc::ptr_eq(&cancellation.0, &self.cancellation.0));
     }
 }
 
@@ -120,6 +173,8 @@ pub(crate) struct Execution {
     pub signal: Option<i32>,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// A descendant outside the process group kept the output open after the workload exited.
+    pub escaped: bool,
     pub stdout: Vec<u8>,
     pub stdout_truncated: bool,
     pub stderr: Vec<u8>,
@@ -128,36 +183,48 @@ pub(crate) struct Execution {
 
 impl Execution {
     pub fn succeeded(&self) -> bool {
-        self.code == Some(0) && !self.timed_out && !self.cancelled
+        self.code == Some(0) && !self.timed_out && !self.cancelled && !self.escaped
     }
+}
+
+/// What to start: the environment replaces the collector's own completely.
+pub(crate) struct Launch<'a> {
+    pub program: &'a Path,
+    pub arguments: &'a [String],
+    pub environment: &'a BTreeMap<String, String>,
+    pub directory: &'a Path,
+    pub cpus: &'a [usize],
 }
 
 /// Run one workload process to completion with bounded output, a deadline, CPU placement, and process-group cleanup.
 pub(crate) fn execute(
-    program: &Path,
-    arguments: &[String],
-    cpus: &[usize],
+    launch: &Launch,
     timeout: Duration,
     cancellation: &Cancellation,
 ) -> io::Result<Execution> {
+    let (program, cpus) = (launch.program, launch.cpus);
     let mut command = Command::new(program);
     command
-        .args(arguments)
-        .env("LC_ALL", "C")
+        .args(launch.arguments)
+        .env_clear()
+        .envs(launch.environment)
+        .current_dir(launch.directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
     let started = Instant::now();
-    let mut child = with_affinity(cpus, || command.spawn())
+    let mut child = with_affinity(cpus, || spawn(&mut command))
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", program.display())))?;
     let group = Pid::from_raw(i32::try_from(child.id()).expect("process IDs fit in pid_t"));
     cancellation.register(group);
 
+    let (sender, outputs) = mpsc::channel();
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
-    let stdout = std::thread::spawn(move || read_head(stdout, STDOUT_LIMIT));
-    let stderr = std::thread::spawn(move || read_tail(stderr, STDERR_LIMIT));
+    let stdout_sender = sender.clone();
+    std::thread::spawn(move || stdout_sender.send(Output::Stdout(read_head(stdout, STDOUT_LIMIT))));
+    std::thread::spawn(move || sender.send(Output::Stderr(read_tail(stderr, STDERR_LIMIT))));
 
     let timed_out = Arc::new(AtomicBool::new(false));
     let (done, finished) = mpsc::channel::<()>();
@@ -181,16 +248,27 @@ pub(crate) fn execute(
     cancellation.finish(group);
     // After `waitid` reported the exit, reaping our own child cannot fail.
     let status = child.wait().expect("an exited child can be reaped");
-    let (stdout, stdout_truncated) = stdout.join().expect("the stdout reader does not panic");
-    let stderr = stderr.join().expect("the stderr reader does not panic");
+    // A descendant that left the group survives cleanup and may hold the pipes open. Stop waiting for it rather than hold the lock indefinitely.
+    let deadline = Instant::now() + OUTPUT_GRACE;
+    let (mut stdout, mut stderr) = (None, None);
+    while stdout.is_none() || stderr.is_none() {
+        match outputs.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Output::Stdout(output)) => stdout = Some(output),
+            Ok(Output::Stderr(output)) => stderr = Some(output),
+            Err(_) => break,
+        }
+    }
+    let escaped = stdout.is_none() || stderr.is_none();
+    let (stdout, stdout_truncated) = stdout.unwrap_or_default();
     Ok(Execution {
         code: status.code(),
         signal: status.signal(),
         timed_out: timed_out.load(Ordering::SeqCst),
         cancelled: cancellation.is_cancelled(),
+        escaped,
         stdout,
         stdout_truncated,
-        stderr,
+        stderr: stderr.unwrap_or_default(),
         duration_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
     })
 }

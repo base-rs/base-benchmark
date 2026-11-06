@@ -39,6 +39,7 @@ fn current_process_intervals_report_the_standard_metrics() {
         names,
         [
             "wall_time",
+            "cpu_time",
             "user_cpu_time",
             "system_cpu_time",
             "voluntary_context_switches",
@@ -54,8 +55,11 @@ fn current_process_intervals_report_the_standard_metrics() {
     );
     assert_eq!(
         sample.metric("user_cpu_time").unwrap().resolution,
-        Some(1000)
+        Some(10_000_000),
+        "the user and system split is only tick-accurate"
     );
+    assert_eq!(sample.metric("cpu_time").unwrap().resolution, Some(1000));
+    assert_eq!(CurrentProcess.split_resolution_ns(), 10_000_000);
     assert_eq!(CurrentProcess.resolution_ns(), 1000);
 }
 

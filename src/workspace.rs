@@ -10,6 +10,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// The default deadline for one workload process.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// The semantic operations shared by the `base-benchmark` command and the Bake tasks.
 #[derive(Clone, Debug)]
 pub struct Workspace {
@@ -18,42 +21,37 @@ pub struct Workspace {
     pub rustc: PathBuf,
 }
 
-/// A request to collect one scenario from prepared artifacts.
-#[derive(Clone, Debug)]
+/// A request to collect one scenario from prepared artifacts. Unset options take the core's defaults.
+#[derive(Clone, Debug, Default)]
 pub struct RunRequest {
     pub package: Option<String>,
     pub scenario: String,
     pub artifacts: PathBuf,
-    pub mode: Mode,
+    /// Defaults to [`Mode::Screening`].
+    pub mode: Option<Mode>,
+    /// Defaults to the mode's round count.
     pub rounds: Option<u32>,
     pub seed: Option<u64>,
     pub cpus: Vec<usize>,
     pub perf_events: Vec<String>,
-    pub timeout: Duration,
-    pub lock: PathBuf,
+    /// Defaults to [`DEFAULT_TIMEOUT`].
+    pub timeout: Option<Duration>,
+    /// Defaults to [`default_lock_path`].
+    pub lock: Option<PathBuf>,
     pub output: Option<PathBuf>,
     pub decision_rule: Option<String>,
     pub idle_host: bool,
+    /// Defaults to enabled.
+    pub stack_padding: Option<bool>,
     pub invocation: Vec<String>,
 }
 
 impl RunRequest {
-    pub fn new(scenario: impl Into<String>, artifacts: impl Into<PathBuf>, mode: Mode) -> Self {
+    pub fn new(scenario: impl Into<String>, artifacts: impl Into<PathBuf>) -> Self {
         Self {
-            package: None,
             scenario: scenario.into(),
             artifacts: artifacts.into(),
-            mode,
-            rounds: None,
-            seed: None,
-            cpus: Vec::new(),
-            perf_events: Vec::new(),
-            timeout: Duration::from_secs(300),
-            lock: default_lock_path(),
-            output: None,
-            decision_rule: None,
-            idle_host: false,
-            invocation: Vec::new(),
+            ..Self::default()
         }
     }
 }
@@ -76,13 +74,14 @@ impl Workspace {
         config::select(self.suites()?, package)
     }
 
-    /// Build labelled trees, the first being the baseline. Without trees, the current workspace is the baseline, labelled `current`.
+    /// Build labelled trees, the first being the baseline, plus `replicas` layout replicas. Without trees, the current workspace is the baseline, labelled `current`.
     pub fn prepare(
         &self,
         package: Option<&str>,
         mut trees: Vec<Tree>,
-        replica: Option<bool>,
+        replicas: Option<usize>,
         output: Option<PathBuf>,
+        cancellation: &Cancellation,
     ) -> io::Result<Prepared> {
         let suite = self.suite(package)?;
         if trees.is_empty() {
@@ -92,14 +91,17 @@ impl Workspace {
             });
         }
         let output = output.unwrap_or_else(|| default_output(&suite.workspace_root, "prepared"));
-        prepare(&PrepareOptions {
-            suite,
-            trees,
-            replica,
-            output,
-            cargo: self.cargo.clone(),
-            rustc: self.rustc.clone(),
-        })
+        prepare(
+            &PrepareOptions {
+                suite,
+                trees,
+                replicas,
+                output,
+                cargo: self.cargo.clone(),
+                rustc: self.rustc.clone(),
+            },
+            cancellation,
+        )
     }
 
     pub fn run(
@@ -110,10 +112,11 @@ impl Workspace {
     ) -> io::Result<Campaign> {
         let suite = self.suite(request.package.as_deref())?;
         let artifacts = ArtifactManifest::read(&request.artifacts)?;
+        let mode = request.mode.unwrap_or(Mode::Screening);
         let output = request.output.unwrap_or_else(|| {
             default_output(
                 &suite.workspace_root,
-                &format!("{}-{}", request.scenario, request.mode),
+                &format!("{}-{mode}", request.scenario),
             )
         });
         let plan = Plan::new(PlanOptions {
@@ -121,12 +124,13 @@ impl Workspace {
             seed: request.seed,
             cpus: request.cpus,
             perf_events: request.perf_events,
-            timeout: request.timeout,
-            lock: request.lock,
+            timeout: request.timeout.unwrap_or(DEFAULT_TIMEOUT),
+            lock: request.lock.unwrap_or_else(default_lock_path),
             decision_rule: request.decision_rule,
             idle_host: request.idle_host,
+            stack_padding: request.stack_padding.unwrap_or(true),
             invocation: request.invocation,
-            ..PlanOptions::new(suite, request.scenario, artifacts, request.mode)
+            ..PlanOptions::new(suite, request.scenario, artifacts, mode)
         })?;
         runner::run(plan, &output, cancellation, progress)
     }
@@ -136,27 +140,76 @@ impl Workspace {
         &self,
         package: Option<&str>,
         output: Option<PathBuf>,
-        lock: &Path,
+        lock: Option<PathBuf>,
         cancellation: &Cancellation,
         progress: &mut dyn Write,
     ) -> io::Result<Vec<Campaign>> {
         let suite = self.suite(package)?;
         let output = output.unwrap_or_else(|| default_output(&suite.workspace_root, "smoke"));
+        // Labels cannot start with `.`, so prepared artifacts never collide with a scenario's directory.
         let prepared = self.prepare(
             Some(&suite.package),
             Vec::new(),
-            Some(false),
-            Some(output.join("artifacts")),
+            Some(0),
+            Some(output.join(".artifacts")),
+            cancellation,
         )?;
-        let mut campaigns = Vec::new();
-        for scenario in &suite.scenarios {
-            let mut request = RunRequest::new(&scenario.name, &prepared.manifest_path, Mode::Smoke);
-            request.package = Some(suite.package.clone());
-            request.lock = lock.to_owned();
-            request.output = Some(output.join(&scenario.name));
-            campaigns.push(self.run(request, cancellation, progress)?);
-        }
-        Ok(campaigns)
+        self.smoke_all(
+            &suite,
+            &prepared.manifest_path,
+            &output,
+            lock,
+            cancellation,
+            progress,
+        )
+    }
+
+    /// Run every scenario once, with its smoke arguments, using an executable built outside preparation, such as a workload's `CARGO_BIN_EXE_*` in its own tests.
+    pub fn smoke_executable(
+        &self,
+        package: Option<&str>,
+        executable: &Path,
+        output: &Path,
+        lock: Option<PathBuf>,
+    ) -> io::Result<Vec<Campaign>> {
+        let suite = self.suite(package)?;
+        let manifest_path = output.join("unprepared.json");
+        std::fs::create_dir_all(output)
+            .and_then(|()| ArtifactManifest::unprepared(&suite, executable))
+            .and_then(|manifest| manifest.write(&manifest_path))?;
+        self.smoke_all(
+            &suite,
+            &manifest_path,
+            output,
+            lock,
+            &Cancellation::new(),
+            &mut io::sink(),
+        )
+    }
+
+    fn smoke_all(
+        &self,
+        suite: &Suite,
+        artifacts: &Path,
+        output: &Path,
+        lock: Option<PathBuf>,
+        cancellation: &Cancellation,
+        progress: &mut dyn Write,
+    ) -> io::Result<Vec<Campaign>> {
+        suite
+            .scenarios
+            .iter()
+            .map(|scenario| {
+                let request = RunRequest {
+                    package: Some(suite.package.clone()),
+                    mode: Some(Mode::Smoke),
+                    lock: lock.clone(),
+                    output: Some(output.join(&scenario.name)),
+                    ..RunRequest::new(&scenario.name, artifacts)
+                };
+                self.run(request, cancellation, progress)
+            })
+            .collect()
     }
 }
 

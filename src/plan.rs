@@ -4,6 +4,7 @@
 use crate::artifact::{ArtifactManifest, ArtifactRole};
 use crate::config::{Suite, invalid_input};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
@@ -92,6 +93,8 @@ pub struct PlanOptions {
     pub idle_host: bool,
     /// The command line that requested the campaign, for provenance.
     pub invocation: Vec<String>,
+    /// Vary initial stack alignment with a random-length environment variable in each sample. On by default.
+    pub stack_padding: bool,
 }
 
 impl PlanOptions {
@@ -117,13 +120,14 @@ impl PlanOptions {
             decision_rule: None,
             idle_host: false,
             invocation: Vec::new(),
+            stack_padding: true,
         }
     }
 }
 
-/// The host-wide lock shared by every Base project on this machine.
+/// The host-wide lock shared by every Base project and user on this machine. It is a fixed path rather than one under `$TMPDIR`, so sessions with different temporary directories still exclude each other. A private `/tmp`, as under systemd's `PrivateTmp`, still separates them; pass an explicit shared path there.
 pub fn default_lock_path() -> PathBuf {
-    std::env::temp_dir().join("base-benchmark-host.lock")
+    PathBuf::from("/tmp/base-benchmark-host.lock")
 }
 
 /// A fully expanded, serializable campaign definition.
@@ -145,6 +149,12 @@ pub struct Plan {
     pub decision_rule: Option<String>,
     pub idle_host: bool,
     pub invocation: Vec<String>,
+    /// Every workload starts here, so relative paths and the working directory are the same for all subjects.
+    pub working_directory: PathBuf,
+    /// The complete workload environment. The collector's own environment is not inherited.
+    pub environment: BTreeMap<String, String>,
+    /// Whether each sample adds a random-length environment variable, so that initial stack alignment varies between processes instead of being fixed by the environment's size.
+    pub stack_padding: bool,
     pub subjects: Vec<Subject>,
     pub pairs: Vec<Pair>,
     pub artifacts: ArtifactManifest,
@@ -217,9 +227,12 @@ impl Plan {
                 if let Some(variant) = variant {
                     arguments.extend(variant.arguments.iter().cloned());
                 }
-                if options.mode == Mode::Smoke {
-                    arguments.extend(scenario.smoke_arguments.iter().cloned());
-                }
+                let mode_arguments = if options.mode == Mode::Smoke {
+                    &scenario.smoke_arguments
+                } else {
+                    &scenario.measure_arguments
+                };
+                arguments.extend(mode_arguments.iter().cloned());
                 let variant = variant.map(|variant| variant.name.clone());
                 subjects.push(Subject {
                     label: label(&artifact.label, variant.as_deref()),
@@ -278,6 +291,9 @@ impl Plan {
             decision_rule: options.decision_rule.filter(|rule| !rule.trim().is_empty()),
             idle_host: options.idle_host,
             invocation: options.invocation,
+            working_directory: options.suite.workspace_root.clone(),
+            environment: launch_environment(std::env::var("PATH").ok()),
+            stack_padding: options.stack_padding,
             subjects,
             pairs,
             artifacts: options.artifacts,
@@ -313,7 +329,7 @@ impl Plan {
             artifact.role != ArtifactRole::LayoutReplica && !artifact.source.is_frozen()
         }) {
             missing.push(format!(
-                "a committed, unmodified revision for {}",
+                "committed, unmodified source and path dependencies for {}",
                 artifact.label
             ));
         }
@@ -331,9 +347,9 @@ impl Plan {
         }
         if artifacts
             .iter()
-            .any(|artifact| artifact.build.toolchain != artifacts[0].build.toolchain)
+            .any(|artifact| artifact.build.settings() != artifacts[0].build.settings())
         {
-            missing.push("the same toolchain for every artifact".to_owned());
+            missing.push("the same toolchain, Cargo version, build environment, and Cargo configuration for every artifact".to_owned());
         }
         if missing.is_empty() {
             Ok(())
@@ -370,6 +386,21 @@ pub fn parse_cpus(value: &str) -> io::Result<Vec<usize>> {
     Ok(cpus)
 }
 
+/// The variable that carries stack padding, and the exclusive bound of its random length in bytes.
+pub const STACK_PADDING_VARIABLE: &str = "BASE_BENCHMARK_STACK_PADDING";
+pub const STACK_PADDING_LIMIT: usize = 4096;
+
+/// A minimal, recorded environment: `PATH` from the collector and the C locale.
+///
+/// The size of the environment shifts the initial stack, so inheriting a shell's or agent's environment would make layout depend on who ran the campaign.
+pub(crate) fn launch_environment(path: Option<String>) -> BTreeMap<String, String> {
+    let path = path.unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_owned());
+    BTreeMap::from([
+        ("LC_ALL".to_owned(), "C".to_owned()),
+        ("PATH".to_owned(), path),
+    ])
+}
+
 fn seed_from_clock() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -383,6 +414,11 @@ pub(crate) struct Shuffle(u64);
 impl Shuffle {
     pub fn new(seed: u64) -> Self {
         Self(seed)
+    }
+
+    /// A value in `0..bound`. The modulo bias is negligible for the small bounds used here.
+    pub fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
     }
 
     fn next(&mut self) -> u64 {

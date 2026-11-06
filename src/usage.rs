@@ -46,11 +46,18 @@ impl ResourceUsage {
 pub trait ResourceSource {
     fn snapshot(&mut self) -> io::Result<ResourceUsage>;
 
-    /// Resolution of CPU times in nanoseconds.
+    /// Resolution of total CPU time (user plus system) in nanoseconds.
     fn resolution_ns(&self) -> u64;
+
+    /// Resolution of the separate user and system times. It defaults to the total's resolution.
+    fn split_resolution_ns(&self) -> u64 {
+        self.resolution_ns()
+    }
 }
 
-/// `getrusage(RUSAGE_SELF)`: every thread of the current process, at microsecond resolution.
+/// `getrusage(RUSAGE_SELF)`: every thread of the current process.
+///
+/// Linux reports total CPU time precisely but divides it between user and system time by sampling scheduler ticks, so the split is only as fine as a tick. Ten milliseconds is a conservative tick length.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CurrentProcess;
 
@@ -79,6 +86,10 @@ impl ResourceSource for CurrentProcess {
 
     fn resolution_ns(&self) -> u64 {
         1000
+    }
+
+    fn split_resolution_ns(&self) -> u64 {
+        10_000_000
     }
 }
 
@@ -118,8 +129,11 @@ impl<S: ResourceSource> Interval<S> {
                 "an interval must measure at least one operation",
             ));
         }
-        let resolution = self.source.resolution_ns();
-        let cpu = |name: &str, value| {
+        let (resolution, split) = (
+            self.source.resolution_ns(),
+            self.source.split_resolution_ns(),
+        );
+        let cpu = |name: &str, value, resolution| {
             Metric::total(name, Unit::Nanoseconds, value)
                 .with_source(Source::Rusage)
                 .with_resolution(resolution)
@@ -137,8 +151,13 @@ impl<S: ResourceSource> Interval<S> {
                     .with_phase(Phase::Measured)
                     .lower_is_better(),
             )
-            .with(cpu("user_cpu_time", usage.user_cpu_ns))
-            .with(cpu("system_cpu_time", usage.system_cpu_ns))
+            .with(cpu(
+                "cpu_time",
+                usage.user_cpu_ns + usage.system_cpu_ns,
+                resolution,
+            ))
+            .with(cpu("user_cpu_time", usage.user_cpu_ns, split))
+            .with(cpu("system_cpu_time", usage.system_cpu_ns, split))
             .with(switches(
                 "voluntary_context_switches",
                 usage.voluntary_context_switches,

@@ -3,13 +3,33 @@
 
 use super::*;
 use crate::test_support::SHELL;
+use std::os::unix::fs::PermissionsExt;
 
-fn shell(script: &str) -> Vec<String> {
-    vec!["-c".to_owned(), script.to_owned()]
+fn environment() -> BTreeMap<String, String> {
+    BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())])
+}
+
+fn launch_with(
+    program: &Path,
+    script: &str,
+    cpus: &[usize],
+    timeout: Duration,
+    cancellation: &Cancellation,
+) -> io::Result<Execution> {
+    let arguments = vec!["-c".to_owned(), script.to_owned()];
+    let environment = environment();
+    let launch = Launch {
+        program,
+        arguments: &arguments,
+        environment: &environment,
+        directory: Path::new("/"),
+        cpus,
+    };
+    execute(&launch, timeout, cancellation)
 }
 
 fn run(script: &str, timeout: Duration, cancellation: &Cancellation) -> Execution {
-    execute(Path::new(SHELL), &shell(script), &[], timeout, cancellation).unwrap()
+    launch_with(Path::new(SHELL), script, &[], timeout, cancellation).unwrap()
 }
 
 #[test]
@@ -28,14 +48,29 @@ fn captures_output_and_exit_status() {
         (&b"out\n"[..], &b"err\n"[..], Some(3))
     );
     assert!(!execution.succeeded());
+    assert!(execution.duration_ns > 0);
+}
+
+#[test]
+fn workloads_see_only_the_given_environment_and_directory() {
+    // The test process has HOME, USER, and Cargo variables; none may reach the workload.
     let execution = run(
-        "printf %s \"$LC_ALL\"",
+        "env | sort; pwd",
         Duration::from_secs(10),
         &Cancellation::new(),
     );
     assert!(execution.succeeded());
-    assert_eq!(execution.stdout, b"C");
-    assert!(execution.duration_ns > 0);
+    let text = String::from_utf8(execution.stdout).unwrap();
+    assert!(
+        text.lines()
+            .filter(|line| line.contains('='))
+            .all(|line| line.starts_with("PATH=")
+                || line.starts_with("PWD=")
+                || line.starts_with("SHLVL=")
+                || line.starts_with("_=")),
+        "{text}"
+    );
+    assert_eq!(text.lines().last(), Some("/"));
 }
 
 #[test]
@@ -65,6 +100,23 @@ fn descendants_are_killed_after_the_leader_exits() {
 }
 
 #[test]
+fn escaped_descendants_fail_the_sample_instead_of_hanging() {
+    let started = Instant::now();
+    // Give the background process time to leave the group before the leader exits.
+    let execution = run(
+        "setsid sleep 10 & sleep 0.3; echo done",
+        Duration::from_secs(20),
+        &Cancellation::new(),
+    );
+    assert!(execution.escaped);
+    assert!(!execution.succeeded());
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the runner stops waiting after the grace period"
+    );
+}
+
+#[test]
 fn cancellation_stops_running_and_new_processes() {
     let cancellation = Cancellation::new();
     let canceller = cancellation.clone();
@@ -81,16 +133,59 @@ fn cancellation_stops_running_and_new_processes() {
 }
 
 #[test]
-fn termination_signals_cancel_campaigns() {
+fn the_first_termination_signal_cancels_guarded_campaigns() {
     let cancellation = Cancellation::new();
     let guard = cancellation.on_termination_signals();
+    let other = Cancellation::new();
+    drop(other.on_termination_signals());
     nix::sys::signal::raise(Signal::SIGHUP).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !cancellation.is_cancelled() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    drop(guard);
     assert!(cancellation.is_cancelled());
+    assert!(
+        !other.is_cancelled(),
+        "a dropped guard no longer receives signals"
+    );
+    drop(guard);
+    assert!(
+        !guarded()
+            .iter()
+            .any(|guarded| Arc::ptr_eq(&guarded.0, &cancellation.0))
+    );
+}
+
+#[test]
+fn busy_executables_are_retried() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("busy");
+    let mut file = std::fs::File::create(&path).unwrap();
+    std::io::Write::write_all(&mut file, b"#!/bin/sh\necho ready\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = launch_with(
+        &path,
+        "",
+        &[],
+        Duration::from_secs(10),
+        &Cancellation::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ExecutableFileBusy);
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(file);
+    });
+    let execution = launch_with(
+        &path,
+        "",
+        &[],
+        Duration::from_secs(10),
+        &Cancellation::new(),
+    )
+    .unwrap();
+    closer.join().unwrap();
+    assert_eq!(execution.stdout, b"ready\n");
 }
 
 #[test]
@@ -99,9 +194,9 @@ fn workloads_inherit_the_requested_cpu() {
     let cpu = (0..CpuSet::count())
         .find(|cpu| allowed.is_set(*cpu).unwrap())
         .unwrap();
-    let execution = execute(
+    let execution = launch_with(
         Path::new(SHELL),
-        &shell("grep Cpus_allowed_list /proc/self/status"),
+        "grep Cpus_allowed_list /proc/self/status",
         &[cpu],
         Duration::from_secs(10),
         &Cancellation::new(),
@@ -117,9 +212,9 @@ fn workloads_inherit_the_requested_cpu() {
     );
     assert_eq!(sched_getaffinity(Pid::from_raw(0)).unwrap(), allowed);
 
-    let too_large = execute(
+    let too_large = launch_with(
         Path::new(SHELL),
-        &shell("true"),
+        "true",
         &[CpuSet::count()],
         Duration::from_secs(10),
         &Cancellation::new(),
@@ -130,9 +225,9 @@ fn workloads_inherit_the_requested_cpu() {
         .rev()
         .find(|cpu| !allowed.is_set(*cpu).unwrap())
         .unwrap();
-    let unavailable = execute(
+    let unavailable = launch_with(
         Path::new(SHELL),
-        &shell("true"),
+        "true",
         &[offline],
         Duration::from_secs(10),
         &Cancellation::new(),
@@ -143,9 +238,9 @@ fn workloads_inherit_the_requested_cpu() {
 
 #[test]
 fn missing_programs_are_errors() {
-    let error = execute(
+    let error = launch_with(
         Path::new("/nonexistent/workload"),
-        &[],
+        "",
         &[],
         Duration::from_secs(1),
         &Cancellation::new(),

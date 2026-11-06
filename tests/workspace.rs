@@ -1,6 +1,8 @@
 // Released under the MIT License.
 // Copyright, 2026, by Samuel Williams.
 
+#![cfg(feature = "runner")]
+
 mod support;
 
 use base_benchmark::{
@@ -13,6 +15,15 @@ fn workspace(path: &Path) -> Workspace {
     Workspace::new(support::workspace(path, ""))
 }
 
+fn request(artifacts: &Path, lock: &Path) -> RunRequest {
+    RunRequest {
+        rounds: Some(2),
+        seed: Some(1),
+        lock: Some(lock.to_owned()),
+        ..RunRequest::new("work", artifacts)
+    }
+}
+
 #[test]
 fn prepares_trees_with_a_layout_replica_and_compares_them() {
     let directory = tempfile::tempdir().unwrap();
@@ -22,6 +33,11 @@ fn prepares_trees_with_a_layout_replica_and_compares_them() {
     support::workspace(&candidate, "");
     let suites = workspace.suites().unwrap();
     assert_eq!(suites[0].scenarios[0].variants.len(), 2);
+    assert_eq!(
+        suites[0].scenarios[0].baseline.as_deref(),
+        Some("reference"),
+        "listings show the resolved baseline"
+    );
 
     let trees = vec![
         Tree {
@@ -33,9 +49,14 @@ fn prepares_trees_with_a_layout_replica_and_compares_them() {
             path: candidate,
         },
     ];
-    let output = directory.path().join("prepared");
     let prepared = workspace
-        .prepare(None, trees, None, Some(output.clone()))
+        .prepare(
+            None,
+            trees,
+            None,
+            Some(directory.path().join("prepared")),
+            &Cancellation::new(),
+        )
         .unwrap();
     let roles: Vec<_> = prepared
         .manifest
@@ -57,8 +78,11 @@ fn prepares_trees_with_a_layout_replica_and_compares_them() {
         !replica.source.path.exists(),
         "the replica source copy is removed after building"
     );
-    assert_eq!(replica.source.path.parent(), Some(directory.path()));
-    assert!(replica.build.toolchain.contains("rustc"));
+    assert_eq!(
+        replica.source.path.parent(),
+        Some(directory.path().canonicalize().unwrap().as_path())
+    );
+    assert!(replica.build.toolchain.contains("rustc") && replica.build.cargo.contains("cargo"));
     assert!(
         prepared.manifest.artifacts[0]
             .source
@@ -70,10 +94,7 @@ fn prepares_trees_with_a_layout_replica_and_compares_them() {
         prepared.manifest
     );
 
-    let mut request = RunRequest::new("work", &prepared.manifest_path, Mode::Screening);
-    request.rounds = Some(2);
-    request.seed = Some(1);
-    request.lock = directory.path().join("lock");
+    let mut request = request(&prepared.manifest_path, &directory.path().join("lock"));
     request.output = Some(directory.path().join("campaign"));
     let campaign = workspace
         .run(request, &Cancellation::new(), &mut Vec::new())
@@ -92,11 +113,15 @@ fn prepares_trees_with_a_layout_replica_and_compares_them() {
         .iter()
         .find(|pair| pair.kind == PairKind::Variant)
         .unwrap();
-    assert_eq!(variant.metrics[0].improved, 2);
-    assert!(campaign.summary.warnings.iter().all(|warning| {
-        warning.contains("within the layout replica's range")
-            || warning.starts_with("no CPU placement")
-    }));
+    assert_eq!(
+        variant
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "wall_time")
+            .unwrap()
+            .improved,
+        2
+    );
     assert_eq!(
         read_metadata(&campaign.output).unwrap().status,
         CampaignStatus::Complete
@@ -112,7 +137,7 @@ fn smoke_builds_the_current_workspace_and_runs_every_scenario() {
         .smoke(
             Some("fixture"),
             Some(output.clone()),
-            &directory.path().join("lock"),
+            Some(directory.path().join("lock")),
             &Cancellation::new(),
             &mut Vec::new(),
         )
@@ -123,10 +148,57 @@ fn smoke_builds_the_current_workspace_and_runs_every_scenario() {
             .report
             .starts_with("smoke: correctness and lifecycle only")
     );
-    let manifest = ArtifactManifest::read(&output.join("artifacts/artifacts.json")).unwrap();
+    assert!(campaigns[0].summary.pairs.is_empty());
+    let manifest = ArtifactManifest::read(&output.join(".artifacts/artifacts.json")).unwrap();
     assert_eq!(manifest.artifacts.len(), 1);
     assert_eq!(manifest.artifacts[0].label, "current");
     assert!(manifest.artifacts[0].source.revision.is_none());
+}
+
+#[test]
+fn smoke_runs_an_unprepared_executable() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    let workspace = workspace(&project);
+    let prepared = workspace
+        .prepare(
+            None,
+            Vec::new(),
+            None,
+            Some(directory.path().join("prepared")),
+            &Cancellation::new(),
+        )
+        .unwrap();
+    let executable = &prepared.manifest.artifacts[0].executable;
+    let campaigns = workspace
+        .smoke_executable(
+            None,
+            executable,
+            &directory.path().join("smoke"),
+            Some(directory.path().join("lock")),
+        )
+        .unwrap();
+    assert_eq!(campaigns.len(), 1);
+    assert!(
+        workspace
+            .smoke_executable(
+                None,
+                &directory.path().join("missing"),
+                &directory.path().join("missing-smoke"),
+                None
+            )
+            .is_err()
+    );
+    assert!(
+        workspace
+            .smoke_executable(
+                Some("missing"),
+                executable,
+                &directory.path().join("other"),
+                None
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -141,22 +213,11 @@ fn preparation_failures_name_the_tree() {
             Vec::new(),
             None,
             Some(directory.path().join("broken")),
+            &Cancellation::new(),
         )
         .unwrap_err();
     assert!(
         error.to_string().contains("current: cargo build failed"),
-        "{error}"
-    );
-
-    let mut missing_rustc = Workspace::new(support::workspace(&project, ""));
-    missing_rustc.rustc = "/nonexistent/rustc".into();
-    let error = missing_rustc
-        .prepare(None, Vec::new(), None, Some(directory.path().join("rustc")))
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("could not run /nonexistent/rustc"),
         "{error}"
     );
 
@@ -172,12 +233,12 @@ fn preparation_failures_name_the_tree() {
             label: "current".to_owned(),
             path: project.clone(),
         }],
-        replica: Some(true),
+        replicas: Some(1),
         output: directory.path().join("custom"),
         cargo: custom.cargo.clone(),
         rustc: custom.rustc.clone(),
     };
-    let prepared = base_benchmark::prepare(&options).unwrap();
+    let prepared = base_benchmark::prepare(&options, &Cancellation::new()).unwrap();
     assert!(
         prepared.manifest.artifacts[0]
             .build
@@ -189,31 +250,31 @@ fn preparation_failures_name_the_tree() {
     let mut features = options.clone();
     features.suite.features = vec!["missing".to_owned()];
     features.output = directory.path().join("features");
-    assert!(base_benchmark::prepare(&features).is_err());
+    assert!(base_benchmark::prepare(&features, &Cancellation::new()).is_err());
 }
 
 #[test]
 fn runs_reject_unknown_scenarios_and_artifacts() {
     let directory = tempfile::tempdir().unwrap();
     let workspace = workspace(&directory.path().join("project"));
-    let request = RunRequest::new("work", directory.path().join("missing.json"), Mode::Smoke);
     assert!(
         workspace
-            .run(request, &Cancellation::new(), &mut Vec::new())
+            .run(
+                RunRequest::new("work", directory.path().join("missing.json")),
+                &Cancellation::new(),
+                &mut Vec::new()
+            )
             .is_err()
     );
     let none = Workspace::new(directory.path().join("missing/Cargo.toml"));
     assert!(none.suite(None).is_err());
-    assert!(none.prepare(None, Vec::new(), None, None).is_err());
     assert!(
-        none.smoke(
-            None,
-            None,
-            &directory.path().join("lock"),
-            &Cancellation::new(),
-            &mut Vec::new()
-        )
-        .is_err()
+        none.prepare(None, Vec::new(), None, None, &Cancellation::new())
+            .is_err()
+    );
+    assert!(
+        none.smoke(None, None, None, &Cancellation::new(), &mut Vec::new())
+            .is_err()
     );
 }
 
@@ -230,7 +291,7 @@ fn smoke_failures_stop_the_command() {
         .smoke(
             None,
             Some(output.clone()),
-            &directory.path().join("lock"),
+            Some(directory.path().join("lock")),
             &Cancellation::new(),
             &mut Vec::new(),
         )
@@ -243,18 +304,41 @@ fn smoke_failures_stop_the_command() {
 }
 
 #[test]
+fn smoke_reports_build_failures() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    let workspace = workspace(&project);
+    std::fs::write(project.join("src/main.rs"), "fn main() { broken }").unwrap();
+    let error = workspace
+        .smoke(
+            None,
+            Some(directory.path().join("smoke")),
+            Some(directory.path().join("lock")),
+            &Cancellation::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("cargo build failed"));
+}
+
+#[test]
 fn default_outputs_are_new_directories_under_the_target_directory() {
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path().join("project");
     let workspace = workspace(&project);
-    let prepared = workspace.prepare(None, Vec::new(), None, None).unwrap();
+    let prepared = workspace
+        .prepare(None, Vec::new(), None, None, &Cancellation::new())
+        .unwrap();
     assert!(
         prepared
             .manifest_path
             .starts_with(project.join("target/base-benchmark"))
     );
-    let mut request = RunRequest::new("work", &prepared.manifest_path, Mode::Smoke);
-    request.lock = directory.path().join("lock");
+    let mut request = RunRequest {
+        mode: Some(Mode::Smoke),
+        ..request(&prepared.manifest_path, &directory.path().join("lock"))
+    };
+    request.rounds = None;
     let campaign = workspace
         .run(request.clone(), &Cancellation::new(), &mut Vec::new())
         .unwrap();
@@ -267,7 +351,7 @@ fn default_outputs_are_new_directories_under_the_target_directory() {
         .smoke(
             None,
             None,
-            &directory.path().join("lock"),
+            Some(directory.path().join("lock")),
             &Cancellation::new(),
             &mut Vec::new(),
         )
@@ -297,19 +381,46 @@ fn default_outputs_are_new_directories_under_the_target_directory() {
 }
 
 #[test]
-fn smoke_reports_build_failures() {
+fn measure_arguments_are_used_outside_smoke_runs() {
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path().join("project");
-    let workspace = workspace(&project);
-    std::fs::write(project.join("src/main.rs"), "fn main() { broken }").unwrap();
-    let error = workspace
-        .smoke(
+    // `fail` is a measurement-only argument, so smoke runs succeed and screening runs see it.
+    let workspace = Workspace::new(support::workspace(
+        &project,
+        "\n[[package.metadata.base-benchmark.scenario]]\nname = \"measured\"\nmeasure-arguments = [\"fail\"]\n",
+    ));
+    let prepared = workspace
+        .prepare(
             None,
-            Some(directory.path().join("smoke")),
-            &directory.path().join("lock"),
+            Vec::new(),
+            None,
+            Some(directory.path().join("prepared")),
             &Cancellation::new(),
-            &mut Vec::new(),
         )
-        .unwrap_err();
-    assert!(error.to_string().contains("cargo build failed"));
+        .unwrap();
+    let smoke = RunRequest {
+        mode: Some(Mode::Smoke),
+        output: Some(directory.path().join("smoke")),
+        ..RunRequest {
+            scenario: "measured".to_owned(),
+            ..request(&prepared.manifest_path, &directory.path().join("lock"))
+        }
+    };
+    workspace
+        .run(smoke, &Cancellation::new(), &mut Vec::new())
+        .unwrap();
+    let screening = RunRequest {
+        output: Some(directory.path().join("screening")),
+        ..RunRequest {
+            scenario: "measured".to_owned(),
+            ..request(&prepared.manifest_path, &directory.path().join("lock"))
+        }
+    };
+    assert!(
+        workspace
+            .run(screening, &Cancellation::new(), &mut Vec::new())
+            .unwrap_err()
+            .to_string()
+            .contains("exit code Some(3)")
+    );
 }

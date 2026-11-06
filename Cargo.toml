@@ -16,15 +16,25 @@ resolver = "3"
 [workspace.metadata.bake.release]
 reviewers = ["base-rs/maintainers"]
 
+[features]
+default = ["runner"]
+# Preparation, collection, summaries, and the `base-benchmark` command. Workloads need only records and `Interval`: depend with `default-features = false`.
+runner = ["dep:sha2", "dep:signal-hook", "nix/fs", "nix/process", "nix/sched", "nix/signal"]
+
+[[bin]]
+name = "base-benchmark"
+path = "src/main.rs"
+required-features = ["runner"]
+
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-sha2 = "0.10.9"
+sha2 = { version = "0.10.9", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["fs", "process", "resource", "sched", "signal"] }
-signal-hook = { version = "0.4.6", default-features = false, features = ["iterator"] }
+nix = { version = "0.31.3", features = ["resource"] }
+signal-hook = { version = "0.4.6", default-features = false, features = ["iterator"], optional = true }
 
 [dev-dependencies]
-nix = { version = "0.31.3", features = ["signal"] }
+nix = { version = "0.31.3", features = ["fs", "signal"] }
 tempfile = "3.27.0"

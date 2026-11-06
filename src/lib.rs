@@ -22,52 +22,60 @@
 //! }
 //! ```
 //!
-//! The same operations are available through the `base-benchmark` command and, separately, the `bake-benchmark` task library.
+//! The same operations are available through the `base-benchmark` command and, separately, the `bake-benchmark` task library. Records and `Interval` are always available; preparation, collection, summaries, and the command need the default `runner` feature, so workloads can depend on the crate with `default-features = false`. The runner supports Unix, and is tested on Linux.
 
-mod artifact;
-#[cfg(unix)]
-pub mod cli;
-mod config;
-mod plan;
-mod prepare;
 mod record;
-#[cfg(unix)]
-mod summary;
-#[cfg(test)]
-mod test_support;
 mod usage;
 
-#[cfg(unix)]
+#[cfg(feature = "runner")]
+mod artifact;
+#[cfg(feature = "runner")]
+pub mod cli;
+#[cfg(feature = "runner")]
+mod config;
+#[cfg(feature = "runner")]
+mod plan;
+#[cfg(feature = "runner")]
+mod prepare;
+#[cfg(feature = "runner")]
 mod runner;
-#[cfg(unix)]
+#[cfg(feature = "runner")]
+mod summary;
+#[cfg(all(test, feature = "runner"))]
+mod test_support;
+#[cfg(feature = "runner")]
 mod workspace;
 
-pub use artifact::{
-    Artifact, ArtifactManifest, ArtifactRole, BuildIdentity, MANIFEST_SCHEMA, MANIFEST_VERSION,
-    SourceIdentity, sha256_file,
-};
-pub use config::{METADATA_KEY, Scenario, Suite, Variant, cargo_program, discover, select};
-pub use plan::{
-    Mode, PLAN_SCHEMA, PLAN_VERSION, Pair, PairKind, Plan, PlanOptions, Subject, default_lock_path,
-    parse_cpus,
-};
-pub use prepare::{PrepareOptions, Prepared, Tree, prepare};
 pub use record::{
     Direction, Measurement, Metric, Phase, ProcessRecord, RECORD_SCHEMA, RECORD_VERSION, Sample,
     Source, Unit,
 };
-#[cfg(unix)]
-pub use summary::{
-    Distribution, MetricSummary, PairMetric, PairSummary, SUMMARY_SCHEMA, SUMMARY_VERSION,
-    Statistic, SubjectSummary, Summary, summarize,
-};
 pub use usage::{CurrentProcess, Interval, ResourceSource, ResourceUsage};
 
-#[cfg(unix)]
+#[cfg(feature = "runner")]
+pub use artifact::{
+    Artifact, ArtifactManifest, ArtifactRole, BuildIdentity, ConfigurationFile, DependencyIdentity,
+    MANIFEST_SCHEMA, MANIFEST_VERSION, SourceIdentity, sha256_file,
+};
+#[cfg(feature = "runner")]
+pub use config::{METADATA_KEY, Scenario, Suite, Variant, cargo_program, discover, select};
+#[cfg(feature = "runner")]
+pub use plan::{
+    Mode, PLAN_SCHEMA, PLAN_VERSION, Pair, PairKind, Plan, PlanOptions, STACK_PADDING_LIMIT,
+    STACK_PADDING_VARIABLE, Subject, default_lock_path, parse_cpus,
+};
+#[cfg(feature = "runner")]
+pub use prepare::{PrepareOptions, Prepared, Tree, prepare};
+#[cfg(feature = "runner")]
 pub use runner::{
     CAMPAIGN_SCHEMA, CAMPAIGN_VERSION, Campaign, CampaignMetadata, CampaignStatus, Cancellation,
     CpuIdentity, HostIdentity, SampleEntry, SignalGuard, read_entries, read_metadata, run,
     summarize_directory,
 };
-#[cfg(unix)]
+#[cfg(feature = "runner")]
+pub use summary::{
+    Distribution, GENERATOR, MetricSummary, PairMetric, PairSummary, RESOLUTION_FACTOR,
+    SUMMARY_SCHEMA, SUMMARY_VERSION, Statistic, SubjectSummary, Summary, sign_test, summarize,
+};
+#[cfg(feature = "runner")]
 pub use workspace::{RunRequest, Workspace};

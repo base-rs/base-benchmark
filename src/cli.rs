@@ -4,7 +4,7 @@
 //! The `base-benchmark` command. It parses arguments and calls [`Workspace`] operations, exactly as the Bake tasks do.
 
 use crate::config::invalid_input;
-use crate::plan::{Mode, default_lock_path, parse_cpus};
+use crate::plan::parse_cpus;
 use crate::prepare::Tree;
 use crate::runner::{Cancellation, summarize_directory};
 use crate::workspace::{RunRequest, Workspace};
@@ -18,11 +18,12 @@ const USAGE: &str = "\
 usage: base-benchmark COMMAND [--name value]...
 
   list       [--manifest-path PATH]
-  prepare    [--manifest-path PATH] [--package NAME] [--tree LABEL=PATH]... [--replica true|false] [--output DIR]
+  prepare    [--manifest-path PATH] [--package NAME] [--tree LABEL=PATH]... [--replicas N] [--output DIR]
   smoke      [--manifest-path PATH] [--package NAME] [--output DIR] [--lock PATH]
-  run        --scenario NAME --artifacts FILE [--mode smoke|screening|recorded] [--package NAME]
+  run        SCENARIO --artifacts FILE [--mode smoke|screening|recorded] [--package NAME]
              [--manifest-path PATH] [--rounds N] [--seed N] [--cpus 0,2] [--perf-event EVENT]...
              [--timeout-seconds N] [--lock PATH] [--output DIR] [--decision-rule TEXT] [--idle-host true]
+             [--stack-padding false]
   summarize  DIR
 
 Run, smoke, and summarize print a report on stdout; list and prepare print JSON. Progress goes to stderr.";
@@ -45,76 +46,71 @@ fn execute(arguments: Vec<String>, out: &mut dyn Write, errors: &mut dyn Write) 
     let mut arguments = arguments.into_iter();
     let command = arguments.next().unwrap_or_default();
     let mut options = Options::parse(arguments)?;
+    let cancellation = Cancellation::new();
     match command.as_str() {
         "list" => {
-            let workspace = Workspace::new(options.path("manifest-path", "Cargo.toml"));
+            let workspace = Workspace::new(options.path("manifest-path")?);
             options.finish(0)?;
             print_json(out, &workspace.suites()?)
         }
         "prepare" => {
-            let workspace = Workspace::new(options.path("manifest-path", "Cargo.toml"));
+            let workspace = Workspace::new(options.path("manifest-path")?);
             let package = options.take("package")?;
             let trees = options
                 .take_all("tree")
                 .iter()
                 .map(|tree| tree.parse())
                 .collect::<io::Result<Vec<Tree>>>()?;
-            let replica = options.parsed::<bool>("replica")?;
+            let replicas = options.parsed("replicas")?;
             let output = options.take("output")?.map(PathBuf::from);
             options.finish(0)?;
+            let _signals = cancellation.on_termination_signals();
             print_json(
                 out,
-                &workspace.prepare(package.as_deref(), trees, replica, output)?,
+                &workspace.prepare(package.as_deref(), trees, replicas, output, &cancellation)?,
             )
         }
         "smoke" => {
-            let workspace = Workspace::new(options.path("manifest-path", "Cargo.toml"));
+            let workspace = Workspace::new(options.path("manifest-path")?);
             let package = options.take("package")?;
             let output = options.take("output")?.map(PathBuf::from);
-            let lock = options
-                .take("lock")?
-                .map(PathBuf::from)
-                .unwrap_or_else(default_lock_path);
+            let lock = options.take("lock")?.map(PathBuf::from);
             options.finish(0)?;
-            let cancellation = Cancellation::new();
             let _signals = cancellation.on_termination_signals();
             for campaign in
-                workspace.smoke(package.as_deref(), output, &lock, &cancellation, errors)?
+                workspace.smoke(package.as_deref(), output, lock, &cancellation, errors)?
             {
                 writeln!(out, "{}\n{}", campaign.output.display(), campaign.report)?;
             }
             Ok(())
         }
         "run" => {
-            let workspace = Workspace::new(options.path("manifest-path", "Cargo.toml"));
-            let scenario = options.required("scenario")?;
-            let artifacts = options.required("artifacts")?;
-            let mut request = RunRequest::new(
-                scenario,
-                artifacts,
-                options.parsed("mode")?.unwrap_or(Mode::Screening),
-            );
-            request.package = options.take("package")?;
-            request.rounds = options.parsed("rounds")?;
-            request.seed = options.parsed("seed")?;
-            request.cpus = options
-                .take("cpus")?
-                .map(|cpus| parse_cpus(&cpus))
-                .transpose()?
-                .unwrap_or_default();
-            request.perf_events = options.take_all("perf-event");
-            if let Some(seconds) = options.parsed::<u64>("timeout-seconds")? {
-                request.timeout = Duration::from_secs(seconds);
-            }
-            if let Some(lock) = options.take("lock")? {
-                request.lock = PathBuf::from(lock);
-            }
-            request.output = options.take("output")?.map(PathBuf::from);
-            request.decision_rule = options.take("decision-rule")?;
-            request.idle_host = options.parsed("idle-host")?.unwrap_or(false);
-            request.invocation = invocation;
-            options.finish(0)?;
-            let cancellation = Cancellation::new();
+            let workspace = Workspace::new(options.path("manifest-path")?);
+            let request = RunRequest {
+                package: options.take("package")?,
+                mode: options.parsed("mode")?,
+                rounds: options.parsed("rounds")?,
+                seed: options.parsed("seed")?,
+                cpus: options
+                    .take("cpus")?
+                    .map(|cpus| parse_cpus(&cpus))
+                    .transpose()?
+                    .unwrap_or_default(),
+                perf_events: options.take_all("perf-event"),
+                timeout: options.parsed("timeout-seconds")?.map(Duration::from_secs),
+                lock: options.take("lock")?.map(PathBuf::from),
+                output: options.take("output")?.map(PathBuf::from),
+                decision_rule: options.take("decision-rule")?,
+                idle_host: options.parsed("idle-host")?.unwrap_or(false),
+                stack_padding: options.parsed("stack-padding")?,
+                invocation,
+                ..RunRequest::new(String::new(), options.required("artifacts")?)
+            };
+            options.finish(1)?;
+            let request = RunRequest {
+                scenario: options.positional.remove(0),
+                ..request
+            };
             let _signals = cancellation.on_termination_signals();
             let campaign = workspace.run(request, &cancellation, errors)?;
             writeln!(out, "{}\n{}", campaign.output.display(), campaign.report)
@@ -189,12 +185,11 @@ impl Options {
             .ok_or_else(|| invalid_input(format!("--{name} is required")))
     }
 
-    fn path(&mut self, name: &str, default: &str) -> PathBuf {
-        PathBuf::from(
-            self.take_all(name)
-                .pop()
-                .unwrap_or_else(|| default.to_owned()),
-        )
+    /// The workspace manifest, `Cargo.toml` by default.
+    fn path(&mut self, name: &str) -> io::Result<PathBuf> {
+        Ok(PathBuf::from(
+            self.take(name)?.unwrap_or_else(|| "Cargo.toml".to_owned()),
+        ))
     }
 
     fn parsed<T: FromStr>(&mut self, name: &str) -> io::Result<Option<T>> {

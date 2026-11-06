@@ -40,12 +40,14 @@ pub fn artifact(label: &str, role: ArtifactRole, executable: &Path) -> Artifact 
             dirty: Some(false),
             lockfile_sha256: None,
             replica_of: (role == ArtifactRole::LayoutReplica).then(|| "baseline".to_owned()),
+            path_dependencies: Vec::new(),
         },
         build: BuildIdentity {
             command: vec!["cargo".to_owned(), "build".to_owned()],
             toolchain: "rustc test".to_owned(),
-            rustflags: None,
-            encoded_rustflags: None,
+            cargo: "cargo test".to_owned(),
+            environment: Default::default(),
+            configuration: Vec::new(),
         },
     }
 }
@@ -67,7 +69,7 @@ pub fn suite(script: &Path, variants: &[&str]) -> Suite {
     Suite {
         package: "fixture".to_owned(),
         manifest_path: PathBuf::from("/source/Cargo.toml"),
-        workspace_root: PathBuf::from("/source"),
+        workspace_root: PathBuf::from("/"),
         binary: "fixture".to_owned(),
         profile: "release".to_owned(),
         features: Vec::new(),
@@ -75,6 +77,7 @@ pub fn suite(script: &Path, variants: &[&str]) -> Suite {
             name: "work".to_owned(),
             arguments: vec![script.display().to_string()],
             smoke_arguments: vec!["smoke".to_owned()],
+            measure_arguments: vec!["measure".to_owned()],
             variants: variants
                 .iter()
                 .map(|name| Variant {

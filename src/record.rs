@@ -222,15 +222,14 @@ impl Metric {
         self
     }
 
-    /// The per-operation value, when the metric's scope permits that normalization.
+    /// The per-operation value of a measured-phase total.
     ///
-    /// Only measured-phase totals are divided by operations. Whole-process and attached-window totals include work outside the measured operations, so they are never normalized by them.
+    /// Whole-process and attached-window totals include work outside the measured operations, so they are never normalized by them. Means are reported as they are.
     pub fn per_operation(&self, operations: u64) -> Option<f64> {
         match (&self.measurement, self.phase) {
             (Measurement::Total { value }, Phase::Measured) => {
                 Some(*value as f64 / operations as f64)
             }
-            (Measurement::Mean { value }, _) => Some(*value),
             _ => None,
         }
     }

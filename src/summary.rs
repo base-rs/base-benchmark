@@ -15,12 +15,17 @@ pub const SUMMARY_VERSION: u32 = 1;
 /// A ratio is computed only when the baseline is at least this many measurement quanta, so quantization moves it by at most 1%.
 pub const RESOLUTION_FACTOR: f64 = 100.0;
 
+/// Identifies summaries and campaigns produced by this version of the tool.
+pub const GENERATOR: &str = concat!("base-benchmark ", env!("CARGO_PKG_VERSION"));
+
 /// Descriptive statistics regenerated from raw samples. It contains no acceptance verdict.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Summary {
     pub schema: String,
     pub version: u32,
+    /// The tool that generated this summary, so a regenerated summary can be distinguished.
+    pub generator: String,
     pub mode: Mode,
     pub evidence: String,
     pub scenario: String,
@@ -61,8 +66,10 @@ pub struct MetricSummary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Statistic {
-    /// A measured-phase total divided by operations, or a workload-reported mean.
+    /// A measured-phase total divided by operations.
     PerOperation,
+    /// A value the workload reported as a mean, such as mean latency. Shown in its unit, not divided again.
+    Mean,
     /// A total over a window wider than the measured operations, such as the whole process. It is not divided by operations.
     Total,
 }
@@ -122,6 +129,8 @@ pub struct PairMetric {
     pub change: Option<Distribution>,
     /// Rounds without a ratio: the baseline was zero or within [`RESOLUTION_FACTOR`] measurement quanta.
     pub unresolved: usize,
+    /// Two-sided exact sign test over rounds that moved, ignoring ties and magnitudes. Descriptive only: no correction for the many metrics and pairs in one summary.
+    pub sign_test_p: Option<f64>,
 }
 
 type ProcessValues = BTreeMap<String, ProcessValue>;
@@ -131,10 +140,20 @@ struct ProcessValue {
     metric: Metric,
     statistic: Statistic,
     value: Option<f64>,
-    /// The measurement quantum in the same statistic, such as CPU time resolution divided by operations.
+    /// The smallest meaningful difference in the same statistic: the declared resolution, or one unit, divided by operations for per-operation values.
     quantum: f64,
     /// The process reported the name with incompatible definitions, so it contributes no value.
     conflict: bool,
+}
+
+impl ProcessValue {
+    /// Values can be compared only under the same definition.
+    fn compatible(&self, other: &Self) -> bool {
+        self.statistic == other.statistic
+            && self.metric.unit == other.metric.unit
+            && self.metric.phase == other.metric.phase
+            && self.metric.source == other.metric.source
+    }
 }
 
 fn process_values(entry: &SampleEntry) -> ProcessValues {
@@ -148,23 +167,32 @@ fn process_values(entry: &SampleEntry) -> ProcessValues {
     let process = std::iter::once((1, &entry.process_metrics));
     for (operations, metrics) in samples.chain(process) {
         for metric in metrics {
-            let (statistic, value) = match (metric.per_operation(operations), &metric.measurement) {
-                (Some(value), _) => (Statistic::PerOperation, Some(value)),
-                (None, Measurement::Total { value }) => (Statistic::Total, Some(*value as f64)),
-                (None, _) => (Statistic::PerOperation, None),
-            };
-            let divisor = if statistic == Statistic::PerOperation {
-                operations as f64
-            } else {
-                1.0
-            };
-            let quantum = metric.resolution.unwrap_or(0) as f64 / divisor;
+            let resolution = metric.resolution.unwrap_or(1) as f64;
+            let (statistic, value, quantum) =
+                match (metric.per_operation(operations), &metric.measurement) {
+                    (Some(value), _) => (
+                        Statistic::PerOperation,
+                        Some(value),
+                        resolution / operations as f64,
+                    ),
+                    (None, Measurement::Total { value }) => {
+                        (Statistic::Total, Some(*value as f64), resolution)
+                    }
+                    (None, Measurement::Mean { value }) => {
+                        (Statistic::Mean, Some(*value), resolution)
+                    }
+                    (None, Measurement::Unavailable { .. }) => {
+                        (Statistic::PerOperation, None, resolution)
+                    }
+                };
             let slot = grouped
                 .entry(metric.name.clone())
                 .or_insert_with(|| (metric.clone(), statistic, Vec::new(), 0.0, false));
-            // A name reused with another unit, phase, or statistic in one process cannot be combined.
-            slot.4 |=
-                slot.0.unit != metric.unit || slot.0.phase != metric.phase || slot.1 != statistic;
+            // A name reused with another definition in one process cannot be combined.
+            slot.4 |= slot.0.unit != metric.unit
+                || slot.0.phase != metric.phase
+                || slot.0.source != metric.source
+                || slot.1 != statistic;
             slot.2.extend(value);
             slot.3 = slot.3.max(quantum);
         }
@@ -195,8 +223,12 @@ fn process_values(entry: &SampleEntry) -> ProcessValues {
 struct Comparison<'a> {
     base: &'a ProcessValue,
     differences: Vec<f64>,
+    /// Differences smaller than the quantum count as ties.
+    moves: Vec<f64>,
     ratios: Vec<f64>,
     unresolved: usize,
+    incompatible: usize,
+    missing: usize,
 }
 
 /// Summarize complete rounds of `entries` according to `plan`.
@@ -214,29 +246,17 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
         .subjects
         .iter()
         .map(|subject| {
-            let processes = by_subject
-                .get(subject.label.as_str())
-                .map(Vec::as_slice)
-                .unwrap_or_default();
+            let processes = by_subject.get(subject.label.as_str()).map(Vec::as_slice).unwrap_or_default();
             let mut metrics: BTreeMap<&str, (&ProcessValue, Vec<f64>, usize)> = BTreeMap::new();
             for (_, values) in processes {
                 for (name, value) in values {
-                    let slot = metrics
-                        .entry(name.as_str())
-                        .or_insert((value, Vec::new(), 0));
+                    let slot = metrics.entry(name.as_str()).or_insert((value, Vec::new(), 0));
                     if value.conflict {
-                        warnings.push(format!(
-                            "{}: metric {name} has conflicting definitions within a process and is not summarized",
-                            subject.label
-                        ));
-                    } else if slot.0.metric.unit != value.metric.unit
-                        || slot.0.metric.phase != value.metric.phase
-                        || slot.0.statistic != value.statistic
-                    {
-                        warnings.push(format!(
-                            "{}: metric {name} changes unit, phase, or statistic between processes",
-                            subject.label
-                        ));
+                        warnings.push(format!("{}: metric {name} has conflicting definitions within a process and is not summarized", subject.label));
+                    } else if !slot.0.compatible(value) {
+                        // The first definition is summarized; later processes that redefine the metric are excluded.
+                        warnings.push(format!("{}: metric {name} changes definition between processes; differing processes are excluded", subject.label));
+                        continue;
                     }
                     match value.value {
                         Some(number) => slot.1.push(number),
@@ -264,72 +284,69 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
         })
         .collect();
 
-    let pairs: Vec<PairSummary> = plan
-        .pairs
+    // Smoke campaigns measure too little to compare anything.
+    let compared = if plan.mode == Mode::Smoke {
+        &[][..]
+    } else {
+        &plan.pairs[..]
+    };
+    let pairs: Vec<PairSummary> = compared
         .iter()
         .map(|pair| {
-            let rounds = |label: &str| -> BTreeMap<u32, &ProcessValues> {
-                by_subject
-                    .get(label)
-                    .into_iter()
-                    .flatten()
-                    .map(|(round, values)| (*round, values))
-                    .collect()
-            };
+            let rounds = |label: &str| -> BTreeMap<u32, &ProcessValues> { by_subject.get(label).into_iter().flatten().map(|(round, values)| (*round, values)).collect() };
             let baseline = rounds(&pair.baseline);
             let candidate = rounds(&pair.candidate);
             let mut comparisons: BTreeMap<&str, Comparison> = BTreeMap::new();
             for (round, baseline_values) in &baseline {
-                let Some(candidate_values) = candidate.get(round) else {
-                    continue;
-                };
+                let Some(candidate_values) = candidate.get(round) else { continue };
                 for (name, base) in baseline_values.iter() {
+                    let slot = comparisons.entry(name.as_str()).or_insert(Comparison { base, differences: Vec::new(), moves: Vec::new(), ratios: Vec::new(), unresolved: 0, incompatible: 0, missing: 0 });
                     let Some(other) = candidate_values.get(name) else {
+                        slot.missing += 1;
                         continue;
                     };
-                    let slot = comparisons.entry(name.as_str()).or_insert(Comparison {
-                        base,
-                        differences: Vec::new(),
-                        ratios: Vec::new(),
-                        unresolved: 0,
-                    });
-                    if let (Some(before), Some(after)) = (base.value, other.value) {
-                        if base.statistic == other.statistic {
-                            slot.differences.push(after - before);
-                            if before > 0.0
-                                && before >= RESOLUTION_FACTOR * base.quantum.max(other.quantum)
-                            {
-                                slot.ratios.push(after / before - 1.0);
-                            } else {
-                                slot.unresolved += 1;
-                            }
-                        }
+                    if !base.compatible(other) {
+                        slot.incompatible += 1;
+                        continue;
+                    }
+                    let (Some(before), Some(after)) = (base.value, other.value) else { continue };
+                    let quantum = base.quantum.max(other.quantum);
+                    let difference = after - before;
+                    slot.differences.push(difference);
+                    slot.moves.push(if difference.abs() >= quantum { difference } else { 0.0 });
+                    if base.metric.unit != Unit::Count && before > 0.0 && before >= RESOLUTION_FACTOR * quantum {
+                        slot.ratios.push(after / before - 1.0);
+                    } else {
+                        slot.unresolved += 1;
                     }
                 }
             }
-            PairSummary {
-                baseline: pair.baseline.clone(),
-                candidate: pair.candidate.clone(),
-                kind: pair.kind,
-                metrics: comparisons
-                    .into_values()
-                    .map(Comparison::into_metric)
-                    .collect(),
+            for (name, comparison) in &comparisons {
+                if comparison.incompatible > 0 {
+                    warnings.push(format!("{} -> {}: {name} is defined differently by baseline and candidate in {} round(s), which are not compared", pair.baseline, pair.candidate, comparison.incompatible));
+                }
+                if comparison.missing > 0 {
+                    warnings.push(format!("{} -> {}: {name} is missing from the candidate in {} round(s)", pair.baseline, pair.candidate, comparison.missing));
+                }
             }
+            PairSummary { baseline: pair.baseline.clone(), candidate: pair.candidate.clone(), kind: pair.kind, metrics: comparisons.into_values().map(Comparison::into_metric).collect() }
         })
         .collect();
 
     warnings.extend(interpretation_warnings(plan, &pairs));
+    let mut seen = std::collections::BTreeSet::new();
+    warnings.retain(|warning| seen.insert(warning.clone()));
     Summary {
         schema: SUMMARY_SCHEMA.to_owned(),
         version: SUMMARY_VERSION,
+        generator: GENERATOR.to_owned(),
         mode: plan.mode,
         evidence: plan.mode.evidence().to_owned(),
         scenario: plan.scenario.clone(),
         rounds: plan.rounds,
         seed: plan.seed,
         decision_rule: plan.decision_rule.clone(),
-        aggregation: "each process contributes the median of its samples; subject distributions are across processes; pair differences and changes are per round".to_owned(),
+        aggregation: "each process contributes the median of its samples; subject distributions are across processes; pair differences, changes, and better or worse counts are per round, with differences below the measurement quantum counted as ties; there is no same-binary repeat subject, so run-to-run variation appears only as each subject's spread".to_owned(),
         subjects,
         pairs,
         warnings,
@@ -347,19 +364,44 @@ impl Comparison<'_> {
         let worse = |difference: &&f64| {
             direction != Direction::Neutral && **difference != 0.0 && !better(difference)
         };
+        let improved = self.moves.iter().filter(better).count();
+        let regressed = self.moves.iter().filter(worse).count();
+        // A ratio from only the resolvable rounds would select large baselines; report one only when every round resolves.
+        let change = if self.unresolved == 0 {
+            Distribution::of(&mut self.ratios)
+        } else {
+            None
+        };
         PairMetric {
             name: self.base.metric.name.clone(),
             unit: self.base.metric.unit,
             statistic: self.base.statistic,
             direction,
             rounds: self.differences.len(),
-            improved: self.differences.iter().filter(better).count(),
-            regressed: self.differences.iter().filter(worse).count(),
+            improved,
+            regressed,
             difference: Distribution::of(&mut self.differences),
-            change: Distribution::of(&mut self.ratios),
+            change,
             unresolved: self.unresolved,
+            sign_test_p: (direction != Direction::Neutral).then(|| sign_test(improved, regressed)),
         }
     }
+}
+
+/// The two-sided exact binomial probability of a split at least this uneven if better and worse rounds were equally likely.
+///
+/// For example, 5 of 5 rounds better gives 0.0625: five rounds cannot show a consistent change at the 5% level.
+pub fn sign_test(improved: usize, regressed: usize) -> f64 {
+    let rounds = improved + regressed;
+    let smaller = improved.min(regressed);
+    // Accumulate C(rounds, k) / 2^rounds for k = 0..=smaller without forming large binomial coefficients.
+    let mut term = 0.5_f64.powi(i32::try_from(rounds).unwrap_or(i32::MAX));
+    let mut tail = 0.0;
+    for k in 0..=smaller {
+        tail += term;
+        term *= (rounds - k) as f64 / (k + 1) as f64;
+    }
+    (2.0 * tail).min(1.0)
 }
 
 /// Hazards that make a comparison weaker than its numbers suggest.
@@ -367,6 +409,9 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
     let mut warnings = Vec::new();
     if plan.mode != Mode::Smoke && plan.cpus.is_empty() {
         warnings.push("no CPU placement: workload processes may run on different cores or core types between rounds".to_owned());
+    }
+    if plan.mode != Mode::Smoke && !plan.stack_padding {
+        warnings.push("stack padding disabled: every process of a subject starts with the same stack alignment, which can bias comparisons".to_owned());
     }
     let timed = |metric: &&PairMetric| {
         metric.direction != Direction::Neutral && metric.unit == Unit::Nanoseconds
@@ -391,31 +436,43 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
         }
     }
     for pair in pairs.iter().filter(|pair| pair.kind == PairKind::Build) {
-        let Some(replica) = pairs
+        let replicas: Vec<&PairSummary> = pairs
             .iter()
-            .find(|other| other.kind == PairKind::Replica && other.baseline == pair.baseline)
-        else {
+            .filter(|other| other.kind == PairKind::Replica && other.baseline == pair.baseline)
+            .collect();
+        if replicas.is_empty() {
             warnings.push(format!(
                 "{} -> {}: no layout replica, so build-layout variation is not controlled",
                 pair.baseline, pair.candidate
             ));
             continue;
-        };
+        }
         for metric in pair.metrics.iter().filter(timed) {
-            let (Some(change), Some(control)) = (
-                metric.change,
-                replica
-                    .metrics
-                    .iter()
-                    .find(|other| other.name == metric.name)
-                    .and_then(|other| other.change),
-            ) else {
+            // The widest per-round change of any replica: the layout variation seen in this campaign.
+            let bound = replicas
+                .iter()
+                .filter_map(|replica| {
+                    replica
+                        .metrics
+                        .iter()
+                        .find(|other| other.name == metric.name)
+                        .and_then(|other| other.change)
+                })
+                .map(|control| control.minimum.abs().max(control.maximum.abs()))
+                .reduce(f64::max);
+            let Some(change) = metric.change else {
                 continue;
             };
-            let bound = control.minimum.abs().max(control.maximum.abs());
+            let Some(bound) = bound else {
+                warnings.push(format!(
+                    "{} -> {}: {} has no resolved layout-replica change to compare with",
+                    pair.baseline, pair.candidate, metric.name
+                ));
+                continue;
+            };
             if change.median.abs() <= bound {
                 warnings.push(format!(
-                    "{} -> {}: {} median change {:+.2}% is within the layout replica's range of ±{:.2}%",
+                    "{} -> {}: {} median change {:+.2}% is within the layout replicas' range of ±{:.2}%",
                     pair.baseline,
                     pair.candidate,
                     metric.name,
@@ -426,6 +483,14 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
         }
     }
     // A variant comparison inside one executable can also depend on that executable's layout.
+    let has_replica = plan
+        .artifacts
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.role == ArtifactRole::LayoutReplica);
+    if !has_replica && pairs.iter().any(|pair| pair.kind == PairKind::Variant) {
+        warnings.push("no layout replica: variant comparisons inside one executable can depend on its build layout; prepare with --replicas 1 to check".to_owned());
+    }
     for replica in plan
         .artifacts
         .artifacts
@@ -452,14 +517,19 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
                 continue;
             };
             for metric in pair.metrics.iter().filter(timed) {
-                let (Some(change), Some(other)) = (
-                    metric.change,
-                    control
-                        .metrics
-                        .iter()
-                        .find(|other| other.name == metric.name)
-                        .and_then(|other| other.change),
-                ) else {
+                let Some(change) = metric.change else {
+                    continue;
+                };
+                let other = control
+                    .metrics
+                    .iter()
+                    .find(|other| other.name == metric.name)
+                    .and_then(|other| other.change);
+                let Some(other) = other else {
+                    warnings.push(format!(
+                        "{} -> {}: {} has no resolved comparison in the layout replica {}",
+                        pair.baseline, pair.candidate, metric.name, replica.label
+                    ));
                     continue;
                 };
                 if change.median * other.median < 0.0 {
@@ -565,6 +635,10 @@ fn report_pair_metric(text: &mut String, metric: &PairMetric) {
         ),
         (_, None, None) => return,
     };
+    let sign = metric
+        .sign_test_p
+        .map(|p| format!(", sign test p={p:.3}"))
+        .unwrap_or_default();
     let unresolved = if metric.unresolved > 0 && metric.unit != Unit::Count {
         format!(", {} round(s) below resolution", metric.unresolved)
     } else {
@@ -572,7 +646,7 @@ fn report_pair_metric(text: &mut String, metric: &PairMetric) {
     };
     let _ = writeln!(
         text,
-        "  {name:<32} {value}  better {}/{} worse {}/{}{unresolved}",
+        "  {name:<32} {value}  better {}/{} worse {}/{}{sign}{unresolved}",
         metric.improved, metric.rounds, metric.regressed, metric.rounds
     );
 }
@@ -585,6 +659,9 @@ fn suffix(statistic: Statistic, unit: Unit) -> &'static str {
         (Statistic::Total, Unit::Nanoseconds) => "ns total",
         (Statistic::Total, Unit::Count) => "total",
         (Statistic::Total, Unit::Bytes) => "B total",
+        (Statistic::Mean, Unit::Nanoseconds) => "ns mean",
+        (Statistic::Mean, Unit::Count) => "mean",
+        (Statistic::Mean, Unit::Bytes) => "B mean",
     }
 }
 

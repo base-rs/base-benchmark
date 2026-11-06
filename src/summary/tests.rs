@@ -23,6 +23,7 @@ fn entry(
         subject: subject.to_owned(),
         command: Vec::new(),
         cpus: Vec::new(),
+        stack_padding: None,
         executable_sha256: String::new(),
         duration_ns: 0,
         exit_code: Some(0),
@@ -82,6 +83,15 @@ fn distributions_have_medians_and_ranges() {
 }
 
 #[test]
+fn sign_tests_are_exact_and_two_sided() {
+    assert_eq!(sign_test(5, 0), 0.0625);
+    assert_eq!(sign_test(0, 0), 1.0);
+    assert_eq!(sign_test(3, 3), 1.0);
+    assert!((sign_test(9, 1) - 0.021_484_375).abs() < 1e-12);
+    assert!(sign_test(2000, 0) < 1e-300);
+}
+
+#[test]
 fn build_changes_are_compared_with_the_layout_replica() {
     let plan = build_plan();
     let instructions = |value| {
@@ -117,22 +127,35 @@ fn build_changes_are_compared_with_the_layout_replica() {
     failed.error = Some("ignored".to_owned());
     entries.push(failed);
     let summary = summarize(&plan, &entries);
+    assert_eq!(summary.generator, GENERATOR);
     let build = pair(&summary, PairKind::Build);
     let counted = metric(build, "instructions:u");
     assert_eq!(
         (counted.statistic, counted.improved, counted.regressed),
         (Statistic::Total, 2, 0)
     );
-    assert_eq!(counted.difference.unwrap().median, -300.0);
+    assert_eq!(
+        (counted.change, counted.difference.unwrap().median),
+        (None, -300.0),
+        "counts are compared by difference only"
+    );
+    assert_eq!(counted.sign_test_p, Some(0.5));
     let bytes = metric(build, "bytes");
     assert_eq!(
-        (bytes.direction, bytes.improved, bytes.regressed),
-        (Direction::Neutral, 0, 0)
+        (
+            bytes.direction,
+            bytes.improved,
+            bytes.regressed,
+            bytes.sign_test_p
+        ),
+        (Direction::Neutral, 0, 0, None)
     );
-    assert_eq!(summary.warnings.len(), 1, "{:?}", summary.warnings);
-    assert!(summary.warnings.iter().any(|warning| warning.contains(
-        "wall_time median change -1.00% is within the layout replica's range of ±2.00%"
-    )));
+    assert_eq!(
+        summary.warnings,
+        [
+            "baseline -> candidate: wall_time median change -1.00% is within the layout replicas' range of ±2.00%"
+        ]
+    );
     assert_eq!(summary.subjects[1].processes, 2);
     let report = summary.report();
     assert!(report.contains("instructions:u (total)"));
@@ -140,19 +163,19 @@ fn build_changes_are_compared_with_the_layout_replica() {
         report.contains("-300.000 [-300.000, -300.000] total"),
         "{report}"
     );
+    assert!(report.contains("sign test p=0.500"), "{report}");
     assert!(report.contains("ns/op"));
 }
 
 #[test]
 fn variant_conclusions_are_checked_against_the_replica() {
-    let plan = pinned(
+    let mut plan = pinned(
         &[
             ("current", ArtifactRole::Baseline),
             ("current-replica", ArtifactRole::LayoutReplica),
         ],
         &["reference", "engine"],
     );
-    let mut plan = plan;
     plan.artifacts.artifacts[1].source.replica_of = Some("current".to_owned());
     let entries = vec![
         entry("current/reference", 1, vec![wall(1000)], Vec::new()),
@@ -168,6 +191,7 @@ fn variant_conclusions_are_checked_against_the_replica() {
 fn quantized_counters_and_mixed_directions_are_flagged() {
     let mut plan = pinned(&[("baseline", ArtifactRole::Baseline)], &["slow", "fast"]);
     plan.cpus.clear();
+    plan.stack_padding = false;
     let cpu = |value| {
         Metric::total("user_cpu_time", Unit::Nanoseconds, value)
             .with_resolution(1000)
@@ -190,13 +214,13 @@ fn quantized_counters_and_mixed_directions_are_flagged() {
         entry(
             "baseline/slow",
             2,
-            vec![wall(1000), cpu(2_000_000)],
+            vec![wall(1000), cpu(2_000_000), switches(1)],
             Vec::new(),
         ),
         entry(
             "baseline/fast",
             2,
-            vec![wall(1100), cpu(1_000_000)],
+            vec![wall(1100), cpu(1_000_000), switches(1)],
             Vec::new(),
         ),
     ];
@@ -204,24 +228,94 @@ fn quantized_counters_and_mixed_directions_are_flagged() {
     let variant = pair(&summary, PairKind::Variant);
     let user = metric(variant, "user_cpu_time");
     assert_eq!(
-        (user.rounds, user.unresolved, user.change.unwrap().median),
-        (2, 1, -0.5)
+        (user.rounds, user.unresolved, user.change),
+        (2, 1, None),
+        "a ratio needs every round resolved"
     );
-    assert!(
-        summary
-            .warnings
-            .iter()
-            .any(|warning| warning.starts_with("no CPU placement"))
+    assert_eq!((user.improved, user.regressed), (1, 1));
+    let switch = metric(variant, "switches");
+    assert_eq!(
+        (switch.improved, switch.regressed, switch.change),
+        (0, 1, None),
+        "a difference below one event is a tie"
     );
-    assert!(summary.warnings.iter().any(|warning| {
-        warning.contains("wall_time changed in both directions (better 1/2, worse 1/2)")
-    }));
+    for expected in [
+        "no CPU placement",
+        "stack padding disabled",
+        "wall_time changed in both directions (better 1/2, worse 1/2)",
+        "no layout replica: variant comparisons",
+    ] {
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(expected)),
+            "{expected}: {:?}",
+            summary.warnings
+        );
+    }
     let report = summary.report();
     assert!(report.contains("1 round(s) below resolution"), "{report}");
     assert!(
-        report.contains("switches                         +0.400 [+0.400, +0.400] /op"),
+        report.contains("switches                         +0.200 [+0.000, +0.400] /op"),
         "{report}"
     );
+}
+
+#[test]
+fn incompatible_and_missing_metrics_are_disclosed() {
+    let plan = build_plan();
+    let latency = |value| Metric::total("latency", Unit::Nanoseconds, value).lower_is_better();
+    let entries = vec![
+        entry(
+            "baseline",
+            1,
+            vec![
+                wall(100),
+                latency(50),
+                Metric::total("mixed", Unit::Count, 5),
+                Metric::mean("mean", Unit::Nanoseconds, 400.0).lower_is_better(),
+            ],
+            Vec::new(),
+        ),
+        entry(
+            "candidate",
+            1,
+            vec![
+                wall(90),
+                Metric::total("mixed", Unit::Count, 5).with_phase(Phase::Process),
+                Metric::mean("mean", Unit::Nanoseconds, 200.0).lower_is_better(),
+            ],
+            vec![Metric::total("wall_time", Unit::Nanoseconds, 1).with_phase(Phase::Process)],
+        ),
+        entry(
+            "baseline-replica",
+            1,
+            vec![wall(100), latency(50)],
+            Vec::new(),
+        ),
+    ];
+    let summary = summarize(&plan, &entries);
+    let build = pair(&summary, PairKind::Build);
+    assert_eq!(metric(build, "mixed").rounds, 0);
+    let mean = metric(build, "mean");
+    assert_eq!(
+        (mean.statistic, mean.change.unwrap().median),
+        (Statistic::Mean, -0.5)
+    );
+    for expected in [
+        "candidate: metric wall_time has conflicting definitions within a process and is not summarized",
+        "baseline -> candidate: mixed is defined differently by baseline and candidate in 1 round(s), which are not compared",
+        "baseline -> candidate: latency is missing from the candidate in 1 round(s)",
+        "baseline -> candidate: mean has no resolved layout-replica change to compare with",
+    ] {
+        assert!(
+            summary.warnings.contains(&expected.to_owned()),
+            "{expected}: {:?}",
+            summary.warnings
+        );
+    }
+    assert!(summary.report().contains("ns mean"));
 }
 
 #[test]
@@ -244,6 +338,8 @@ fn missing_controls_rounds_and_values_are_visible() {
                 Metric::mean("latency", Unit::Nanoseconds, 2.0).higher_is_better(),
                 Metric::total("total_bytes", Unit::Bytes, 5).with_phase(Phase::Attached),
                 Metric::total("total_time", Unit::Nanoseconds, 5).with_phase(Phase::Process),
+                Metric::mean("mean_count", Unit::Count, 1.0),
+                Metric::mean("mean_bytes", Unit::Bytes, 1.0),
             ],
             Vec::new(),
         ),
@@ -276,19 +372,24 @@ fn missing_controls_rounds_and_values_are_visible() {
         summary
             .warnings
             .iter()
-            .any(|warning| warning.contains("no layout replica"))
+            .any(|warning| warning.contains("no layout replica, so build-layout"))
     );
     assert!(
         summary
             .warnings
             .iter()
-            .any(|warning| warning.contains("latency changes unit"))
+            .any(|warning| warning.contains("latency changes definition between processes"))
     );
     let build = pair(&summary, PairKind::Build);
     let wall_time = metric(build, "wall_time");
     assert_eq!(
-        (wall_time.rounds, wall_time.regressed, wall_time.unresolved),
-        (2, 2, 1)
+        (
+            wall_time.rounds,
+            wall_time.regressed,
+            wall_time.unresolved,
+            wall_time.change
+        ),
+        (2, 2, 2, None)
     );
     let latency = metric(build, "latency");
     assert_eq!((latency.rounds, latency.regressed), (1, 1));
@@ -316,6 +417,8 @@ fn missing_controls_rounds_and_values_are_visible() {
         "ns total",
         "/op",
         "B/op",
+        " mean",
+        "B mean",
     ] {
         assert!(report.contains(expected), "{expected}: {report}");
     }
@@ -332,104 +435,33 @@ fn missing_controls_rounds_and_values_are_visible() {
 }
 
 #[test]
-fn incomplete_rounds_and_metrics_are_skipped() {
-    let plan = build_plan();
+fn several_replicas_widen_the_control_range() {
+    let plan = pinned(
+        &[
+            ("baseline", ArtifactRole::Baseline),
+            ("candidate", ArtifactRole::Candidate),
+            ("baseline-replica-1", ArtifactRole::LayoutReplica),
+            ("baseline-replica-2", ArtifactRole::LayoutReplica),
+        ],
+        &[],
+    );
     let entries = vec![
-        entry(
-            "baseline",
-            1,
-            vec![
-                wall(100),
-                Metric::total("bytes", Unit::Bytes, 1).lower_is_better(),
-            ],
-            Vec::new(),
-        ),
-        entry(
-            "candidate",
-            1,
-            vec![
-                wall(90),
-                Metric::total("bytes", Unit::Bytes, 1).lower_is_better(),
-            ],
-            Vec::new(),
-        ),
-        entry("baseline-replica", 1, vec![wall(100)], Vec::new()),
-        entry("baseline", 2, vec![wall(100)], Vec::new()),
+        entry("baseline", 1, vec![wall(1000)], Vec::new()),
+        entry("candidate", 1, vec![wall(970)], Vec::new()),
+        entry("baseline-replica-1", 1, vec![wall(1010)], Vec::new()),
+        entry("baseline-replica-2", 1, vec![wall(960)], Vec::new()),
     ];
     let summary = summarize(&plan, &entries);
     assert_eq!(
-        metric(pair(&summary, PairKind::Build), "wall_time").rounds,
-        1
+        summary.warnings,
+        [
+            "baseline -> candidate: wall_time median change -3.00% is within the layout replicas' range of ±4.00%"
+        ]
     );
-    assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
 }
 
 #[test]
-fn smoke_reports_omit_pair_comparisons() {
-    let mut plan = pinned(&[("baseline", ArtifactRole::Baseline)], &["slow", "fast"]);
-    plan.mode = Mode::Smoke;
-    plan.cpus.clear();
-    let entries = vec![
-        entry("baseline/slow", 1, vec![wall(1000)], Vec::new()),
-        entry("baseline/fast", 1, vec![wall(500)], Vec::new()),
-    ];
-    let summary = summarize(&plan, &entries);
-    assert!(summary.warnings.is_empty());
-    let report = summary.report();
-    assert!(report.contains("pair comparisons are omitted from smoke reports"));
-    assert!(!report.contains("-50.00%"));
-}
-
-#[test]
-fn comparisons_skip_metrics_without_a_counterpart() {
-    let plan = build_plan();
-    let latency = |value| Metric::total("latency", Unit::Nanoseconds, value).lower_is_better();
-    let cpu = |value| {
-        Metric::total("cpu", Unit::Nanoseconds, value)
-            .with_resolution(1000)
-            .lower_is_better()
-    };
-    let entries = vec![
-        entry(
-            "baseline",
-            1,
-            vec![
-                wall(100),
-                latency(50),
-                cpu(10),
-                Metric::total("mixed", Unit::Count, 5),
-            ],
-            Vec::new(),
-        ),
-        entry(
-            "candidate",
-            1,
-            vec![
-                wall(90),
-                latency(40),
-                cpu(20),
-                Metric::total("mixed", Unit::Count, 5).with_phase(Phase::Process),
-            ],
-            vec![Metric::total("wall_time", Unit::Nanoseconds, 1).with_phase(Phase::Process)],
-        ),
-        entry("baseline-replica", 1, vec![wall(100)], Vec::new()),
-    ];
-    let summary = summarize(&plan, &entries);
-    let build = pair(&summary, PairKind::Build);
-    assert_eq!(metric(build, "latency").rounds, 1);
-    let cpu = metric(build, "cpu");
-    assert_eq!((cpu.change, cpu.unresolved), (None, 1));
-    assert_eq!(metric(build, "mixed").rounds, 0);
-    assert!(summary.warnings.iter().any(|warning| warning
-        == "candidate: metric wall_time has conflicting definitions within a process and is not summarized"));
-    assert!(
-        summary
-            .report()
-            .contains("cpu                              +1.000 [+1.000, +1.000] ns/op"),
-        "{}",
-        summary.report()
-    );
-
+fn unresolved_replica_comparisons_are_disclosed() {
     let mut plan = pinned(
         &[
             ("current", ArtifactRole::Baseline),
@@ -442,12 +474,62 @@ fn comparisons_skip_metrics_without_a_counterpart() {
         entry(
             "current/reference",
             1,
-            vec![wall(1000), latency(10)],
+            vec![
+                wall(1000),
+                Metric::total("cpu", Unit::Nanoseconds, 10)
+                    .with_resolution(1000)
+                    .lower_is_better(),
+            ],
             Vec::new(),
         ),
-        entry("current/engine", 1, vec![wall(800), latency(5)], Vec::new()),
-        entry("current-replica/reference", 1, vec![wall(1000)], Vec::new()),
-        entry("current-replica/engine", 1, vec![wall(900)], Vec::new()),
+        entry(
+            "current/engine",
+            1,
+            vec![
+                wall(800),
+                Metric::total("cpu", Unit::Nanoseconds, 20)
+                    .with_resolution(1000)
+                    .lower_is_better(),
+            ],
+            Vec::new(),
+        ),
+        entry("current-replica/reference", 1, vec![wall(0)], Vec::new()),
+        entry("current-replica/engine", 1, vec![wall(5)], Vec::new()),
     ];
-    assert!(summarize(&plan, &entries).warnings.is_empty());
+    let summary = summarize(&plan, &entries);
+    assert!(summary.warnings.contains(&"current/reference -> current/engine: wall_time has no resolved comparison in the layout replica current-replica".to_owned()), "{:?}", summary.warnings);
+}
+
+#[test]
+fn incomplete_rounds_and_metrics_are_skipped() {
+    let plan = build_plan();
+    let entries = vec![
+        entry("baseline", 1, vec![wall(100)], Vec::new()),
+        entry("candidate", 1, vec![wall(90)], Vec::new()),
+        entry("baseline-replica", 1, vec![wall(100)], Vec::new()),
+        entry("baseline", 2, vec![wall(100)], Vec::new()),
+    ];
+    let summary = summarize(&plan, &entries);
+    assert_eq!(
+        metric(pair(&summary, PairKind::Build), "wall_time").rounds,
+        1
+    );
+    assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+}
+
+#[test]
+fn smoke_summaries_contain_no_comparisons() {
+    let mut plan = pinned(&[("baseline", ArtifactRole::Baseline)], &["slow", "fast"]);
+    plan.mode = Mode::Smoke;
+    plan.cpus.clear();
+    let entries = vec![
+        entry("baseline/slow", 1, vec![wall(1000)], Vec::new()),
+        entry("baseline/fast", 1, vec![wall(500)], Vec::new()),
+    ];
+    let summary = summarize(&plan, &entries);
+    assert!(summary.pairs.is_empty());
+    assert!(summary.warnings.is_empty());
+    let report = summary.report();
+    assert!(report.contains("pair comparisons are omitted from smoke reports"));
+    assert!(!report.contains("-50.00%"));
 }

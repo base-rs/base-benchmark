@@ -4,8 +4,9 @@
 use super::Cancellation;
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -36,11 +37,22 @@ impl HostLock {
         progress: &mut dyn Write,
         mut try_lock: impl FnMut(File) -> Result<Flock<File>, (File, Errno)>,
     ) -> io::Result<Self> {
+        // Open an existing lock read-only, since `flock` needs no write access and a sticky `/tmp` may forbid opening another user's file for writing. Create a missing one so every user can lock it.
         let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
+            .read(true)
             .open(path)
+            .or_else(|error| match error.kind() {
+                io::ErrorKind::NotFound => OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(path)
+                    .and_then(|file| {
+                        file.set_permissions(Permissions::from_mode(0o666))
+                            .map(|()| file)
+                    }),
+                _ => Err(error),
+            })
             .map_err(|error| {
                 io::Error::new(error.kind(), format!("{}: {error}", path.display()))
             })?;

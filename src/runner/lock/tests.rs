@@ -58,3 +58,22 @@ fn lock_failures_other_than_contention_are_errors() {
     .unwrap();
     assert!(error.to_string().contains("host.lock"));
 }
+
+#[test]
+fn locks_are_shared_between_users() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("host.lock");
+    drop(HostLock::acquire(&path, &Cancellation::new(), &mut Vec::new()).unwrap());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o666
+    );
+    // An existing lock is opened read-only, which is enough for `flock`.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    drop(HostLock::acquire(&path, &Cancellation::new(), &mut Vec::new()).unwrap());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&path).is_err() {
+        assert!(HostLock::acquire(&path, &Cancellation::new(), &mut Vec::new()).is_err());
+    }
+}

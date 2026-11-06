@@ -11,6 +11,8 @@ pub struct HostIdentity {
     pub hostname: Option<String>,
     pub kernel: Option<String>,
     pub cpu_model: Option<String>,
+    /// `kernel.randomize_va_space`: `2` randomizes stack, heap, and mappings for every process; `0` disables it.
+    pub address_space_randomization: Option<String>,
     pub cpus: Vec<CpuIdentity>,
 }
 
@@ -44,6 +46,7 @@ impl HostIdentity {
         Self {
             hostname: read("proc/sys/kernel/hostname"),
             kernel: read("proc/sys/kernel/osrelease"),
+            address_space_randomization: read("proc/sys/kernel/randomize_va_space"),
             cpu_model,
             cpus: cpus
                 .iter()

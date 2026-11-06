@@ -4,7 +4,7 @@
 use crate::config::invalid_input;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -63,12 +63,14 @@ impl ArtifactManifest {
                     dirty: None,
                     lockfile_sha256: None,
                     replica_of: None,
+                    path_dependencies: Vec::new(),
                 },
                 build: BuildIdentity {
                     command: Vec::new(),
                     toolchain: "unknown".to_owned(),
-                    rustflags: None,
-                    encoded_rustflags: None,
+                    cargo: "unknown".to_owned(),
+                    environment: BTreeMap::new(),
+                    configuration: Vec::new(),
                 },
             }],
         })
@@ -144,7 +146,13 @@ pub struct Artifact {
 impl Artifact {
     /// Fail if the frozen executable changed after preparation.
     pub fn verify(&self) -> io::Result<()> {
-        let actual = sha256_file(&self.executable)?;
+        self.verify_at(&self.executable)
+    }
+
+    /// Fail if `path`, such as a staged link or copy, does not contain the frozen executable.
+    pub fn verify_at(&self, path: &Path) -> io::Result<()> {
+        let actual = sha256_file(path)?;
+
         if actual != self.sha256 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -175,10 +183,33 @@ pub struct SourceIdentity {
     pub dirty: Option<bool>,
     pub lockfile_sha256: Option<String>,
     pub replica_of: Option<String>,
+    /// Path dependencies outside the tree. `Cargo.lock` does not pin them, so each is identified by its own Git state.
+    pub path_dependencies: Vec<DependencyIdentity>,
 }
 
 impl SourceIdentity {
-    /// A committed, unmodified revision.
+    /// A committed, unmodified revision whose out-of-tree path dependencies are committed and unmodified too.
+    pub fn is_frozen(&self) -> bool {
+        self.revision.is_some()
+            && self.dirty == Some(false)
+            && self
+                .path_dependencies
+                .iter()
+                .all(DependencyIdentity::is_frozen)
+    }
+}
+
+/// A path dependency outside the built tree.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyIdentity {
+    pub name: String,
+    pub path: PathBuf,
+    pub revision: Option<String>,
+    pub dirty: Option<bool>,
+}
+
+impl DependencyIdentity {
     pub fn is_frozen(&self) -> bool {
         self.revision.is_some() && self.dirty == Some(false)
     }
@@ -190,9 +221,37 @@ pub struct BuildIdentity {
     pub command: Vec<String>,
     /// `rustc -Vv` in the source tree.
     pub toolchain: String,
-    /// `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` from the preparation environment.
-    pub rustflags: Option<String>,
-    pub encoded_rustflags: Option<String>,
+    /// `cargo -Vv` in the source tree.
+    pub cargo: String,
+    /// Build-affecting variables from the preparation environment: `RUSTFLAGS`, `RUSTC*`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_*`, `CARGO_PROFILE_*`, and `CARGO_TARGET_*`.
+    pub environment: BTreeMap<String, String>,
+    /// Cargo configuration files that apply to the tree, from the tree upward and `$CARGO_HOME`, with their contents' hashes.
+    pub configuration: Vec<ConfigurationFile>,
+}
+
+impl BuildIdentity {
+    /// Settings that must match between artifacts of a recorded comparison. Configuration is compared by content, since replicas live at other paths.
+    pub fn settings(&self) -> (&str, &str, &BTreeMap<String, String>, Vec<&str>) {
+        let mut configuration: Vec<&str> = self
+            .configuration
+            .iter()
+            .map(|file| file.sha256.as_str())
+            .collect();
+        configuration.sort_unstable();
+        (
+            &self.toolchain,
+            &self.cargo,
+            &self.environment,
+            configuration,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigurationFile {
+    pub path: PathBuf,
+    pub sha256: String,
 }
 
 pub fn sha256_file(path: &Path) -> io::Result<String> {
@@ -214,7 +273,12 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
 pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let mut text = serde_json::to_vec_pretty(value).expect("benchmark documents serialize");
     text.push(b'\n');
-    std::fs::write(path, text)
+    // Write a sibling and rename it into place, so readers never see a partly written document.
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    std::fs::write(&temporary, text)
+        .and_then(|()| std::fs::rename(&temporary, path))
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
 

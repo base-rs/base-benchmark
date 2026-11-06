@@ -30,26 +30,9 @@ fn options_are_strict() {
     assert!(failure(&["list", "--manifest-path"]).contains("needs a value"));
     assert!(failure(&["list", "--unknown", "1"]).contains("unknown option --unknown"));
     assert!(failure(&["list", "extra"]).contains("positional"));
-    assert!(failure(&["prepare", "--package", "a", "--package", "b"]).contains("more than once"));
-    assert!(failure(&["prepare", "--replica", "maybe"]).contains("invalid --replica"));
     assert!(failure(&["prepare", "--tree", "nolabel"]).contains("LABEL=PATH"));
-    assert!(failure(&["run", "--artifacts", "a.json"]).contains("--scenario is required"));
-    assert!(
-        failure(&["run", "--scenario", "s", "--artifacts", "a", "--cpus", "x"])
-            .contains("invalid CPU list")
-    );
-    assert!(
-        failure(&[
-            "run",
-            "--scenario",
-            "s",
-            "--artifacts",
-            "a",
-            "--mode",
-            "fast"
-        ])
-        .contains("invalid --mode")
-    );
+    assert!(failure(&["run", "--artifacts", "a.json"]).contains("expected 1 positional"));
+    assert!(failure(&["run", "s"]).contains("--artifacts is required"));
     assert!(failure(&["summarize"]).contains("positional"));
     assert!(failure(&["summarize", "/nonexistent"]).contains("metadata.json"));
     let mut out = Vec::new();
@@ -88,12 +71,20 @@ fn output_failures_are_command_failures() {
 #[test]
 fn every_option_reports_repetition_and_parse_errors() {
     let commands: [(&str, &[&str], &[&str]); 4] = [
-        ("prepare", &["package", "replica", "output"], &["replica"]),
-        ("smoke", &["package", "output", "lock"], &[]),
+        (
+            "prepare",
+            &["manifest-path", "package", "replicas", "output"],
+            &["replicas"],
+        ),
+        (
+            "smoke",
+            &["manifest-path", "package", "output", "lock"],
+            &[],
+        ),
         (
             "run",
             &[
-                "scenario",
+                "manifest-path",
                 "artifacts",
                 "mode",
                 "package",
@@ -105,6 +96,7 @@ fn every_option_reports_repetition_and_parse_errors() {
                 "output",
                 "decision-rule",
                 "idle-host",
+                "stack-padding",
             ],
             &[
                 "mode",
@@ -113,13 +105,14 @@ fn every_option_reports_repetition_and_parse_errors() {
                 "cpus",
                 "timeout-seconds",
                 "idle-host",
+                "stack-padding",
             ],
         ),
-        ("list", &[], &[]),
+        ("list", &["manifest-path"], &[]),
     ];
     for (command, options, parsed) in commands {
         let required = if command == "run" {
-            vec!["--scenario", "s", "--artifacts", "a"]
+            vec!["s", "--artifacts", "a"]
         } else {
             Vec::new()
         };
@@ -154,5 +147,4 @@ fn every_option_reports_repetition_and_parse_errors() {
             "{command}"
         );
     }
-    assert!(failure(&["run", "--scenario", "s"]).contains("--artifacts is required"));
 }

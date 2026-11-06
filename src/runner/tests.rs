@@ -5,6 +5,7 @@ use super::*;
 use crate::artifact::ArtifactRole;
 use crate::plan::PairKind;
 use crate::test_support::{plan, record, script};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 const ROLES: &[(&str, ArtifactRole)] = &[("baseline", ArtifactRole::Baseline)];
@@ -55,7 +56,7 @@ fn complete_campaigns_journal_samples_and_summarize_pairs() {
     assert_eq!(entries.len(), 4);
     assert!(entries.iter().all(|entry| entry.error.is_none()
         && entry.stderr == "note\n"
-        && entry.command[0] == "/bin/sh"));
+        && entry.command[0].ends_with("/bin/0")));
     let pair = &campaign.summary.pairs[0];
     assert_eq!(
         (pair.kind, pair.metrics[0].improved, pair.metrics[0].rounds),
@@ -318,12 +319,9 @@ fn journal_failures_are_reported_with_the_original_error() {
     }
     let valid = record("same", 100);
     let cases = [
+        (format!("chmod 555 \"$1\"; echo '{valid}'"), "summary.json"),
         (
-            format!("chmod 444 \"$1/metadata.json\"; echo '{valid}'"),
-            "metadata.json",
-        ),
-        (
-            "chmod 444 \"$1/metadata.json\"; exit 2".to_owned(),
+            "chmod 555 \"$1\"; exit 2".to_owned(),
             "recording the failure also failed",
         ),
         (
@@ -335,28 +333,28 @@ fn journal_failures_are_reported_with_the_original_error() {
         let output = directory.path().join(format!("campaign-{index}"));
         let (mut plan, _) = campaign(directory.path(), &body);
         plan.rounds = 1;
+        // The campaign directory is the script's first argument.
         plan.subjects[0]
             .arguments
-            .push(output.display().to_string());
+            .insert(1, output.display().to_string());
         let error = run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap_err();
         assert!(error.to_string().contains(message), "{message}: {error}");
+        std::fs::set_permissions(&output, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
     }
     let (mut plan, _) = campaign(directory.path(), &format!("echo '{valid}'"));
     plan.rounds = 1;
     let output = directory.path().join("complete");
     run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap();
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(
-        output.join("summary.json"),
-        std::fs::Permissions::from_mode(0o444),
-    )
-    .unwrap();
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o555)).unwrap();
     assert!(
         summarize_directory(&output)
             .unwrap_err()
             .to_string()
             .contains("summary.json")
     );
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::remove_file(output.join("samples.jsonl")).unwrap();
     assert!(
         summarize_directory(&output)
@@ -410,5 +408,167 @@ fn unsigned_records_unusable_locks_and_missing_programs() {
         .unwrap_err()
         .to_string()
         .contains("new directory")
+    );
+}
+
+fn variant_workload(directory: &Path, fast: &str) -> PathBuf {
+    let slow = record("same", 1000);
+    script(
+        directory,
+        "variants.sh",
+        &format!("if [ \"$1\" = fast ]; then echo '{fast}'; else echo '{slow}'; fi\n"),
+    )
+}
+
+#[test]
+fn records_must_share_workload_signature_and_parameters() {
+    let cases = [
+        (
+            record("same", 900).replace("\"workload\":\"fixture\"", "\"workload\":\"other\""),
+            "did not do equivalent work",
+        ),
+        (
+            record("same", 900).replace(r#""signature":"same","#, ""),
+            "did not do equivalent work",
+        ),
+    ];
+    for (fast, message) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let work = variant_workload(directory.path(), &fast);
+        let mut plan = plan(
+            &work,
+            &["slow", "fast"],
+            ROLES,
+            &directory.path().join("lock"),
+        );
+        plan.rounds = 1;
+        plan.seed = 1;
+        let error = run(
+            plan,
+            &directory.path().join("campaign"),
+            &Cancellation::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(message), "{message}: {error}");
+    }
+}
+
+#[test]
+fn workloads_start_from_equal_length_staged_paths_with_stack_padding() {
+    let directory = tempfile::tempdir().unwrap();
+    let valid = record("same", 100);
+    let work = script(
+        directory.path(),
+        "padded.sh",
+        &format!("printf %s \"${{#BASE_BENCHMARK_STACK_PADDING}}\" >&2; pwd >&2; echo '{valid}'\n"),
+    );
+    // An executable owned by this user can be hard linked; `/bin/sh` usually cannot, so it is copied.
+    let shell = directory.path().join("sh");
+    std::fs::copy("/bin/sh", &shell).unwrap();
+    let mut plan = plan(
+        &work,
+        &[],
+        &[
+            ("baseline", ArtifactRole::Baseline),
+            ("candidate", ArtifactRole::Candidate),
+        ],
+        &directory.path().join("lock"),
+    );
+    plan.artifacts.artifacts[1] =
+        crate::test_support::artifact("candidate", ArtifactRole::Candidate, &shell);
+    for subject in &mut plan.subjects {
+        if subject.artifact == "candidate" {
+            subject.program = shell.clone();
+        }
+    }
+    let output = directory.path().join("campaign");
+    run(plan.clone(), &output, &Cancellation::new(), &mut Vec::new()).unwrap();
+    let entries = read_entries(&output.join("samples.jsonl")).unwrap();
+    for entry in &entries {
+        let padding = entry.stack_padding.unwrap();
+        assert!(padding < crate::plan::STACK_PADDING_LIMIT);
+        assert_eq!(entry.stderr, format!("{padding}/\n"));
+        let staged = Path::new(&entry.command[0]);
+        assert_eq!(staged.parent().unwrap(), output.join("bin"));
+        assert_eq!(staged.file_name().unwrap().len(), 1);
+    }
+    assert_eq!(
+        std::fs::metadata(output.join("bin/1")).unwrap().ino(),
+        std::fs::metadata(&shell).unwrap().ino(),
+        "owned executables are hard linked"
+    );
+
+    plan.stack_padding = false;
+    let output = directory.path().join("unpadded");
+    run(plan.clone(), &output, &Cancellation::new(), &mut Vec::new()).unwrap();
+    assert!(
+        read_entries(&output.join("samples.jsonl"))
+            .unwrap()
+            .iter()
+            .all(|entry| entry.stack_padding.is_none() && entry.stderr == "0/\n")
+    );
+
+    plan.artifacts.artifacts[1].executable = directory.path().join("missing");
+    let output = directory.path().join("unstaged");
+    assert!(
+        run(plan, &output, &Cancellation::new(), &mut Vec::new())
+            .unwrap_err()
+            .to_string()
+            .contains("candidate: cannot stage")
+    );
+}
+
+#[test]
+fn escaped_descendants_fail_the_campaign() {
+    let directory = tempfile::tempdir().unwrap();
+    let (plan, output) = campaign(directory.path(), "setsid sleep 10 & sleep 0.3; echo '{}'");
+    let error = run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("left the workload's process group"),
+        "{error}"
+    );
+}
+
+#[test]
+fn artifacts_must_run_a_variant_with_the_same_parameters() {
+    let directory = tempfile::tempdir().unwrap();
+    let normal = record("same", 100);
+    let changed = normal.replace("\"parameters\":{}", "\"parameters\":{\"items\":2}");
+    // The candidate's shell is staged as `bin/1`; its changed default shows up as different parameters.
+    let work = script(
+        directory.path(),
+        "defaults.sh",
+        &format!(
+            "case \"$(readlink /proc/$$/exe)\" in */bin/1) echo '{changed}';; *) echo '{normal}';; esac\n"
+        ),
+    );
+    let shell = directory.path().join("sh");
+    std::fs::copy("/bin/sh", &shell).unwrap();
+    let mut plan = plan(
+        &work,
+        &[],
+        &[
+            ("baseline", ArtifactRole::Baseline),
+            ("candidate", ArtifactRole::Candidate),
+        ],
+        &directory.path().join("lock"),
+    );
+    plan.artifacts.artifacts[1] =
+        crate::test_support::artifact("candidate", ArtifactRole::Candidate, &shell);
+    let error = run(
+        plan,
+        &directory.path().join("campaign"),
+        &Cancellation::new(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("parameters differ from another run of the same variant"),
+        "{error}"
     );
 }
