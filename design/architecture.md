@@ -8,9 +8,9 @@ Implement shared measurement, collection, records, validation, provenance, persi
 
 Workloads, correctness oracles, protocol semantics, operation boundaries, and acceptance budgets remain project-owned. Do not impose one network/CPU workload model or fabricate numerical targets. Distinguish whole-process counters from measured-loop counters; normalized metrics require compatible scopes and denominators. Unimplemented or unavailable capabilities must not be presented as measured or working.
 
-Comparative evidence must distinguish same-binary repetition from same-source rebuild/layout controls and disclose missing controls. Smoke and quick screening must be explicitly non-acceptance evidence. Predeclared expected performance outcomes may be data, but must not turn malformed output, failed correctness checks, or violated required completion/cohort contracts into successful samples. Detailed preparation defaults and task interfaces remain proposals in the architecture plan.
+Comparative evidence must distinguish same-binary repetition from same-source rebuild/layout controls and disclose missing controls. Smoke and quick screening must be explicitly non-acceptance evidence. Predeclared expected performance outcomes may be data, but must not turn malformed output, failed correctness checks, or violated required completion/cohort contracts into successful samples. Comparisons must not report changes below the measurement's resolution as percentages, and smoke reports must not report comparisons.
 
-When records are implemented, retain raw values and workload, revision/build/harness, metric-scope, baseline/pair, and measurement-host/environment identities so compatible historical series can be selected. Normalized results must identify their reference and method; do not imply arbitrary cross-host comparability. A historical analysis tool or comparison web UI is a lower-priority follow-up, not a required part of the initial implementation.
+Records must retain raw values and workload, revision/build/harness, metric-scope, baseline/pair, and measurement-host/environment identities so compatible historical series can be selected. Normalized results must identify their reference and method; do not imply arbitrary cross-host comparability. A historical analysis tool or comparison web UI is a lower-priority follow-up, not a required part of the initial implementation.
 
 Preserve optimization investigations and their evidence regardless of an adopted, rejected, deferred, or open decision. Record the hypothesis, exact variants/method, validity, results or explicit absence of measurement, rationale, and revisit conditions. Keep engineering decisions separate from evidence validity and never present invalid experiments as valid performance conclusions. The [shared investigation convention](../context/investigations.md) defines the initial documentation format; automated tooling remains future work.
 
@@ -26,14 +26,28 @@ The user explicitly requested a standard record of measured and rejected optimiz
 
 ## Scope
 
-The core library, any CLI, dependency direction to the separate Bake adapter, and claims made in documentation. Detailed runner and record contracts remain proposals until implementation review; this document does not claim they are implemented.
+The core library, the `base-benchmark` command, dependency direction to the separate Bake adapter, record and summary semantics, and claims made in documentation. The architecture guide lists which planned capabilities are not yet implemented.
 
 ## Validation
 
-Inspect package dependency graphs and public signatures separately from private `bake/` tooling. Review core and adapter together for duplicate semantic logic and test equivalence of their entry points when implemented. Exercise normal collection/summarization without Python, inspect raw metric scopes and normalization, and test differing workload shapes while retaining project-owned oracles. For this initial scaffold, validate the dependency direction and honest status documentation; runtime behavior remains unverified because it does not exist yet.
+Inspect `cargo tree -p base-benchmark -e normal` for Bake, the adapter, or Python, and the adapter's tasks for semantic logic not delegated to `Workspace`. The command and task test suites exercise the same operations; workspace integration tests build a fixture workspace and collect it without Python.
 
-When comparative APIs exist, test replica/control labels, missing-control disclosures, mode-specific evidence classification, and declared performance outcomes separately from invalid/correctness/completion failures. Inspect paired raw records rather than treat rounds-improved counts as acceptance proof.
+Tests cover:
 
-When records/analysis exist, verify that changed workload semantics, host/environment epochs, harnesses, or baseline definitions are separated or explicitly qualified; reproduce plotted/normalized values from retained raw evidence. This future runtime validation is not established by the initial scaffold.
+- process-group cleanup on timeout, cancellation, and signals;
+- rejection of malformed, oversized, signature-mismatched, or changed-executable samples;
+- journal failure reporting;
+- recorded prerequisites;
+- layout replica preparation and cleanup;
+- normalization only of measured-phase totals;
+- resolution-aware ratios;
+- smoke report omission;
+- each interpretation warning.
 
-Review investigation records for retained candidate identity/evidence, an explicit decision and reason, missing/invalid metrics, and revisit conditions. Test that future indexing/summary tooling does not drop rejected or incomplete attempts or confuse decisions with evidence validity. The initial scaffold supplies a template, not a fabricated completed investigation.
+The shared coverage task requires every measured source region to be covered.
+
+For comparative claims, inspect paired raw records and replica/control pairs rather than treat rounds-improved counts as acceptance proof. The [`base-html` integration report](../reports/base-html-integration.md) records how real screening runs exposed placement and layout hazards.
+
+When history or analysis tooling exists, verify that changed workload semantics, host/environment epochs, harnesses, or baseline definitions are separated or explicitly qualified; reproduce plotted or normalized values from retained raw evidence.
+
+Review investigation records for retained candidate identity and evidence, an explicit decision and reason, missing or invalid metrics, and revisit conditions. Future indexing or summary tooling must not drop rejected or incomplete attempts, or confuse decisions with evidence validity.

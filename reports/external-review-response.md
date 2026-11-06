@@ -20,3 +20,22 @@ An expected load-generator timeout may be part of a declared outcome contract, b
 ## Implementation validation still required
 
 Test deterministic/shuffled schedules, paired summary arithmetic, replica omission/availability, prepared-tree paths and archives, downstream patch identity, immutable source handling, interrupted builds, lock ownership/wait cancellation, role placement, per-host provenance, and declared-error versus invalid-sample separation. Then validate a small HTML path plus scheduler echo and a downstream HTTP workload. None of these runtime capabilities or migrations exists in the initial scaffold.
+
+## Implementation status, 7 November 2026
+
+The first implementation covers these items:
+- labelled explicit source trees with a common build policy;
+- a default same-source layout replica for comparisons of two or more trees;
+- seeded random rounds that include the replica;
+- side-by-side replica pairs with warnings;
+- smoke, screening, and recorded modes, with recorded prerequisites enforced;
+- a host-wide lock with visible, cancellation-aware waiting and round progress;
+- recorded host identity and CPU placement.
+
+Not yet implemented:
+- revision archives as inputs, and downstream workloads built through patch overrides;
+- unchanged external comparators as plan subjects;
+- predeclared expected-error outcome contracts, beyond reporting load errors as ordinary workload metrics;
+- per-role server/client placement and per-role resource sources.
+
+See the [architecture](../context/architecture.md). The [`base-html` integration](base-html-integration.md) independently reproduced the review's central point on a different workload: an apparently consistent improvement disappeared under CPU placement, and its sign reversed in the layout replica.

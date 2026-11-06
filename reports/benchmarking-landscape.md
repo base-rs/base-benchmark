@@ -1,5 +1,7 @@
 # Base Benchmarking Landscape
 
+> Update, 7 November 2026: an initial implementation exists and replaced the `base-html` Python collector; see the [architecture](../context/architecture.md) and the [integration review](base-html-integration.md). The audit below describes the 6 November source snapshot.
+
 ## Decision
 
 Create **two repositories with one shared Rust implementation**:
