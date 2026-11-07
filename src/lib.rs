@@ -77,4 +77,4 @@ pub use summary::{
     SUMMARY_SCHEMA, SUMMARY_VERSION, Statistic, SubjectSummary, Summary, sign_test, summarize,
 };
 #[cfg(feature = "runner")]
-pub use workspace::{DEFAULT_TIMEOUT, RunRequest, Workspace};
+pub use workspace::{DEFAULT_TIMEOUT, PrepareRequest, RunRequest, Workspace};

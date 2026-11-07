@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Let scenarios set their own Cargo `features`. Preparation builds each tree once for every distinct feature set of the scenarios it prepares, or of those named with `--scenario`, and a run uses only the builds with its scenario's features. A diagnostic or allocation-counting build can then be a declared scenario without reaching the timed builds. Breaking: artifact manifests are version 2, with `features` on each artifact instead of the manifest; `Workspace::prepare` takes a `PrepareRequest`; `PrepareOptions` has `feature_sets`; and `Workspace::smoke_executable` takes the features the executable was built with, skipping scenarios that need others. Executables are frozen under `artifacts/LABEL/N/`, numbered by feature set.
 - Add `Metric::quantile` and `Measurement::Quantile` for order statistics such as a 99th percentile latency, summarized as `Statistic::Quantile` with the quantile, and reported as, for example, `ns p99`. A metric reported at different quantiles is a different definition, flagged rather than compared.
 - Records are now version 2 and summaries version 2, since both can contain quantiles. The runner still accepts version 1 records, so workloads built against 0.1 keep working. A 0.1 runner rejects 0.2 records: with a version mismatch, or for records with quantiles, with an unknown variant `quantile`.
 - Breaking: `Measurement` and `Statistic` gain variants and are now `#[non_exhaustive]`, so matches on them need a wildcard arm. `Statistic` is no longer `Eq`, since it now carries the quantile.

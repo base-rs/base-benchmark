@@ -59,6 +59,7 @@ fn options(directory: &Path, trees: Vec<Tree>, cargo: PathBuf) -> PrepareOptions
         trees,
         replicas: None,
         output: directory.join("prepared"),
+        feature_sets: Vec::new(),
         cargo,
         rustc: PathBuf::from("/bin/echo"),
     }
@@ -348,7 +349,7 @@ fn build_and_freeze_failures_identify_the_tree() {
         ("exit 1", "a: cargo build failed"),
         ("exit 0", "a: cargo reported no executable"),
         (
-            "mkdir -p \"$output/artifacts/a/fixture\"",
+            "mkdir -p \"$output/artifacts/a/0/fixture\"",
             "a: cannot freeze",
         ),
         ("mkdir \"$output/artifacts.json\"", "artifacts.json"),

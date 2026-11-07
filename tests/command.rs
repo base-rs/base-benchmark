@@ -51,6 +51,8 @@ fn every_command_uses_the_shared_workspace_operations() {
         "fixture",
         "--replicas",
         "1",
+        "--scenario",
+        "work",
         "--output",
         &prepared,
     ]);

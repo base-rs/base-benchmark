@@ -11,9 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub const MANIFEST_SCHEMA: &str = "base-benchmark/artifacts";
-pub const MANIFEST_VERSION: u32 = 1;
+/// Version 2 records each artifact's features, so one manifest can hold several builds of each tree.
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// Frozen executables prepared before any measurement, with the identity of each source tree and build.
+///
+/// A tree is built once for each set of features its scenarios need, so a label names one tree and appears once per feature set.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactManifest {
@@ -22,7 +25,6 @@ pub struct ArtifactManifest {
     pub package: String,
     pub binary: String,
     pub profile: String,
-    pub features: Vec<String>,
     pub artifacts: Vec<Artifact>,
 }
 
@@ -44,7 +46,7 @@ impl ArtifactManifest {
 
     /// Describe an executable built outside [`crate::prepare`], such as a test binary, as the only baseline artifact.
     ///
-    /// Its source and build are unknown, so it can be used for smoke and screening runs but never satisfies recorded prerequisites.
+    /// Its source and build are unknown, so it can be used for smoke and screening runs but never satisfies recorded prerequisites. Its features are unknown too, so it serves every scenario; callers choose which scenarios it can run.
     pub fn unprepared(suite: &crate::config::Suite, executable: &Path) -> io::Result<Self> {
         Ok(Self {
             schema: MANIFEST_SCHEMA.to_owned(),
@@ -52,10 +54,10 @@ impl ArtifactManifest {
             package: suite.package.clone(),
             binary: suite.binary.clone(),
             profile: "unknown".to_owned(),
-            features: Vec::new(),
             artifacts: vec![Artifact {
                 label: "unprepared".to_owned(),
                 role: ArtifactRole::Baseline,
+                features: None,
                 sha256: sha256_identified(executable)?,
                 executable: executable.to_owned(),
                 source: SourceIdentity {
@@ -77,11 +79,36 @@ impl ArtifactManifest {
         })
     }
 
+    /// The baseline. Call it on a manifest of one feature set, such as one from [`Self::for_features`].
     pub fn baseline(&self) -> &Artifact {
         self.artifacts
             .iter()
             .find(|artifact| artifact.role == ArtifactRole::Baseline)
-            .expect("validated manifests have one baseline")
+            .expect("validated manifests have a baseline")
+    }
+
+    /// The artifacts built with exactly `features`, sorted and without duplicates, as a manifest of their own; artifacts whose features are unknown serve any.
+    pub fn for_features(&self, features: &[String]) -> io::Result<Self> {
+        let artifacts: Vec<Artifact> = self
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact
+                    .features
+                    .as_deref()
+                    .is_none_or(|built| built == features)
+            })
+            .cloned()
+            .collect();
+        if artifacts.is_empty() {
+            return Err(invalid_input(format!(
+                "no artifact was built with features {features:?}; prepare the scenarios that need them"
+            )));
+        }
+        Ok(Self {
+            artifacts,
+            ..self.clone()
+        })
     }
 
     pub fn validate(&self) -> io::Result<()> {
@@ -91,41 +118,50 @@ impl ArtifactManifest {
                 self.schema, self.version
             )));
         }
-        let labels: BTreeSet<&str> = self
-            .artifacts
-            .iter()
-            .map(|artifact| artifact.label.as_str())
-            .collect();
-        if labels.len() != self.artifacts.len()
-            || labels
-                .iter()
-                .any(|label| !crate::config::valid_label(label))
-        {
-            return Err(invalid_input("artifact labels must be unique and valid"));
-        }
-        if self
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.role == ArtifactRole::Baseline)
-            .count()
-            != 1
-        {
-            return Err(invalid_input(
-                "an artifact manifest needs exactly one baseline",
-            ));
-        }
+        let mut builds = BTreeMap::<Option<&[String]>, Vec<&Artifact>>::new();
         for artifact in &self.artifacts {
-            let replica_of = artifact.source.replica_of.as_deref();
-            let consistent = match artifact.role {
-                ArtifactRole::LayoutReplica => replica_of
-                    .is_some_and(|label| labels.contains(label) && label != artifact.label),
-                _ => replica_of.is_none(),
-            };
-            if !consistent {
-                return Err(invalid_input(format!(
-                    "{}: only layout replicas name an existing replicated artifact",
-                    artifact.label
-                )));
+            builds
+                .entry(artifact.features.as_deref())
+                .or_default()
+                .push(artifact);
+        }
+        for artifacts in builds.values() {
+            let labels: BTreeSet<&str> = artifacts
+                .iter()
+                .map(|artifact| artifact.label.as_str())
+                .collect();
+            if labels.len() != artifacts.len()
+                || labels
+                    .iter()
+                    .any(|label| !crate::config::valid_label(label))
+            {
+                return Err(invalid_input(
+                    "artifact labels must be valid and unique within each feature set",
+                ));
+            }
+            if artifacts
+                .iter()
+                .filter(|artifact| artifact.role == ArtifactRole::Baseline)
+                .count()
+                != 1
+            {
+                return Err(invalid_input(
+                    "an artifact manifest needs exactly one baseline for each feature set",
+                ));
+            }
+            for artifact in artifacts {
+                let replica_of = artifact.source.replica_of.as_deref();
+                let consistent = match artifact.role {
+                    ArtifactRole::LayoutReplica => replica_of
+                        .is_some_and(|label| labels.contains(label) && label != artifact.label),
+                    _ => replica_of.is_none(),
+                };
+                if !consistent {
+                    return Err(invalid_input(format!(
+                        "{}: only layout replicas name an existing replicated artifact with the same features",
+                        artifact.label
+                    )));
+                }
             }
         }
         Ok(())
@@ -137,6 +173,8 @@ impl ArtifactManifest {
 pub struct Artifact {
     pub label: String,
     pub role: ArtifactRole,
+    /// The Cargo features it was built with, sorted and without duplicates, or `None` when unknown, as for an executable built outside preparation.
+    pub features: Option<Vec<String>>,
     /// The frozen copy of the executable, outside any Cargo target directory.
     pub executable: PathBuf,
     pub sha256: String,

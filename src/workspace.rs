@@ -2,7 +2,7 @@
 // Copyright, 2026, by Samuel Williams.
 
 use crate::artifact::ArtifactManifest;
-use crate::config::{self, Suite};
+use crate::config::{self, Scenario, Suite};
 use crate::plan::{Mode, Plan, PlanOptions, default_lock_path};
 use crate::prepare::{PrepareOptions, Prepared, Tree, prepare};
 use crate::runner::{self, Campaign, Cancellation};
@@ -19,6 +19,20 @@ pub struct Workspace {
     pub manifest_path: PathBuf,
     pub cargo: PathBuf,
     pub rustc: PathBuf,
+}
+
+/// A request to prepare artifacts. Unset options take the core's defaults.
+#[derive(Clone, Debug, Default)]
+pub struct PrepareRequest {
+    pub package: Option<String>,
+    /// Labelled trees, the first being the baseline. Without trees, the current workspace is the baseline, labelled `current`.
+    pub trees: Vec<Tree>,
+    /// Layout replicas of the baseline; defaults to one when comparing two or more trees, otherwise none.
+    pub replicas: Option<usize>,
+    /// Defaults to a new directory under `target/base-benchmark`.
+    pub output: Option<PathBuf>,
+    /// Build the feature sets these scenarios need; without scenarios, every scenario's.
+    pub scenarios: Vec<String>,
 }
 
 /// A request to collect one scenario from prepared artifacts. Unset options take the core's defaults.
@@ -74,29 +88,45 @@ impl Workspace {
         config::select(self.suites()?, package)
     }
 
-    /// Build labelled trees, the first being the baseline, plus `replicas` layout replicas. Without trees, the current workspace is the baseline, labelled `current`.
+    /// Build labelled trees, the first being the baseline, plus layout replicas of the baseline, once for each feature set the requested scenarios need.
     pub fn prepare(
         &self,
-        package: Option<&str>,
-        mut trees: Vec<Tree>,
-        replicas: Option<usize>,
-        output: Option<PathBuf>,
+        request: PrepareRequest,
         cancellation: &Cancellation,
     ) -> io::Result<Prepared> {
-        let suite = self.suite(package)?;
+        let suite = self.suite(request.package.as_deref())?;
+        let mut trees = request.trees;
         if trees.is_empty() {
             trees.push(Tree {
                 label: "current".to_owned(),
                 path: suite.workspace_root.clone(),
             });
         }
-        let output = output.unwrap_or_else(|| default_output(&suite.workspace_root, "prepared"));
+        let scenarios = if request.scenarios.is_empty() {
+            suite.scenarios.iter().collect()
+        } else {
+            request
+                .scenarios
+                .iter()
+                .map(|name| suite.scenario(name))
+                .collect::<io::Result<Vec<_>>>()?
+        };
+        let mut feature_sets: Vec<Vec<String>> = Vec::new();
+        for scenario in scenarios {
+            if !feature_sets.contains(&scenario.features) {
+                feature_sets.push(scenario.features.clone());
+            }
+        }
+        let output = request
+            .output
+            .unwrap_or_else(|| default_output(&suite.workspace_root, "prepared"));
         prepare(
             &PrepareOptions {
                 suite,
                 trees,
-                replicas,
+                replicas: request.replicas,
                 output,
+                feature_sets,
                 cargo: self.cargo.clone(),
                 rustc: self.rustc.clone(),
             },
@@ -151,14 +181,17 @@ impl Workspace {
         let output = output.unwrap_or_else(|| default_output(&suite.workspace_root, "smoke"));
         // Labels cannot start with `.`, so prepared artifacts never collide with a scenario's directory.
         let prepared = self.prepare(
-            Some(&suite.package),
-            Vec::new(),
-            Some(0),
-            Some(output.join(".artifacts")),
+            PrepareRequest {
+                package: Some(suite.package.clone()),
+                replicas: Some(0),
+                output: Some(output.join(".artifacts")),
+                ..PrepareRequest::default()
+            },
             cancellation,
         )?;
         self.smoke_all(
             &suite,
+            suite.scenarios.iter().collect(),
             &prepared.manifest_path,
             &output,
             lock,
@@ -167,11 +200,12 @@ impl Workspace {
         )
     }
 
-    /// Run every scenario once, with its smoke arguments, using an executable built outside preparation, such as a workload's `CARGO_BIN_EXE_*` in its own tests.
+    /// Run once, with its smoke arguments, every scenario whose features `features` includes, using an executable built outside preparation with those features, such as a workload's `CARGO_BIN_EXE_*` in its own tests. Scenarios that need other features are skipped, since the executable cannot run them.
     pub fn smoke_executable(
         &self,
         package: Option<&str>,
         executable: &Path,
+        features: &[&str],
         output: &Path,
         lock: Option<PathBuf>,
     ) -> io::Result<Vec<Campaign>> {
@@ -182,8 +216,19 @@ impl Workspace {
         std::fs::create_dir_all(output)
             .and_then(|()| ArtifactManifest::unprepared(&suite, executable))
             .and_then(|manifest| manifest.write(&manifest_path))?;
+        let scenarios = suite
+            .scenarios
+            .iter()
+            .filter(|scenario| {
+                scenario
+                    .features
+                    .iter()
+                    .all(|feature| features.contains(&feature.as_str()))
+            })
+            .collect();
         self.smoke_all(
             &suite,
+            scenarios,
             &manifest_path,
             output,
             lock,
@@ -192,18 +237,19 @@ impl Workspace {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn smoke_all(
         &self,
         suite: &Suite,
+        scenarios: Vec<&Scenario>,
         artifacts: &Path,
         output: &Path,
         lock: Option<PathBuf>,
         cancellation: &Cancellation,
         progress: &mut dyn Write,
     ) -> io::Result<Vec<Campaign>> {
-        suite
-            .scenarios
-            .iter()
+        scenarios
+            .into_iter()
             .map(|scenario| {
                 let request = RunRequest {
                     package: Some(suite.package.clone()),

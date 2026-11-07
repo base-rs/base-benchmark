@@ -46,6 +46,8 @@ pub struct PrepareOptions {
     pub replicas: Option<usize>,
     /// A new directory that receives frozen executables and `artifacts.json`.
     pub output: PathBuf,
+    /// The feature sets to build each tree with, each sorted and without duplicates: those of the scenarios to be run. Empty means the suite's features alone.
+    pub feature_sets: Vec<Vec<String>>,
     pub cargo: PathBuf,
     pub rustc: PathBuf,
 }
@@ -57,9 +59,9 @@ pub struct Prepared {
     pub manifest: ArtifactManifest,
 }
 
-/// Build every tree with the same profile, features, and lockfile policy, then freeze each executable.
+/// Build every tree with the same profile and lockfile policy, once for each feature set, then freeze each executable.
 ///
-/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at a different path changes Cargo's package metadata hashes and therefore code layout; comparing the baseline with its replicas shows how much a change of that kind alone moves the results. Each build's target directory is removed once its executable is frozen. Cancellation is checked between builds.
+/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at a different path changes Cargo's package metadata hashes and therefore code layout; comparing the baseline with its replicas shows how much a change of that kind alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds.
 pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Result<Prepared> {
     let (trees, replicas) = validate(options)?;
     let output = std::path::absolute(&options.output)?;
@@ -83,6 +85,11 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         .map(|(label, path)| TemporaryCopy::create(path).map(|copy| (label, copy)))
         .collect::<io::Result<Vec<_>>>()?;
 
+    let feature_sets = if options.feature_sets.is_empty() {
+        vec![options.suite.features.clone()]
+    } else {
+        options.feature_sets.clone()
+    };
     let mut artifacts = Vec::new();
     for (index, (label, path)) in trees.iter().enumerate() {
         let role = if index == 0 {
@@ -90,34 +97,37 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         } else {
             ArtifactRole::Candidate
         };
-        artifacts.push(build(
+        artifacts.extend(build_feature_sets(
             options,
+            &feature_sets,
             &output,
             label,
             role,
             path,
-            source_identity(path),
+            &source_identity(path),
             cancellation,
         )?);
     }
+    // The baseline's source identity is the same for each of its feature sets.
+    let baseline = artifacts[0].source.clone();
     for (label, copy) in copies {
-        let baseline = &artifacts[0];
-        copy_contents(&baseline.source.path, &copy.0, &output)?;
+        copy_contents(&baseline.path, &copy.0, &output)?;
         let source = SourceIdentity {
             path: copy.0.clone(),
-            revision: baseline.source.revision.clone(),
-            dirty: baseline.source.dirty,
+            revision: baseline.revision.clone(),
+            dirty: baseline.dirty,
             lockfile_sha256: None,
-            replica_of: Some(baseline.label.clone()),
-            path_dependencies: baseline.source.path_dependencies.clone(),
+            replica_of: Some(trees[0].0.clone()),
+            path_dependencies: baseline.path_dependencies.clone(),
         };
-        artifacts.push(build(
+        artifacts.extend(build_feature_sets(
             options,
+            &feature_sets,
             &output,
             &label,
             ArtifactRole::LayoutReplica,
             &copy.0,
-            source,
+            &source,
             cancellation,
         )?);
     }
@@ -128,7 +138,6 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         package: options.suite.package.clone(),
         binary: options.suite.binary.clone(),
         profile: options.suite.profile.clone(),
-        features: options.suite.features.clone(),
         artifacts,
     };
     let manifest_path = artifact::manifest_path(&output);
@@ -209,107 +218,169 @@ impl Drop for TemporaryCopy {
     }
 }
 
-fn build(
+/// Build one tree for each feature set, sharing its target directory, then remove the directory.
+#[allow(clippy::too_many_arguments)]
+fn build_feature_sets(
     options: &PrepareOptions,
+    feature_sets: &[Vec<String>],
     output: &Path,
     label: &str,
     role: ArtifactRole,
     tree: &Path,
-    mut source: SourceIdentity,
+    source: &SourceIdentity,
     cancellation: &Cancellation,
-) -> io::Result<Artifact> {
-    if cancellation.is_cancelled() {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "preparation was cancelled",
-        ));
-    }
-    let suite = &options.suite;
+) -> io::Result<Vec<Artifact>> {
     let target = output.join("targets").join(label);
-    let mut command = vec![
-        options.cargo.display().to_string(),
-        "build".to_owned(),
-        "--locked".to_owned(),
-        "--message-format=json-render-diagnostics".to_owned(),
-        "--manifest-path".to_owned(),
-        tree.join("Cargo.toml").display().to_string(),
-        "--package".to_owned(),
-        suite.package.clone(),
-        "--bin".to_owned(),
-        suite.binary.clone(),
-        "--profile".to_owned(),
-        suite.profile.clone(),
-        "--target-dir".to_owned(),
-        target.display().to_string(),
-    ];
-    if !suite.features.is_empty() {
-        command.extend(["--features".to_owned(), suite.features.join(",")]);
-    }
-    eprintln!("base-benchmark: building {label} from {}", tree.display());
-    let result = Command::new(&command[0])
-        .args(&command[1..])
-        .current_dir(tree)
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .output();
-    let output_text = result.map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("{label}: cannot run {}: {error}", command[0]),
-        )
-    })?;
-    if !output_text.status.success() {
-        return Err(io::Error::other(format!(
-            "{label}: cargo build failed with {}",
-            output_text.status
-        )));
-    }
-    let built = executable(&String::from_utf8_lossy(&output_text.stdout), &suite.binary)
-        .ok_or_else(|| {
-            io::Error::other(format!(
-                "{label}: cargo reported no executable for {}",
-                suite.binary
-            ))
-        })?;
-    let executable = output.join("artifacts").join(label).join(&suite.binary);
-    let sha256 = std::fs::create_dir_all(output.join("artifacts").join(label))
-        .and_then(|()| std::fs::copy(&built, &executable))
-        .and_then(|_| sha256_identified(&executable))
-        .map_err(|error| {
+    let artifacts = feature_sets
+        .iter()
+        .enumerate()
+        .map(|(index, features)| {
+            let build = Build {
+                label,
+                role,
+                tree,
+                target: &target,
+                features,
+                // Each feature set's executable has its own directory, numbered in order.
+                executable: output
+                    .join("artifacts")
+                    .join(label)
+                    .join(index.to_string())
+                    .join(&options.suite.binary),
+            };
+            build.run(options, source.clone(), cancellation)
+        })
+        .collect();
+    // The frozen copies are all that collection uses; the build directory is only disk space.
+    let _ = std::fs::remove_dir_all(&target);
+    artifacts
+}
+
+/// One build of a tree with one feature set.
+struct Build<'a> {
+    label: &'a str,
+    role: ArtifactRole,
+    tree: &'a Path,
+    target: &'a Path,
+    features: &'a [String],
+    /// Where to freeze the executable.
+    executable: PathBuf,
+}
+
+impl Build<'_> {
+    fn run(
+        self,
+        options: &PrepareOptions,
+        mut source: SourceIdentity,
+        cancellation: &Cancellation,
+    ) -> io::Result<Artifact> {
+        let Build {
+            label,
+            role,
+            tree,
+            target,
+            features,
+            executable: frozen,
+        } = self;
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "preparation was cancelled",
+            ));
+        }
+        let suite = &options.suite;
+        let mut command = vec![
+            options.cargo.display().to_string(),
+            "build".to_owned(),
+            "--locked".to_owned(),
+            "--message-format=json-render-diagnostics".to_owned(),
+            "--manifest-path".to_owned(),
+            tree.join("Cargo.toml").display().to_string(),
+            "--package".to_owned(),
+            suite.package.clone(),
+            "--bin".to_owned(),
+            suite.binary.clone(),
+            "--profile".to_owned(),
+            suite.profile.clone(),
+            "--target-dir".to_owned(),
+            target.display().to_string(),
+        ];
+        if !features.is_empty() {
+            command.extend(["--features".to_owned(), features.join(",")]);
+        }
+        eprintln!(
+            "base-benchmark: building {label} from {}{}",
+            tree.display(),
+            if features.is_empty() {
+                String::new()
+            } else {
+                format!(" with features {}", features.join(","))
+            }
+        );
+        let result = Command::new(&command[0])
+            .args(&command[1..])
+            .current_dir(tree)
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output();
+        let output_text = result.map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!("{label}: cannot freeze {}: {error}", built.display()),
+                format!("{label}: cannot run {}: {error}", command[0]),
             )
         })?;
-    // The frozen copy is all that collection uses; the build directory is only disk space.
-    let _ = std::fs::remove_dir_all(&target);
-    source.lockfile_sha256 = sha256_file(&tree.join("Cargo.lock")).ok();
-    let version = |program: &Path| {
-        capture(Command::new(program).arg("-Vv").current_dir(tree)).ok_or_else(|| {
-            io::Error::other(format!("{label}: could not run {} -Vv", program.display()))
+        if !output_text.status.success() {
+            return Err(io::Error::other(format!(
+                "{label}: cargo build failed with {}",
+                output_text.status
+            )));
+        }
+        let built = executable(&String::from_utf8_lossy(&output_text.stdout), &suite.binary)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "{label}: cargo reported no executable for {}",
+                    suite.binary
+                ))
+            })?;
+        let sha256 =
+            std::fs::create_dir_all(frozen.parent().expect("an executable has a directory"))
+                .and_then(|()| std::fs::copy(&built, &frozen))
+                .and_then(|_| sha256_identified(&frozen))
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("{label}: cannot freeze {}: {error}", built.display()),
+                    )
+                })?;
+        source.lockfile_sha256 = sha256_file(&tree.join("Cargo.lock")).ok();
+        let version = |program: &Path| {
+            capture(Command::new(program).arg("-Vv").current_dir(tree)).ok_or_else(|| {
+                io::Error::other(format!("{label}: could not run {} -Vv", program.display()))
+            })
+        };
+        let toolchain = version(&options.rustc)?;
+        if role != ArtifactRole::LayoutReplica {
+            source.path_dependencies = path_dependencies(&options.cargo, tree, host(&toolchain));
+        }
+        Ok(Artifact {
+            label: label.to_owned(),
+            role,
+            features: Some(features.to_vec()),
+            executable: frozen,
+            sha256,
+            source,
+            build: BuildIdentity {
+                command,
+                toolchain,
+                cargo: version(&options.cargo)?,
+                environment: build_environment(std::env::vars()),
+                configuration: configuration_files(
+                    tree,
+                    cargo_home(std::env::var_os("CARGO_HOME"), std::env::var_os("HOME")),
+                ),
+            },
         })
-    };
-    let toolchain = version(&options.rustc)?;
-    if role != ArtifactRole::LayoutReplica {
-        source.path_dependencies = path_dependencies(&options.cargo, tree, host(&toolchain));
     }
-    Ok(Artifact {
-        label: label.to_owned(),
-        role,
-        executable,
-        sha256,
-        source,
-        build: BuildIdentity {
-            command,
-            toolchain,
-            cargo: version(&options.cargo)?,
-            environment: build_environment(std::env::vars()),
-            configuration: configuration_files(
-                tree,
-                cargo_home(std::env::var_os("CARGO_HOME"), std::env::var_os("HOME")),
-            ),
-        },
-    })
 }
 
 /// Find the executable Cargo reported for `binary`, wherever the configured target directory layout put it.

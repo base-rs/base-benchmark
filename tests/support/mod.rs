@@ -14,6 +14,9 @@ const MAIN: &str = r##"fn main() {
     if arguments.iter().any(|argument| argument == "fail") {
         std::process::exit(3);
     }
+    if arguments.iter().any(|argument| argument == "needs-extra") && !cfg!(feature = "extra") {
+        std::process::exit(4);
+    }
     if arguments.iter().any(|argument| argument == "slow") {
         std::thread::sleep(std::time::Duration::from_secs(30));
     }
@@ -27,6 +30,9 @@ name = "fixture"
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+[features]
+extra = []
 
 [[package.metadata.base-benchmark.scenario]]
 name = "work"
