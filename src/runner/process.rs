@@ -251,19 +251,13 @@ pub(crate) struct Launch<'a> {
     pub cpus: &'a [usize],
 }
 
-/// Whether this platform can collect samples, checked before a campaign creates its directory or builds anything.
+/// Collecting samples needs Linux, so elsewhere campaigns fail with this before creating their directory or building anything.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn check_collection() -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "collecting samples needs Linux, for process groups, waitid, and CPU affinity",
-        ))
-    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "collecting samples needs Linux, for process groups, waitid, and CPU affinity",
+    ))
 }
 
 /// Collecting samples needs Linux; see the module documentation. Campaigns check first, so this is not reached.

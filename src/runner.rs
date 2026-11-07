@@ -7,6 +7,7 @@ mod perf;
 mod process;
 
 pub use host::{CpuIdentity, HostIdentity};
+#[cfg(not(target_os = "linux"))]
 pub(crate) use process::check_collection;
 pub use process::{Cancellation, SignalGuard};
 
@@ -115,6 +116,7 @@ pub fn run(
     cancellation: &Cancellation,
     progress: &mut dyn Write,
 ) -> io::Result<Campaign> {
+    #[cfg(not(target_os = "linux"))]
     check_collection()?;
     plan.check_prerequisites()?;
     let metadata = CampaignMetadata {
