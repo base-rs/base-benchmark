@@ -12,7 +12,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 pub const PLAN_SCHEMA: &str = "base-benchmark/plan";
-pub const PLAN_VERSION: u32 = 1;
+/// Version 2 embeds a version 2 artifact manifest, with features per artifact.
+pub const PLAN_VERSION: u32 = 2;
 
 /// How results may be used. The mode is recorded with every campaign.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

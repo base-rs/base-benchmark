@@ -60,6 +60,7 @@ pub fn manifest(artifacts: Vec<Artifact>) -> ArtifactManifest {
         binary: "fixture".to_owned(),
         profile: "release".to_owned(),
         artifacts,
+        ..ArtifactManifest::default()
     }
 }
 

@@ -574,3 +574,30 @@ fn scenarios_run_the_builds_made_with_their_features() {
         .unwrap();
     assert_eq!(campaigns.len(), 2);
 }
+
+#[test]
+fn smoking_an_executable_that_can_run_no_scenario_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    let workspace = Workspace::new(support::workspace(
+        &project,
+        "\n[package.metadata.base-benchmark]\nfeatures = [\"extra\"]\n",
+    ));
+    let executable = directory.path().join("tool");
+    std::fs::write(&executable, "").unwrap();
+    let error = workspace
+        .smoke_executable(
+            None,
+            &executable,
+            &[],
+            &directory.path().join("smoke"),
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("no scenario of fixture can run with features []"),
+        "{error}"
+    );
+}

@@ -236,7 +236,7 @@ fn package_defaults_apply_to_scenarios_that_do_not_replace_them() {
 #[test]
 fn scenarios_inherit_or_replace_the_package_features_in_canonical_order() {
     let configuration = json!({
-        "features": ["b", "a", "b"],
+        "features": ["b", "a,b", " a "],
         "scenario": [
             { "name": "inherits" },
             { "name": "replaces", "features": ["diagnostics", "allocations"] },

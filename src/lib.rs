@@ -57,7 +57,9 @@ pub use artifact::{
     MANIFEST_SCHEMA, MANIFEST_VERSION, SourceIdentity, sha256_file, sha256_identified,
 };
 #[cfg(feature = "runner")]
-pub use config::{METADATA_KEY, Scenario, Suite, Variant, cargo_program, discover, select};
+pub use config::{
+    METADATA_KEY, Scenario, Suite, Variant, canonical_features, cargo_program, discover, select,
+};
 #[cfg(feature = "runner")]
 pub use plan::{
     Mode, PLAN_SCHEMA, PLAN_VERSION, Pair, PairKind, Plan, PlanOptions, STACK_PADDING_LIMIT,

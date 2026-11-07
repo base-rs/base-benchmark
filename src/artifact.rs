@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub const MANIFEST_SCHEMA: &str = "base-benchmark/artifacts";
-/// Version 2 records each artifact's features, so one manifest can hold several builds of each tree.
+/// Version 2 records each artifact's features, so one manifest can hold several builds of each tree. Version 1 manifests embedded in older campaigns can still be read, so those campaigns can be summarized again, but preparation must be repeated to run them.
 pub const MANIFEST_VERSION: u32 = 2;
 
 /// Frozen executables prepared before any measurement, with the identity of each source tree and build.
 ///
 /// A tree is built once for each set of features its scenarios need, so a label names one tree and appears once per feature set.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactManifest {
     pub schema: String,
@@ -26,6 +26,9 @@ pub struct ArtifactManifest {
     pub binary: String,
     pub profile: String,
     pub artifacts: Vec<Artifact>,
+    /// Version 1 recorded one feature set for every artifact. It is accepted only so that campaigns embedding a version 1 manifest still parse.
+    #[serde(default, rename = "features", skip_serializing)]
+    pub(crate) legacy_features: Option<Vec<String>>,
 }
 
 impl ArtifactManifest {
@@ -54,6 +57,7 @@ impl ArtifactManifest {
             package: suite.package.clone(),
             binary: suite.binary.clone(),
             profile: "unknown".to_owned(),
+            legacy_features: None,
             artifacts: vec![Artifact {
                 label: "unprepared".to_owned(),
                 role: ArtifactRole::Baseline,
@@ -113,10 +117,29 @@ impl ArtifactManifest {
 
     pub fn validate(&self) -> io::Result<()> {
         if self.schema != MANIFEST_SCHEMA || self.version != MANIFEST_VERSION {
+            let advice = if self.version < MANIFEST_VERSION {
+                "; prepare the trees again"
+            } else {
+                ""
+            };
             return Err(invalid_input(format!(
-                "unsupported artifact manifest {} version {}",
+                "unsupported artifact manifest {} version {}{advice}",
                 self.schema, self.version
             )));
+        }
+        // Unknown features serve every scenario, so they cannot be mixed with known ones without giving one plan two baselines.
+        if self
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.features.is_none())
+            && self
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.features.is_some())
+        {
+            return Err(invalid_input(
+                "an artifact manifest cannot mix artifacts with unknown features and known ones",
+            ));
         }
         let mut builds = BTreeMap::<Option<&[String]>, Vec<&Artifact>>::new();
         for artifact in &self.artifacts {
@@ -164,6 +187,28 @@ impl ArtifactManifest {
                 }
             }
         }
+        // A label names one tree, with the same role and source, and every feature set builds the same trees.
+        let mut trees = BTreeMap::<&str, (ArtifactRole, &Path, Option<&str>)>::new();
+        for artifact in &self.artifacts {
+            let tree = (
+                artifact.role,
+                artifact.source.path.as_path(),
+                artifact.source.replica_of.as_deref(),
+            );
+            if *trees.entry(&artifact.label).or_insert(tree) != tree {
+                return Err(invalid_input(format!(
+                    "{}: a label must name the same tree, with the same role, in every feature set",
+                    artifact.label
+                )));
+            }
+        }
+        // Labels are unique within each set, so equal counts mean equal labels.
+        if builds
+            .values()
+            .any(|artifacts| artifacts.len() != trees.len())
+        {
+            return Err(invalid_input("every feature set must build the same trees"));
+        }
         Ok(())
     }
 }
@@ -173,7 +218,8 @@ impl ArtifactManifest {
 pub struct Artifact {
     pub label: String,
     pub role: ArtifactRole,
-    /// The Cargo features it was built with, sorted and without duplicates, or `None` when unknown, as for an executable built outside preparation.
+    /// The Cargo features it was built with, sorted and without duplicates, or `None` when unknown, as for an executable built outside preparation or recorded by a version 1 manifest.
+    #[serde(default)]
     pub features: Option<Vec<String>>,
     /// The frozen copy of the executable, outside any Cargo target directory.
     pub executable: PathBuf,

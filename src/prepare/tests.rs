@@ -531,3 +531,29 @@ fn hosts_and_cargo_homes_are_resolved() {
     );
     assert_eq!(cargo_home(None, None), None);
 }
+
+#[test]
+fn feature_sets_are_canonical_and_built_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut options = options(
+        directory.path(),
+        vec![tree(directory.path(), "t")],
+        cargo(directory.path()),
+    );
+    options.feature_sets = vec![
+        vec!["b".to_owned(), "a".to_owned()],
+        vec!["a, b".to_owned()],
+    ];
+    let prepared = prepared(&options).unwrap();
+    assert_eq!(prepared.manifest.artifacts.len(), 1);
+    assert_eq!(
+        prepared.manifest.artifacts[0].features.as_deref(),
+        Some(&["a".to_owned(), "b".to_owned()][..])
+    );
+    assert!(
+        prepared.manifest.artifacts[0]
+            .build
+            .command
+            .ends_with(&["--features".to_owned(), "a,b".to_owned()])
+    );
+}

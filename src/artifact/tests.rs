@@ -263,3 +263,84 @@ fn each_feature_set_has_its_own_baseline_and_labels() {
         assert!(error.contains(message), "{message}: {error}");
     }
 }
+
+#[test]
+fn feature_sets_must_describe_the_same_trees_and_never_mix_unknown_features() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("tool");
+    std::fs::write(&executable, "one").unwrap();
+    let with = |label: &str, role, features: Option<&[&str]>| Artifact {
+        features: features.map(|features| features.iter().map(|f| (*f).to_owned()).collect()),
+        ..artifact(label, role, &executable)
+    };
+    let plain: &[&str] = &[];
+    let extra: &[&str] = &["extra"];
+    for (artifacts, message) in [
+        (
+            vec![
+                with("baseline", ArtifactRole::Baseline, Some(plain)),
+                with("unknown", ArtifactRole::Baseline, None),
+            ],
+            "cannot mix artifacts with unknown features and known ones",
+        ),
+        (
+            vec![
+                with("baseline", ArtifactRole::Baseline, Some(plain)),
+                with("candidate", ArtifactRole::Candidate, Some(plain)),
+                with("candidate", ArtifactRole::Baseline, Some(extra)),
+                with("baseline", ArtifactRole::Candidate, Some(extra)),
+            ],
+            "a label must name the same tree",
+        ),
+        (
+            vec![
+                with("baseline", ArtifactRole::Baseline, Some(plain)),
+                with("candidate", ArtifactRole::Candidate, Some(plain)),
+                with("baseline", ArtifactRole::Baseline, Some(extra)),
+            ],
+            "every feature set must build the same trees",
+        ),
+    ] {
+        let error = manifest(artifacts).validate().unwrap_err().to_string();
+        assert!(error.contains(message), "{message}: {error}");
+    }
+}
+
+#[test]
+fn version_one_manifests_parse_but_must_be_prepared_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("tool");
+    std::fs::write(&executable, "one").unwrap();
+    let mut value = serde_json::to_value(manifest(vec![artifact(
+        "baseline",
+        ArtifactRole::Baseline,
+        &executable,
+    )]))
+    .unwrap();
+    // Version 1 recorded features on the manifest, not on each artifact.
+    value["version"] = serde_json::json!(1);
+    value["features"] = serde_json::json!(["extra"]);
+    value["artifacts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("features");
+    let legacy: ArtifactManifest = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(legacy.artifacts[0].features, None);
+    assert_eq!(
+        legacy.legacy_features.as_deref(),
+        Some(&["extra".to_owned()][..])
+    );
+    assert!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("features")
+            .is_none()
+    );
+    let path = directory.path().join("legacy.json");
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let error = ArtifactManifest::read(&path).unwrap_err().to_string();
+    assert!(
+        error.contains("version 1; prepare the trees again"),
+        "{error}"
+    );
+}

@@ -6,7 +6,7 @@ use crate::artifact::{
     DependencyIdentity, MANIFEST_SCHEMA, MANIFEST_VERSION, SourceIdentity, sha256_file,
     sha256_identified,
 };
-use crate::config::{Suite, invalid_input, valid_label};
+use crate::config::{Suite, canonical_features, invalid_input, valid_label};
 use crate::runner::Cancellation;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -85,11 +85,21 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         .map(|(label, path)| TemporaryCopy::create(path).map(|copy| (label, copy)))
         .collect::<io::Result<Vec<_>>>()?;
 
-    let feature_sets = if options.feature_sets.is_empty() {
-        vec![options.suite.features.clone()]
+    // Canonical sets, without duplicates, so that each matches its scenarios and each tree is built once per set.
+    let mut feature_sets: Vec<Vec<String>> = Vec::new();
+    let requested = if options.feature_sets.is_empty() {
+        std::slice::from_ref(&options.suite.features)
     } else {
-        options.feature_sets.clone()
+        options.feature_sets.as_slice()
     };
+    for features in requested
+        .iter()
+        .map(|features| canonical_features(features))
+    {
+        if !feature_sets.contains(&features) {
+            feature_sets.push(features);
+        }
+    }
     let mut artifacts = Vec::new();
     for (index, (label, path)) in trees.iter().enumerate() {
         let role = if index == 0 {
@@ -139,6 +149,7 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         binary: options.suite.binary.clone(),
         profile: options.suite.profile.clone(),
         artifacts,
+        ..ArtifactManifest::default()
     };
     let manifest_path = artifact::manifest_path(&output);
     manifest.write(&manifest_path)?;

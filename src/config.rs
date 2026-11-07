@@ -185,11 +185,15 @@ impl PackageConfiguration {
     }
 }
 
-/// Features sorted and without duplicates, so that equal sets compare equal.
-pub(crate) fn canonical_features(features: &[String]) -> Vec<String> {
+/// Features sorted and without duplicates, so that equal sets compare equal. Entries are split on commas and whitespace, as Cargo's `--features` splits them.
+pub fn canonical_features(features: &[String]) -> Vec<String> {
     features
         .iter()
-        .cloned()
+        .flat_map(|entry| {
+            entry.split(|character: char| character == ',' || character.is_whitespace())
+        })
+        .filter(|feature| !feature.is_empty())
+        .map(str::to_owned)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()

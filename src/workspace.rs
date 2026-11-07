@@ -225,7 +225,16 @@ impl Workspace {
                     .iter()
                     .all(|feature| features.contains(&feature.as_str()))
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if scenarios.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "no scenario of {} can run with features {features:?}",
+                    suite.package
+                ),
+            ));
+        }
         self.smoke_all(
             &suite,
             scenarios,
