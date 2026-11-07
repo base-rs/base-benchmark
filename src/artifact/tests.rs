@@ -97,6 +97,34 @@ fn invalid_manifests_are_rejected() {
 }
 
 #[test]
+fn identified_hashes_are_read_once_until_the_file_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("tool");
+    std::fs::write(&path, "one").unwrap();
+    let identity = FileIdentity::of(&path).unwrap();
+    let hash = sha256_identified(&path).unwrap();
+    assert_eq!(hash, sha256_file(&path).unwrap());
+    assert_eq!(hashes().get(&identity), Some(&hash));
+    // A remembered hash is returned without reading: replace it to observe that.
+    hashes().insert(identity.clone(), "remembered".to_owned());
+    assert_eq!(sha256_identified(&path).unwrap(), "remembered");
+    // A hard link is the same file, so it shares the identity.
+    let link = directory.path().join("link");
+    std::fs::hard_link(&path, &link).unwrap();
+    #[cfg(unix)]
+    assert_eq!(sha256_identified(&link).unwrap(), "remembered");
+    // Writing the same length changes the identity, so the file is read again.
+    std::fs::write(&path, "two").unwrap();
+    assert_ne!(FileIdentity::of(&path).unwrap(), identity);
+    assert_eq!(
+        sha256_identified(&path).unwrap(),
+        sha256_file(&path).unwrap()
+    );
+    assert!(sha256_identified(&directory.path().join("missing")).is_err());
+    assert!(sha256_identified(directory.path()).is_err());
+}
+
+#[test]
 fn hashing_reports_read_errors() {
     let directory = tempfile::tempdir().unwrap();
     assert!(sha256_file(directory.path()).is_err());

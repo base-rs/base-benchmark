@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub const MANIFEST_SCHEMA: &str = "base-benchmark/artifacts";
 pub const MANIFEST_VERSION: u32 = 1;
@@ -55,7 +56,7 @@ impl ArtifactManifest {
             artifacts: vec![Artifact {
                 label: "unprepared".to_owned(),
                 role: ArtifactRole::Baseline,
-                sha256: sha256_file(executable)?,
+                sha256: sha256_identified(executable)?,
                 executable: executable.to_owned(),
                 source: SourceIdentity {
                     path: executable.to_owned(),
@@ -150,8 +151,10 @@ impl Artifact {
     }
 
     /// Fail if `path`, such as a staged link or copy, does not contain the frozen executable.
+    ///
+    /// Each sample verifies its executable, so a file this process has already hashed is not read again while its identity is unchanged; see [`sha256_identified`].
     pub fn verify_at(&self, path: &Path) -> io::Result<()> {
-        let actual = sha256_file(path)?;
+        let actual = sha256_identified(path)?;
 
         if actual != self.sha256 {
             return Err(io::Error::new(
@@ -267,6 +270,66 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
         hasher.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// What identifies a file's contents without reading them: on Unix its device, inode, size, and modification time; elsewhere its path, size, and modification time.
+///
+/// Every write updates the modification time. The change time would also catch a modification time set back on purpose, but staging hard-links executables, which updates it, so every campaign would read them again. Verification guards against rebuilt or replaced executables, not deliberate tampering. A rewrite to the same size within the file system's timestamp granularity of the hash would go unnoticed; Linux 6.13 and later give a timestamp that was read since the last change a fine-grained update, which `stat` here ensures.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FileIdentity {
+    #[cfg(unix)]
+    file: (u64, u64, i64, i64),
+    #[cfg(not(unix))]
+    file: (PathBuf, Option<std::time::SystemTime>),
+    length: u64,
+}
+
+impl FileIdentity {
+    fn of(path: &Path) -> io::Result<Self> {
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+        })?;
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+            )
+        };
+        #[cfg(not(unix))]
+        let file = (path.to_owned(), metadata.modified().ok());
+        Ok(Self {
+            file,
+            length: metadata.len(),
+        })
+    }
+}
+
+/// Hashes this process has computed, by the identity of the file hashed.
+static HASHES: Mutex<BTreeMap<FileIdentity, String>> = Mutex::new(BTreeMap::new());
+
+/// The SHA-256 of `path`, read only when this process has not already hashed the same file with the same identity.
+///
+/// Runs verify every executable before each sample, and a smoke run verifies the same one for every scenario; reading a large executable each time dominated them, especially in unoptimized test builds. The identity is taken before and after reading, and a file that changed while it was read is not remembered.
+pub fn sha256_identified(path: &Path) -> io::Result<String> {
+    let identity = FileIdentity::of(path)?;
+    if let Some(hash) = hashes().get(&identity) {
+        return Ok(hash.clone());
+    }
+    let hash = sha256_file(path)?;
+    // Remember the hash only if the file kept its identity while it was read.
+    let _ = FileIdentity::of(path)
+        .ok()
+        .filter(|after| *after == identity)
+        .map(|_| hashes().insert(identity, hash.clone()));
+    Ok(hash)
+}
+
+fn hashes() -> std::sync::MutexGuard<'static, BTreeMap<FileIdentity, String>> {
+    HASHES.lock().expect("the hash cache is never poisoned")
 }
 
 /// Write a pretty-printed JSON document, naming the path in any error.
