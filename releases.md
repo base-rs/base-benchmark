@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+- Build the runner on every platform, so that projects whose task package depends on `bake-benchmark` build in CI on macOS and Windows. Collecting samples needs Linux, the only platform it is tested on: elsewhere `run` and `smoke` return an `Unsupported` error before creating a campaign or building anything. FreeBSD and Android, where the runner may previously have compiled untested, are now unsupported too. The host lock and replica copies of symbolic links need Unix. CI checks the library and command on macOS and Windows.
+
 ## v0.1.0
 
 - Establish the repository and shared Base development tooling.

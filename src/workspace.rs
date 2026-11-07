@@ -144,6 +144,9 @@ impl Workspace {
         cancellation: &Cancellation,
         progress: &mut dyn Write,
     ) -> io::Result<Vec<Campaign>> {
+        // Fail before building when samples cannot be collected here.
+        #[cfg(not(target_os = "linux"))]
+        runner::check_collection()?;
         let suite = self.suite(package)?;
         let output = output.unwrap_or_else(|| default_output(&suite.workspace_root, "smoke"));
         // Labels cannot start with `.`, so prepared artifacts never collide with a scenario's directory.
@@ -172,6 +175,8 @@ impl Workspace {
         output: &Path,
         lock: Option<PathBuf>,
     ) -> io::Result<Vec<Campaign>> {
+        #[cfg(not(target_os = "linux"))]
+        runner::check_collection()?;
         let suite = self.suite(package)?;
         let manifest_path = output.join("unprepared.json");
         std::fs::create_dir_all(output)

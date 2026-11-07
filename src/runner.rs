@@ -7,6 +7,8 @@ mod perf;
 mod process;
 
 pub use host::{CpuIdentity, HostIdentity};
+#[cfg(not(target_os = "linux"))]
+pub(crate) use process::check_collection;
 pub use process::{Cancellation, SignalGuard};
 
 use crate::artifact::write_json;
@@ -107,13 +109,15 @@ impl Campaign {
 
 /// Run every subject once per round, in a seeded random order, under the host lock.
 ///
-/// `output` must be a new directory. It receives `metadata.json`, an append-only `samples.jsonl`, and on success `summary.json`. Any invalid sample stops the campaign and leaves `failed` metadata; partial results never become a summary.
+/// `output` must be a new directory. It receives `metadata.json`, an append-only `samples.jsonl`, and on success `summary.json`. Any invalid sample stops the campaign and leaves `failed` metadata; partial results never become a summary. Collection needs Linux; elsewhere this returns an `Unsupported` error before creating anything.
 pub fn run(
     plan: Plan,
     output: &Path,
     cancellation: &Cancellation,
     progress: &mut dyn Write,
 ) -> io::Result<Campaign> {
+    #[cfg(not(target_os = "linux"))]
+    check_collection()?;
     plan.check_prerequisites()?;
     let metadata = CampaignMetadata {
         schema: CAMPAIGN_SCHEMA.to_owned(),

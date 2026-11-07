@@ -525,8 +525,18 @@ pub(crate) fn copy_contents(from: &Path, to: &Path, exclude: &Path) -> io::Resul
     Ok(())
 }
 
+#[cfg(unix)]
 fn symlink(target: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, link)
+}
+
+// Windows distinguishes file and directory links, and creating either needs a privilege, so replicas of trees with links need Unix.
+#[cfg(not(unix))]
+fn symlink(_target: &Path, link: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{}: copying symbolic links needs Unix", link.display()),
+    ))
 }
 
 #[cfg(test)]
