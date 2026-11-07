@@ -98,6 +98,11 @@ fn structural_errors_are_rejected() {
         Metric::total("a", Unit::Count, 1).with_resolution(0),
         Metric::mean("a", Unit::Count, f64::NAN),
         Metric::mean("a", Unit::Count, -1.0),
+        Metric::quantile("a", Unit::Count, 1.5, 1.0),
+        Metric::quantile("a", Unit::Count, -0.1, 1.0),
+        Metric::quantile("a", Unit::Count, f64::NAN, 1.0),
+        Metric::quantile("a", Unit::Count, 0.5, f64::INFINITY),
+        Metric::quantile("a", Unit::Count, 0.5, -1.0),
         Metric::unavailable("a", Unit::Count, " "),
     ] {
         let error = ProcessRecord::new("fixture", json!({}))
@@ -132,6 +137,19 @@ fn only_measured_totals_are_normalized_by_operations() {
             .with_phase(Phase::Process)
             .per_operation(4),
         None
+    );
+    let quantile = Metric::quantile("p99", Unit::Nanoseconds, 0.99, 7.0);
+    assert_eq!(quantile.per_operation(4), None);
+    assert!(
+        ProcessRecord::new("fixture", json!({}))
+            .with_sample(
+                Sample::new(1)
+                    .with(quantile)
+                    .with(Metric::quantile("min", Unit::Count, 0.0, 0.0))
+                    .with(Metric::quantile("max", Unit::Count, 1.0, 9.0))
+            )
+            .validate()
+            .is_ok()
     );
     let unavailable = Metric::unavailable("c", Unit::Count, "denied")
         .with_source(Source::PerfStat)

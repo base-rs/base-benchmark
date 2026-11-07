@@ -652,3 +652,65 @@ fn unavailable_values_are_not_redefinitions() {
         "pairs are described by a measured round"
     );
 }
+
+#[test]
+fn quantiles_are_compared_only_at_the_same_quantile() {
+    let plan = build_plan();
+    let p99 =
+        |value| Metric::quantile("latency_p99", Unit::Nanoseconds, 0.99, value).lower_is_better();
+    let entries = vec![
+        entry(
+            "baseline",
+            1,
+            vec![
+                wall(100),
+                p99(400.0),
+                Metric::quantile("tail", Unit::Nanoseconds, 0.999, 9.0),
+                Metric::quantile("bytes", Unit::Bytes, 0.5, 3.0),
+                Metric::quantile("count", Unit::Count, 1.0, 2.0),
+            ],
+            Vec::new(),
+        ),
+        entry(
+            "candidate",
+            1,
+            vec![
+                wall(100),
+                p99(200.0),
+                Metric::quantile("tail", Unit::Nanoseconds, 0.99, 9.0),
+            ],
+            Vec::new(),
+        ),
+        entry(
+            "baseline-replica",
+            1,
+            vec![wall(100), p99(400.0)],
+            Vec::new(),
+        ),
+    ];
+    let summary = summarize(&plan, &entries);
+    let build = pair(&summary, PairKind::Build);
+    let latency = metric(build, "latency_p99");
+    assert_eq!(
+        (
+            latency.statistic,
+            latency.improved,
+            latency.change.unwrap().median
+        ),
+        (Statistic::Quantile(0.99), 1, -0.5)
+    );
+    assert_eq!(metric(build, "tail").rounds, 0);
+    assert!(
+        summary.warnings.contains(
+            &"baseline -> candidate: tail is defined differently by baseline and candidate in 1 round(s), which are not compared".to_owned()
+        ),
+        "{:?}",
+        summary.warnings
+    );
+    let report = summary.report();
+    for expected in ["ns p99", "ns p99.9", "B p50", "2.000 p100 ["] {
+        assert!(report.contains(expected), "{expected}: {report}");
+    }
+    let serialized = serde_json::to_value(latency.statistic).unwrap();
+    assert_eq!(serialized, serde_json::json!({"quantile": 0.99}));
+}

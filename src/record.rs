@@ -174,6 +174,11 @@ impl Metric {
         Self::new(name, unit, Measurement::Mean { value })
     }
 
+    /// The `quantile` (from 0 to 1) of a distribution the workload observed, such as the 99th percentile latency, 0.99. Like a mean, it is reported as it is and never divided by operations.
+    pub fn quantile(name: impl Into<String>, unit: Unit, quantile: f64, value: f64) -> Self {
+        Self::new(name, unit, Measurement::Quantile { quantile, value })
+    }
+
     /// A metric that was requested but could not be measured.
     pub fn unavailable(name: impl Into<String>, unit: Unit, reason: impl Into<String>) -> Self {
         Self::new(
@@ -251,6 +256,15 @@ impl Metric {
                 "{}: mean must be finite and nonnegative",
                 self.name
             ))),
+            Measurement::Quantile { quantile, value }
+                if (0.0..=1.0).contains(quantile) && value.is_finite() && *value >= 0.0 =>
+            {
+                Ok(())
+            }
+            Measurement::Quantile { .. } => Err(invalid(format!(
+                "{}: a quantile must be between 0 and 1, with a finite, nonnegative value",
+                self.name
+            ))),
             Measurement::Unavailable { reason } if !reason.trim().is_empty() => Ok(()),
             Measurement::Unavailable { .. } => Err(invalid(format!(
                 "{}: unavailable metrics need a reason",
@@ -263,9 +277,20 @@ impl Metric {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Measurement {
-    Total { value: u64 },
-    Mean { value: f64 },
-    Unavailable { reason: String },
+    Total {
+        value: u64,
+    },
+    Mean {
+        value: f64,
+    },
+    /// The value at `quantile`, from 0 (the minimum) to 1 (the maximum), of a distribution the workload observed.
+    Quantile {
+        quantile: f64,
+        value: f64,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

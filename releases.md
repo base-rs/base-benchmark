@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+- Add `Metric::quantile` and `Measurement::Quantile` for order statistics such as a 99th percentile latency, summarized as `Statistic::Quantile` with the quantile, and reported as, for example, `ns p99`. A metric reported at different quantiles is a different definition, flagged rather than compared. `Statistic` is no longer `Eq`, since it now carries the quantile.
+
 ## v0.1.1
 
 - Build the runner on every platform, so that projects whose task package depends on `bake-benchmark` build in CI on macOS and Windows. Collecting samples needs Linux, the only platform it is tested on: elsewhere `run` and `smoke` return an `Unsupported` error before creating a campaign or building anything. FreeBSD and Android, where the runner may previously have compiled untested, are now unsupported too. The host lock and replica copies of symbolic links need Unix. CI checks the library and command on macOS and Windows.

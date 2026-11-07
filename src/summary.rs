@@ -63,13 +63,15 @@ pub struct MetricSummary {
 }
 
 /// What a summarized value means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Statistic {
     /// A measured-phase total divided by operations.
     PerOperation,
     /// A value the workload reported as a mean, such as mean latency. Shown in its unit, not divided again.
     Mean,
+    /// The value the workload reported at this quantile of a distribution, such as 0.99 for the 99th percentile latency. Shown in its unit, not divided. Values at different quantiles are different definitions, never compared.
+    Quantile(f64),
     /// A total over a window wider than the measured operations, such as the whole process. It is not divided by operations.
     Total,
 }
@@ -180,6 +182,9 @@ fn process_values(entry: &SampleEntry) -> ProcessValues {
                     }
                     (None, Measurement::Mean { value }) => {
                         (Statistic::Mean, Some(*value), resolution)
+                    }
+                    (None, Measurement::Quantile { quantile, value }) => {
+                        (Statistic::Quantile(*quantile), Some(*value), resolution)
                     }
                     (None, Measurement::Unavailable { .. }) => {
                         (Statistic::PerOperation, None, resolution)
@@ -669,17 +674,24 @@ fn report_pair_metric(text: &mut String, metric: &PairMetric) {
     );
 }
 
-fn suffix(statistic: Statistic, unit: Unit) -> &'static str {
-    match (statistic, unit) {
-        (Statistic::PerOperation, Unit::Nanoseconds) => "ns/op",
-        (Statistic::PerOperation, Unit::Count) => "/op",
-        (Statistic::PerOperation, Unit::Bytes) => "B/op",
-        (Statistic::Total, Unit::Nanoseconds) => "ns total",
-        (Statistic::Total, Unit::Count) => "total",
-        (Statistic::Total, Unit::Bytes) => "B total",
-        (Statistic::Mean, Unit::Nanoseconds) => "ns mean",
-        (Statistic::Mean, Unit::Count) => "mean",
-        (Statistic::Mean, Unit::Bytes) => "B mean",
+fn suffix(statistic: Statistic, unit: Unit) -> String {
+    let unit = match unit {
+        Unit::Nanoseconds => "ns ",
+        Unit::Count => "",
+        Unit::Bytes => "B ",
+    };
+    match statistic {
+        Statistic::PerOperation => format!("{}/op", unit.trim_end()),
+        Statistic::Total => format!("{unit}total"),
+        Statistic::Mean => format!("{unit}mean"),
+        // 0.99 is p99 and 0.999 is p99.9. Rounding to a thousandth of a percent hides the binary representation's error.
+        Statistic::Quantile(quantile) => {
+            let percent = format!("{:.3}", quantile * 100.0);
+            format!(
+                "{unit}p{}",
+                percent.trim_end_matches('0').trim_end_matches('.')
+            )
+        }
     }
 }
 
