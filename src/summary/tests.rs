@@ -652,3 +652,132 @@ fn unavailable_values_are_not_redefinitions() {
         "pairs are described by a measured round"
     );
 }
+
+#[test]
+fn quantiles_are_compared_only_at_the_same_quantile() {
+    let plan = build_plan();
+    let p99 =
+        |value| Metric::quantile("latency_p99", Unit::Nanoseconds, 0.99, value).lower_is_better();
+    let entries = vec![
+        entry(
+            "baseline",
+            1,
+            vec![
+                wall(100),
+                p99(400.0),
+                Metric::quantile("tail", Unit::Nanoseconds, 0.999, 9.0),
+                Metric::quantile("bytes", Unit::Bytes, 0.5, 3.0),
+                Metric::quantile("count", Unit::Count, 1.0, 2.0),
+            ],
+            Vec::new(),
+        ),
+        entry(
+            "candidate",
+            1,
+            vec![
+                wall(100),
+                p99(200.0),
+                Metric::quantile("tail", Unit::Nanoseconds, 0.99, 9.0),
+            ],
+            Vec::new(),
+        ),
+        entry(
+            "baseline-replica",
+            1,
+            vec![wall(100), p99(400.0)],
+            Vec::new(),
+        ),
+    ];
+    let summary = summarize(&plan, &entries);
+    let build = pair(&summary, PairKind::Build);
+    let latency = metric(build, "latency_p99");
+    assert_eq!(
+        (
+            latency.statistic,
+            latency.improved,
+            latency.change.unwrap().median
+        ),
+        (Statistic::Quantile(0.99), 1, -0.5)
+    );
+    assert_eq!(metric(build, "tail").rounds, 0);
+    assert!(
+        summary.warnings.contains(
+            &"baseline -> candidate: tail is defined differently by baseline and candidate in 1 round(s), which are not compared".to_owned()
+        ),
+        "{:?}",
+        summary.warnings
+    );
+    let report = summary.report();
+    for expected in ["ns p99", "ns p99.9", "B p50", "2.000 p100 ["] {
+        assert!(report.contains(expected), "{expected}: {report}");
+    }
+    let serialized = serde_json::to_value(latency.statistic).unwrap();
+    assert_eq!(serialized, serde_json::json!({"quantile": 0.99}));
+    let parsed: Statistic = serde_json::from_value(serialized).unwrap();
+    assert_eq!(parsed, Statistic::Quantile(0.99));
+    assert_eq!(summary.version, 2);
+}
+
+#[test]
+fn quantile_labels_keep_their_precision() {
+    for (quantile, label) in [
+        (0.0, "ns p0"),
+        (0.001, "ns p0.1"),
+        (0.5, "ns p50"),
+        (0.99, "ns p99"),
+        (0.999, "ns p99.9"),
+        (0.999999, "ns p99.9999"),
+        (0.000001, "ns p0.0001"),
+        (1.0, "ns p100"),
+    ] {
+        assert_eq!(
+            suffix(Statistic::Quantile(quantile), Unit::Nanoseconds),
+            label
+        );
+    }
+}
+
+#[test]
+fn quantiles_from_records_normalize_negative_zero_and_conflict_within_a_process() {
+    let plan = build_plan();
+    let minimum: Metric = serde_json::from_value(serde_json::json!({
+        "name": "minimum", "unit": "count", "phase": "measured", "source": "workload",
+        "direction": "neutral", "measurement": {"kind": "quantile", "quantile": -0.0, "value": 1.0}
+    }))
+    .unwrap();
+    let mut sample = Sample::new(10)
+        .with(Metric::quantile("tail", Unit::Nanoseconds, 0.99, 1.0))
+        .with(minimum);
+    let mut entries = vec![entry("baseline", 1, vec![wall(100)], Vec::new())];
+    sample.push(wall(100));
+    let record = entries[0].record.as_mut().unwrap();
+    record.samples.push(
+        Sample::new(10)
+            .with(Metric::quantile("tail", Unit::Nanoseconds, 0.5, 1.0))
+            .with(wall(100)),
+    );
+    record.samples.push(sample);
+    let summary = summarize(&plan, &entries);
+    let baseline = &summary.subjects[0];
+    let statistic = |name: &str| {
+        baseline
+            .metrics
+            .iter()
+            .find(|metric| metric.name == name)
+            .unwrap()
+            .statistic
+    };
+    assert_eq!(statistic("minimum"), Statistic::Quantile(0.0));
+    assert!(
+        summary
+            .report()
+            .contains("minimum                          1.000 p0 [")
+    );
+    assert!(
+        summary
+            .warnings
+            .contains(&"baseline: metric tail has conflicting definitions within a process and is not summarized".to_owned()),
+        "{:?}",
+        summary.warnings
+    );
+}

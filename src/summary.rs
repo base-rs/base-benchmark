@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 pub const SUMMARY_SCHEMA: &str = "base-benchmark/summary";
-pub const SUMMARY_VERSION: u32 = 1;
+/// Version 2 added quantile statistics.
+pub const SUMMARY_VERSION: u32 = 2;
 
 /// A ratio is computed only when the baseline is at least this many measurement quanta, so quantization moves it by at most 1%.
 pub const RESOLUTION_FACTOR: f64 = 100.0;
@@ -63,13 +64,16 @@ pub struct MetricSummary {
 }
 
 /// What a summarized value means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Statistic {
     /// A measured-phase total divided by operations.
     PerOperation,
     /// A value the workload reported as a mean, such as mean latency. Shown in its unit, not divided again.
     Mean,
+    /// The value the workload reported at this quantile of a distribution, such as 0.99 for the 99th percentile latency. Shown in its unit, not divided. Values at different quantiles are different definitions, never compared. Like any metric, a subject's value is the median over its processes of each process's median sample, so it is not a quantile of every observation pooled together.
+    Quantile(f64),
     /// A total over a window wider than the measured operations, such as the whole process. It is not divided by operations.
     Total,
 }
@@ -180,6 +184,14 @@ fn process_values(entry: &SampleEntry) -> ProcessValues {
                     }
                     (None, Measurement::Mean { value }) => {
                         (Statistic::Mean, Some(*value), resolution)
+                    }
+                    (None, Measurement::Quantile { quantile, value }) => {
+                        // Records read from JSON may carry -0.0; adding zero normalizes it.
+                        (
+                            Statistic::Quantile(quantile + 0.0),
+                            Some(*value),
+                            resolution,
+                        )
                     }
                     (None, Measurement::Unavailable { .. }) => {
                         (Statistic::PerOperation, None, resolution)
@@ -669,17 +681,20 @@ fn report_pair_metric(text: &mut String, metric: &PairMetric) {
     );
 }
 
-fn suffix(statistic: Statistic, unit: Unit) -> &'static str {
-    match (statistic, unit) {
-        (Statistic::PerOperation, Unit::Nanoseconds) => "ns/op",
-        (Statistic::PerOperation, Unit::Count) => "/op",
-        (Statistic::PerOperation, Unit::Bytes) => "B/op",
-        (Statistic::Total, Unit::Nanoseconds) => "ns total",
-        (Statistic::Total, Unit::Count) => "total",
-        (Statistic::Total, Unit::Bytes) => "B total",
-        (Statistic::Mean, Unit::Nanoseconds) => "ns mean",
-        (Statistic::Mean, Unit::Count) => "mean",
-        (Statistic::Mean, Unit::Bytes) => "B mean",
+fn suffix(statistic: Statistic, unit: Unit) -> String {
+    let unit = match unit {
+        Unit::Nanoseconds => "ns ",
+        Unit::Count => "",
+        Unit::Bytes => "B ",
+    };
+    match statistic {
+        Statistic::PerOperation => format!("{}/op", unit.trim_end()),
+        Statistic::Total => format!("{unit}total"),
+        Statistic::Mean => format!("{unit}mean"),
+        // 0.99 is p99 and 0.999 is p99.9. Rounding to a billionth of a percent hides only the binary representation's error, so 0.999999 stays p99.9999 rather than reading as p100.
+        Statistic::Quantile(quantile) => {
+            format!("{unit}p{}", (quantile * 100.0 * 1e9).round() / 1e9 + 0.0)
+        }
     }
 }
 

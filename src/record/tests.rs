@@ -11,7 +11,8 @@ fn valid() -> ProcessRecord {
         .with_sample(
             Sample::new(4)
                 .with(Metric::total("bytes", Unit::Bytes, 8))
-                .with(Metric::mean("latency", Unit::Nanoseconds, 2.5).higher_is_better()),
+                .with(Metric::mean("latency", Unit::Nanoseconds, 2.5).higher_is_better())
+                .with(Metric::quantile("tail", Unit::Nanoseconds, 0.99, 7.5).lower_is_better()),
         )
 }
 
@@ -31,13 +32,46 @@ fn valid_records_round_trip_as_one_line() {
     assert_eq!(parsed, record);
     assert_eq!(parsed.samples[0].metric("bytes").unwrap().unit, Unit::Bytes);
     assert!(parsed.samples[0].metric("missing").is_none());
+    let tail =
+        serde_json::to_value(&parsed.samples[0].metric("tail").unwrap().measurement).unwrap();
+    assert_eq!(
+        tail,
+        json!({"kind": "quantile", "quantile": 0.99, "value": 7.5})
+    );
+}
+
+#[test]
+fn version_one_records_are_still_accepted() {
+    assert_eq!(valid().version, 2);
+    ProcessRecord {
+        version: 1,
+        ..valid()
+    }
+    .validate()
+    .unwrap();
+    rejects(
+        ProcessRecord {
+            version: 0,
+            ..valid()
+        },
+        "unsupported record schema",
+    );
+}
+
+#[test]
+fn negative_zero_quantiles_are_the_minimum() {
+    let metric = Metric::quantile("min", Unit::Count, -0.0, 1.0);
+    assert!(matches!(
+        metric.measurement,
+        Measurement::Quantile { quantile, .. } if quantile == 0.0 && quantile.is_sign_positive()
+    ));
 }
 
 #[test]
 fn structural_errors_are_rejected() {
     rejects(
         ProcessRecord {
-            version: 2,
+            version: 3,
             ..valid()
         },
         "unsupported record schema",
@@ -98,6 +132,11 @@ fn structural_errors_are_rejected() {
         Metric::total("a", Unit::Count, 1).with_resolution(0),
         Metric::mean("a", Unit::Count, f64::NAN),
         Metric::mean("a", Unit::Count, -1.0),
+        Metric::quantile("a", Unit::Count, 1.5, 1.0),
+        Metric::quantile("a", Unit::Count, -0.1, 1.0),
+        Metric::quantile("a", Unit::Count, f64::NAN, 1.0),
+        Metric::quantile("a", Unit::Count, 0.5, f64::INFINITY),
+        Metric::quantile("a", Unit::Count, 0.5, -1.0),
         Metric::unavailable("a", Unit::Count, " "),
     ] {
         let error = ProcessRecord::new("fixture", json!({}))
@@ -132,6 +171,19 @@ fn only_measured_totals_are_normalized_by_operations() {
             .with_phase(Phase::Process)
             .per_operation(4),
         None
+    );
+    let quantile = Metric::quantile("p99", Unit::Nanoseconds, 0.99, 7.0);
+    assert_eq!(quantile.per_operation(4), None);
+    assert!(
+        ProcessRecord::new("fixture", json!({}))
+            .with_sample(
+                Sample::new(1)
+                    .with(quantile)
+                    .with(Metric::quantile("min", Unit::Count, 0.0, 0.0))
+                    .with(Metric::quantile("max", Unit::Count, 1.0, 9.0))
+            )
+            .validate()
+            .is_ok()
     );
     let unavailable = Metric::unavailable("c", Unit::Count, "denied")
         .with_source(Source::PerfStat)
