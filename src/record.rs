@@ -8,7 +8,7 @@ use std::io::{self, Write};
 
 /// The schema identifier of a [`ProcessRecord`].
 pub const RECORD_SCHEMA: &str = "base-benchmark/process-record";
-/// The current [`ProcessRecord`] schema version. Version 2 added quantile measurements; version 1 records, which cannot contain them, are still accepted.
+/// The current [`ProcessRecord`] schema version. Version 2 added quantile measurements; version 1 records, defined before them, are still accepted.
 pub const RECORD_VERSION: u32 = 2;
 
 /// The single record a workload process writes to stdout on success.
