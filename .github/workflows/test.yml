@@ -52,9 +52,26 @@ jobs:
           packages=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.publish != []) | "--package=\(.name)"')
           cargo check $packages --all-targets --locked
 
+  portability:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: clippy
+      - name: Check that the library and command build, with and without the runner
+        run: |
+          cargo clippy --package base-benchmark --lib --bins --locked -- -D warnings
+          cargo clippy --package base-benchmark --lib --no-default-features --locked -- -D warnings
+
   test-result:
     if: always()
-    needs: [test, minimum-rust]
+    needs: [test, minimum-rust, portability]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

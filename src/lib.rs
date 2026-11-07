@@ -22,14 +22,9 @@
 //! }
 //! ```
 //!
-//! The same operations are available through the `base-benchmark` command and, separately, the `bake-benchmark` task library. Records and `Interval` are always available; preparation, collection, summaries, and the command need the default `runner` feature, so workloads can depend on the crate with `default-features = false`. The runner supports Unix, and is tested on Linux.
+//! The same operations are available through the `base-benchmark` command and, separately, the `bake-benchmark` task library. Records and `Interval` are always available; preparation, collection, summaries, and the command need the default `runner` feature, so workloads can depend on the crate with `default-features = false`. The runner builds on every platform, so a project's task package can depend on it everywhere. Collecting samples needs Linux, the only platform it is tested on; the host lock and replica copies of symbolic links need Unix. Elsewhere those operations return [`std::io::ErrorKind::Unsupported`] errors. `Interval` measures through `getrusage`, so it needs Unix.
 mod record;
 mod usage;
-
-#[cfg(all(feature = "runner", not(unix)))]
-compile_error!(
-    "the `runner` feature supports Unix only; workloads on other platforms can use `default-features = false`"
-);
 
 #[cfg(feature = "runner")]
 mod artifact;

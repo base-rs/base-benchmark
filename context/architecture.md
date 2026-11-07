@@ -73,6 +73,6 @@ Deferred:
 - A descendant that leaves the process group and closes its output is not detected, and may keep running during later samples.
 - Once replicas exist, variant comparisons inside candidate artifacts have no replica control and no warning; only the baseline's variant comparisons are checked against the replica.
 - If writing metadata fails after `summary.json` is written, the summary exists while the campaign is still recorded as `in_progress`.
-- The runner supports Unix and is tested only on Linux. With the `runner` feature, other platforms fail to compile with an explicit error; `default-features = false` builds anywhere.
+- The runner builds on every platform, so a project's task package, such as one that depends on `bake-benchmark`, builds in CI on macOS and Windows. Collecting samples needs Linux: process groups, `waitid` without reaping, and CPU affinity. The host lock and replica copies of symbolic links need Unix. Elsewhere these operations return `Unsupported` errors; listing scenarios, preparing artifacts, and summarizing work. Tests and coverage run only on Linux; CI also checks that the library and command build on macOS and Windows.
 
 Do not invent numeric performance thresholds, portable PMU support, peak-memory guarantees, pooled latency percentiles, automatic revision checkout, or one universal workload trait. Hosted CI validates correctness and failure handling, not performance.

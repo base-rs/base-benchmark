@@ -1,36 +1,58 @@
 // Released under the MIT License.
 // Copyright, 2026, by Samuel Williams.
 
+//! Workload processes. Collecting samples needs Linux: process groups, `waitid` without reaping, and CPU affinity. Elsewhere [`execute`] reports that it is unsupported, and everything else here builds.
+
+#[cfg(target_os = "linux")]
 use nix::errno::Errno;
+#[cfg(target_os = "linux")]
 use nix::sched::{CpuSet, sched_getaffinity, sched_setaffinity};
+#[cfg(target_os = "linux")]
 use nix::sys::signal::{Signal, killpg};
+#[cfg(target_os = "linux")]
 use nix::sys::wait::{Id, WaitPidFlag, waitid};
+#[cfg(target_os = "linux")]
 use nix::unistd::Pid;
 use std::collections::BTreeMap;
-use std::io::{self, Read};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
+#[cfg(target_os = "linux")]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, Once};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 /// Workload stdout beyond this size is a malformed record.
+#[cfg(target_os = "linux")]
 pub(crate) const STDOUT_LIMIT: usize = 16 * 1024 * 1024;
 /// Only the end of stderr is retained as diagnostic evidence.
+#[cfg(target_os = "linux")]
 pub(crate) const STDERR_LIMIT: usize = 64 * 1024;
 /// How long to wait for output after the workload and its process group are gone.
+#[cfg(target_os = "linux")]
 pub(crate) const OUTPUT_GRACE: Duration = Duration::from_secs(2);
 /// Attempts to start a program whose file is briefly open for writing elsewhere, such as a just-staged copy.
+#[cfg(target_os = "linux")]
 const BUSY_ATTEMPTS: usize = 50;
 
+#[cfg(target_os = "linux")]
 enum Output {
     Stdout((Vec<u8>, bool)),
     Stderr(Vec<u8>),
 }
 
 /// Spawn, retrying `ETXTBSY`: another thread may have forked while the executable was still open for writing, and that descriptor closes when its child execs.
+#[cfg(target_os = "linux")]
 fn spawn(command: &mut Command) -> io::Result<std::process::Child> {
     let mut attempts = 1;
     loop {
@@ -56,11 +78,13 @@ pub struct Cancellation(Arc<CancellationState>);
 #[derive(Default)]
 struct CancellationState {
     cancelled: AtomicBool,
-    active: Mutex<Option<Pid>>,
+    /// The running workload's process group.
+    active: Mutex<Option<i32>>,
 }
 
 /// Cancellations guarded against termination signals, shared with the process-wide handler thread.
 static GUARDED: Mutex<Vec<Cancellation>> = Mutex::new(Vec::new());
+#[cfg(unix)]
 static HANDLER: Once = Once::new();
 
 impl Cancellation {
@@ -86,8 +110,9 @@ impl Cancellation {
 
     /// Cancel when the process receives SIGINT, SIGTERM, or SIGHUP, until the guard is dropped.
     ///
-    /// The first signal cancels every guarded campaign, so workloads are killed before locks are released. A signal while nothing is guarded, or a second signal, exits the process with status 128 plus the signal number. The handler stays installed for the life of the process. On Linux, signals already ignored when it is installed, as under `nohup`, stay ignored.
+    /// The first signal cancels every guarded campaign, so workloads are killed before locks are released. A signal while nothing is guarded, or a second signal, exits the process with status 128 plus the signal number. The handler stays installed for the life of the process. On Linux, signals already ignored when it is installed, as under `nohup`, stay ignored. Systems other than Unix install no handler.
     pub fn on_termination_signals(&self) -> SignalGuard {
+        #[cfg(unix)]
         HANDLER.call_once(|| {
             use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
             let ignored =
@@ -109,7 +134,8 @@ impl Cancellation {
         }
     }
 
-    fn register(&self, group: Pid) {
+    #[cfg(target_os = "linux")]
+    fn register(&self, group: i32) {
         let mut active = self
             .0
             .active
@@ -122,7 +148,8 @@ impl Cancellation {
     }
 
     /// Kill remaining group members, such as daemonized descendants, while the leader is still unreaped and its process ID cannot be reused.
-    fn finish(&self, group: Pid) {
+    #[cfg(target_os = "linux")]
+    fn finish(&self, group: i32) {
         let mut active = self
             .0
             .active
@@ -134,6 +161,7 @@ impl Cancellation {
 }
 
 /// The mask of signals ignored by this process, from the `SigIgn` line of `/proc/self/status`, or none where that is unavailable.
+#[cfg(unix)]
 fn ignored_signals(status: Option<&str>) -> u64 {
     status
         .and_then(|status| status.lines().find_map(|line| line.strip_prefix("SigIgn:")))
@@ -148,6 +176,7 @@ fn guarded() -> std::sync::MutexGuard<'static, Vec<Cancellation>> {
 }
 
 /// Cancel guarded campaigns on the first signal; otherwise exit as the default action would.
+#[cfg(unix)]
 fn respond(signal: i32) {
     let guarded = guarded();
     if guarded
@@ -181,12 +210,18 @@ impl Drop for SignalGuard {
     }
 }
 
-fn kill_group(group: Pid) {
+#[cfg(target_os = "linux")]
+fn kill_group(group: i32) {
     // An empty group (ESRCH) is the normal case after a clean exit.
-    let _ = killpg(group, Signal::SIGKILL);
+    let _ = killpg(Pid::from_raw(group), Signal::SIGKILL);
 }
 
+// Only Linux starts workloads, so elsewhere no group is ever registered to kill.
+#[cfg(not(target_os = "linux"))]
+fn kill_group(_group: i32) {}
+
 #[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct Execution {
     pub code: Option<i32>,
     pub signal: Option<i32>,
@@ -207,6 +242,7 @@ impl Execution {
 }
 
 /// What to start: the environment replaces the collector's own completely.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct Launch<'a> {
     pub program: &'a Path,
     pub arguments: &'a [String],
@@ -215,7 +251,24 @@ pub(crate) struct Launch<'a> {
     pub cpus: &'a [usize],
 }
 
+/// Collecting samples needs Linux; see the module documentation.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn execute(
+    launch: &Launch,
+    _timeout: Duration,
+    _cancellation: &Cancellation,
+) -> io::Result<Execution> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "{}: collecting samples needs Linux, for process groups, waitid, and CPU affinity",
+            launch.program.display()
+        ),
+    ))
+}
+
 /// Run one workload process to completion with bounded output, a deadline, CPU placement, and process-group cleanup.
+#[cfg(target_os = "linux")]
 pub(crate) fn execute(
     launch: &Launch,
     timeout: Duration,
@@ -235,7 +288,7 @@ pub(crate) fn execute(
     let started = Instant::now();
     let mut child = with_affinity(cpus, || spawn(&mut command))
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", program.display())))?;
-    let group = Pid::from_raw(i32::try_from(child.id()).expect("process IDs fit in pid_t"));
+    let group = i32::try_from(child.id()).expect("process IDs fit in pid_t");
     cancellation.register(group);
 
     let (sender, outputs) = mpsc::channel();
@@ -259,7 +312,10 @@ pub(crate) fn execute(
 
     // Wait for the leader to exit without reaping it, so its process ID, and therefore the group ID, stays reserved during cleanup.
     let _ = std::iter::repeat_with(|| {
-        waitid(Id::Pid(group), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
+        waitid(
+            Id::Pid(Pid::from_raw(group)),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+        )
     })
     .find(|result| *result != Err(Errno::EINTR));
     drop(done);
@@ -295,6 +351,7 @@ pub(crate) fn execute(
 /// Keep at most `limit` bytes, then drain the rest so the writer never blocks.
 ///
 /// A read error ends the stream; the record parser then rejects incomplete output.
+#[cfg(target_os = "linux")]
 fn read_head(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
     let mut head = Vec::new();
     let _ = (&mut reader).take(limit as u64 + 1).read_to_end(&mut head);
@@ -305,6 +362,7 @@ fn read_head(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
 }
 
 /// Keep the last `limit` bytes.
+#[cfg(target_os = "linux")]
 fn read_tail(mut reader: impl Read, limit: usize) -> Vec<u8> {
     let mut tail = Vec::new();
     let mut buffer = [0; 8192];
@@ -321,6 +379,7 @@ fn read_tail(mut reader: impl Read, limit: usize) -> Vec<u8> {
 }
 
 /// Spawn with the calling thread temporarily pinned, so the child inherits exactly `cpus` from its first instruction.
+#[cfg(target_os = "linux")]
 fn with_affinity<T>(cpus: &[usize], spawn: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     if cpus.is_empty() {
         return spawn();
@@ -349,5 +408,5 @@ fn with_affinity<T>(cpus: &[usize], spawn: impl FnOnce() -> io::Result<T>) -> io
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;

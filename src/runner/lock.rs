@@ -1,26 +1,53 @@
 // Released under the MIT License.
 // Copyright, 2026, by Samuel Williams.
 
+//! The host lock is a `flock` on a shared file, so it needs Unix. Collection needs Linux anyway; elsewhere acquiring it reports that it is unsupported.
+
 use super::Cancellation;
+#[cfg(unix)]
 use nix::errno::Errno;
+#[cfg(unix)]
 use nix::fcntl::OFlag;
+#[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
+#[cfg(unix)]
 use nix::sys::stat::Mode;
+#[cfg(unix)]
 use std::fs::{File, Permissions};
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
 
 /// How often a waiting campaign rechecks the lock and its cancellation.
+#[cfg(unix)]
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A cooperative, host-wide exclusive lock held for a whole campaign. It is released when dropped, or by the kernel if the process dies.
 pub(crate) struct HostLock {
+    #[cfg(unix)]
     _lock: Flock<File>,
 }
 
+#[cfg(not(unix))]
+impl HostLock {
+    pub fn acquire(
+        path: &Path,
+        _cancellation: &Cancellation,
+        _progress: &mut dyn Write,
+    ) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{}: the host lock needs Unix flock", path.display()),
+        ))
+    }
+}
+
+#[cfg(unix)]
 impl HostLock {
     /// Acquire the lock, reporting once when another campaign holds it. Waiting stops if the campaign is cancelled.
     pub fn acquire(
@@ -74,12 +101,13 @@ impl HostLock {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;
 
 /// Open or create the lock file read-only, since `flock` needs no write access.
 ///
 /// The path is shared with every user, so it is never followed as a symbolic link. An existing lock is opened without `O_CREAT`, which Linux's `fs.protected_regular` forbids for another user's file in a sticky `/tmp`. A missing lock is created exclusively, and only that new file is made usable by every user despite the umask.
+#[cfg(unix)]
 fn open(path: &Path) -> io::Result<File> {
     open_with(path, |path| {
         let flags =
@@ -89,6 +117,7 @@ fn open(path: &Path) -> io::Result<File> {
 }
 
 /// `create` makes a new lock file exclusively, replaceable so tests can lose the creation race.
+#[cfg(unix)]
 fn open_with(
     path: &Path,
     mut create: impl FnMut(&Path) -> nix::Result<OwnedFd>,

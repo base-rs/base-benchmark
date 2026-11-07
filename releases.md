@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+- Build the runner on every platform, so that projects whose task package depends on `bake-benchmark` build in CI on macOS and Windows. Collecting samples still needs Linux, and the host lock and replica copies of symbolic links need Unix; elsewhere they return `Unsupported` errors instead of failing to compile. CI checks the library and command on macOS and Windows.
+
 ## v0.1.0
 
 - Establish the repository and shared Base development tooling.
