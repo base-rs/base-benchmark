@@ -72,7 +72,6 @@ On the same host, with the workstation still in use, the `list` scenario was re-
 
 ## Remaining limits
 
-- `base-html` and `bake-benchmark` depend on `base-benchmark`, and `base-html` on `bake-benchmark`, through local path dependencies outside their repositories. Cargo loads every workspace member, so `base-html`'s own CI and publishing fail until these become pinned Git dependencies or crates.io releases.
 - Only single-sample, single-process workloads have been exercised. Multi-sample batches, multi-process roles, downstream patch preparation, and phase-matched counters remain unimplemented; see [architecture](../context/architecture.md).
-- The `base-html` tree has no commits, so recorded mode cannot be used there yet. The tooling rejects it, as intended.
+- At the time of these runs `base-html` had no commits, so recorded mode could not be used there; the tooling rejected it, as intended. Its dependencies were then local checkouts outside the repository; they are now the released crates.
 - The per-process bimodality seen in `reference` remains unexplained.
