@@ -258,8 +258,15 @@ pub struct ConfigurationFile {
 }
 
 pub fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+    sha256_read(&mut open(path)?)
+}
+
+fn open(path: &Path) -> io::Result<File> {
+    File::open(path)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+}
+
+fn sha256_read(file: &mut File) -> io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; 64 * 1024];
     loop {
@@ -274,7 +281,7 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
 
 /// What identifies a file's contents without reading them: on Unix its device, inode, size, and modification time; elsewhere its path, size, and modification time.
 ///
-/// Every write updates the modification time. The change time would also catch a modification time set back on purpose, but staging hard-links executables, which updates it, so every campaign would read them again. Verification guards against rebuilt or replaced executables, not deliberate tampering. A rewrite to the same size within the file system's timestamp granularity of the hash would go unnoticed; Linux 6.13 and later give a timestamp that was read since the last change a fine-grained update, which `stat` here ensures.
+/// Writes update the modification time, at the file system's timestamp granularity; Linux 6.13 and later make an update after the time was read fine-grained on file systems with multigrain timestamps, such as ext4, XFS, btrfs, and tmpfs. The change time would also catch a modification time set back on purpose, but staging hard-links executables, which updates it, so every campaign would read them again. Verification guards against rebuilt or replaced executables, not deliberate tampering: a same-size rewrite that keeps or restores the modification time goes unnoticed.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct FileIdentity {
     #[cfg(unix)]
@@ -285,12 +292,12 @@ struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn of(path: &Path) -> io::Result<Self> {
-        let metadata = std::fs::metadata(path).map_err(|error| {
-            io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-        })?;
+    /// The identity of an open file, so that it describes what is read from it.
+    fn of(file: &File, path: &Path) -> Self {
+        let metadata = file.metadata().expect("an open file has metadata");
         #[cfg(unix)]
         let file = {
+            let _ = path;
             use std::os::unix::fs::MetadataExt;
             (
                 metadata.dev(),
@@ -301,35 +308,61 @@ impl FileIdentity {
         };
         #[cfg(not(unix))]
         let file = (path.to_owned(), metadata.modified().ok());
-        Ok(Self {
+        Self {
             file,
             length: metadata.len(),
-        })
+        }
+    }
+
+    fn at(path: &Path) -> io::Result<Self> {
+        File::open(path).map(|file| Self::of(&file, path))
     }
 }
 
 /// Hashes this process has computed, by the identity of the file hashed.
 static HASHES: Mutex<BTreeMap<FileIdentity, String>> = Mutex::new(BTreeMap::new());
 
-/// The SHA-256 of `path`, read only when this process has not already hashed the same file with the same identity.
-///
-/// Runs verify every executable before each sample, and a smoke run verifies the same one for every scenario; reading a large executable each time dominated them, especially in unoptimized test builds. The identity is taken before and after reading, and a file that changed while it was read is not remembered.
-pub fn sha256_identified(path: &Path) -> io::Result<String> {
-    let identity = FileIdentity::of(path)?;
-    if let Some(hash) = hashes().get(&identity) {
-        return Ok(hash.clone());
-    }
-    let hash = sha256_file(path)?;
-    // Remember the hash only if the file kept its identity while it was read.
-    let _ = FileIdentity::of(path)
-        .ok()
-        .filter(|after| *after == identity)
-        .map(|_| hashes().insert(identity, hash.clone()));
-    Ok(hash)
+fn hashes() -> std::sync::MutexGuard<'static, BTreeMap<FileIdentity, String>> {
+    // Entries are inserted whole, so a panic elsewhere cannot leave one partly written.
+    HASHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn hashes() -> std::sync::MutexGuard<'static, BTreeMap<FileIdentity, String>> {
-    HASHES.lock().expect("the hash cache is never poisoned")
+/// The SHA-256 of `path`, read only when this process has not already hashed the same file with the same identity.
+///
+/// Runs verify every executable before each sample, and a smoke run verifies the same one for every scenario; reading a large executable each time dominated them, especially in unoptimized test builds. The identity comes from the opened file before and after reading it, and a file that changed while it was read is not remembered.
+pub fn sha256_identified(path: &Path) -> io::Result<String> {
+    identified(path).map(|(_, hash)| hash)
+}
+
+/// The identity a file had when it was opened, and its hash.
+fn identified(path: &Path) -> io::Result<(FileIdentity, String)> {
+    let mut file = open(path)?;
+    let identity = FileIdentity::of(&file, path);
+    if let Some(hash) = hashes().get(&identity).cloned() {
+        return Ok((identity, hash));
+    }
+    let hash = sha256_read(&mut file)?;
+    // Remember the hash only if the file kept its identity while it was read.
+    let _ = Some(FileIdentity::of(&file, path))
+        .filter(|after| *after == identity)
+        .map(|_| hashes().insert(identity.clone(), hash.clone()));
+    Ok((identity, hash))
+}
+
+/// Copy `from` to `to`, and remember the copy's hash as the source's when the source kept the identity it was hashed under, so that the copy is not read again.
+///
+/// Staging falls back to copying when it cannot hard-link, such as from one file system to another, and each campaign stages again.
+pub(crate) fn copy_identified(from: &Path, to: &Path) -> io::Result<()> {
+    let (identity, hash) = identified(from)?;
+    std::fs::copy(from, to).map(|_| {
+        let _ = FileIdentity::at(from)
+            .ok()
+            .filter(|after| *after == identity)
+            .and_then(|_| FileIdentity::at(to).ok())
+            .map(|copied| hashes().insert(copied, hash));
+    })
 }
 
 /// Write a pretty-printed JSON document, naming the path in any error.

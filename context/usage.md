@@ -87,7 +87,7 @@ Code and stack layout can change a program's speed as much as a real optimizatio
 
 - The host lock is `/tmp/base-benchmark-host.lock`, independent of `$TMPDIR`, and every user can take it. Under a private `/tmp`, pass a shared `--lock` explicitly.
 - Every executable is staged under the campaign's `bin/` directory with a name of the same length, so the path copied onto the initial stack does not depend on the artifact's label.
-- The environment contains only `PATH` and `LC_ALL=C`, plus `LLVM_PROFILE_FILE` when the collector has it, so that coverage runs, such as a workload test that smokes its scenarios under `cargo llvm-cov`, collect the workload's profiles. The working directory is the workspace root. The campaign metadata records both.
+- The environment contains only `PATH` and `LC_ALL=C`, plus, outside recorded campaigns, `LLVM_PROFILE_FILE` when the collector has it, so that coverage runs, such as a workload test that smokes its scenarios under `cargo llvm-cov`, collect the workload's profiles. The working directory is the workspace root. The campaign metadata records both.
 - Stack padding adds `BASE_BENCHMARK_STACK_PADDING` with a random length from 0 to 4095 bytes, drawn from the campaign seed, so stack alignment varies between processes rather than being fixed for a build. The length is journalled with each sample.
 - Layout replicas rebuild the baseline's source at other paths, which changes Cargo's metadata hashes and therefore code layout. Each replica is one more sample of build layout; several give a better estimate of how much layout alone moves a result.
 

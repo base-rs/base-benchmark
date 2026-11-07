@@ -4,6 +4,7 @@
 use crate::artifact::{
     self, Artifact, ArtifactManifest, ArtifactRole, BuildIdentity, ConfigurationFile,
     DependencyIdentity, MANIFEST_SCHEMA, MANIFEST_VERSION, SourceIdentity, sha256_file,
+    sha256_identified,
 };
 use crate::config::{Suite, invalid_input, valid_label};
 use crate::runner::Cancellation;
@@ -273,7 +274,7 @@ fn build(
     let executable = output.join("artifacts").join(label).join(&suite.binary);
     let sha256 = std::fs::create_dir_all(output.join("artifacts").join(label))
         .and_then(|()| std::fs::copy(&built, &executable))
-        .and_then(|_| sha256_file(&executable))
+        .and_then(|_| sha256_identified(&executable))
         .map_err(|error| {
             io::Error::new(
                 error.kind(),

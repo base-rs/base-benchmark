@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::test_support::{artifact, manifest};
+use std::path::Path;
 
 #[test]
 fn manifests_round_trip_and_verify_executables() {
@@ -20,7 +21,7 @@ fn manifests_round_trip_and_verify_executables() {
     assert_eq!(read.baseline().label, "baseline");
     read.baseline().verify().unwrap();
     assert!(read.baseline().source.is_frozen());
-    std::fs::write(&executable, "two").unwrap();
+    rewrite(&executable, "two");
     assert!(
         read.baseline()
             .verify()
@@ -96,15 +97,27 @@ fn invalid_manifests_are_rejected() {
     );
 }
 
+/// Rewrite `path` and give it a modification time a second later, as a write after a clock tick would, independent of the file system's timestamp granularity.
+fn rewrite(path: &Path, contents: &str) {
+    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::write(path, contents).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(modified + std::time::Duration::from_secs(1))
+        .unwrap();
+}
+
 #[test]
 fn identified_hashes_are_read_once_until_the_file_changes() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("tool");
     std::fs::write(&path, "one").unwrap();
-    let identity = FileIdentity::of(&path).unwrap();
+    let identity = FileIdentity::at(&path).unwrap();
     let hash = sha256_identified(&path).unwrap();
     assert_eq!(hash, sha256_file(&path).unwrap());
-    assert_eq!(hashes().get(&identity), Some(&hash));
+    assert_eq!(hashes().get(&identity).cloned(), Some(hash));
     // A remembered hash is returned without reading: replace it to observe that.
     hashes().insert(identity.clone(), "remembered".to_owned());
     assert_eq!(sha256_identified(&path).unwrap(), "remembered");
@@ -113,15 +126,37 @@ fn identified_hashes_are_read_once_until_the_file_changes() {
     std::fs::hard_link(&path, &link).unwrap();
     #[cfg(unix)]
     assert_eq!(sha256_identified(&link).unwrap(), "remembered");
-    // Writing the same length changes the identity, so the file is read again.
-    std::fs::write(&path, "two").unwrap();
-    assert_ne!(FileIdentity::of(&path).unwrap(), identity);
+    // A same-size rewrite with a later modification time is read again.
+    rewrite(&path, "two");
+    assert_ne!(FileIdentity::at(&path).unwrap(), identity);
     assert_eq!(
         sha256_identified(&path).unwrap(),
         sha256_file(&path).unwrap()
     );
     assert!(sha256_identified(&directory.path().join("missing")).is_err());
     assert!(sha256_identified(directory.path()).is_err());
+}
+
+#[test]
+fn copies_inherit_the_hash_of_an_unchanged_source() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("tool");
+    std::fs::write(&source, "one").unwrap();
+    let copy = directory.path().join("copy");
+    copy_identified(&source, &copy).unwrap();
+    let hash = sha256_file(&source).unwrap();
+    assert_eq!(
+        hashes().get(&FileIdentity::at(&copy).unwrap()).cloned(),
+        Some(hash)
+    );
+    // A changed copy is read again.
+    rewrite(&copy, "two");
+    assert_eq!(
+        sha256_identified(&copy).unwrap(),
+        sha256_file(&copy).unwrap()
+    );
+    assert!(copy_identified(&directory.path().join("missing"), &copy).is_err());
+    assert!(copy_identified(&source, &directory.path().join("absent/copy")).is_err());
 }
 
 #[test]

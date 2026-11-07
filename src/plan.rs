@@ -294,7 +294,10 @@ impl Plan {
             working_directory: options.suite.workspace_root.clone(),
             environment: launch_environment(
                 std::env::var("PATH").ok(),
-                std::env::var("LLVM_PROFILE_FILE").ok(),
+                // Recorded campaigns keep their environment independent of how the collector was started.
+                std::env::var("LLVM_PROFILE_FILE")
+                    .ok()
+                    .filter(|_| options.mode != Mode::Recorded),
             ),
             stack_padding: options.stack_padding,
             subjects,
@@ -400,7 +403,7 @@ pub const STACK_PADDING_LIMIT: usize = 4096;
 
 /// A minimal, recorded environment: `PATH` from the collector and the C locale, and the collector's `LLVM_PROFILE_FILE` when it has one.
 ///
-/// The size of the environment shifts the initial stack, so inheriting a shell's or agent's environment would make layout depend on who ran the campaign. `LLVM_PROFILE_FILE` is kept so that a coverage run, such as a workload's test that drives it through the runner under `cargo llvm-cov`, collects the workload's profiles where the coverage tool expects them, rather than leaving `default_*.profraw` files in the working directory. It affects only instrumented executables.
+/// The size of the environment shifts the initial stack, so inheriting a shell's or agent's environment would make layout depend on who ran the campaign. `LLVM_PROFILE_FILE` is kept, outside recorded campaigns, so that a coverage run, such as a workload's test that drives it through the runner under `cargo llvm-cov`, collects the workload's profiles where the coverage tool expects them, rather than leaving `default_*.profraw` files in the working directory. Like any variable its length shifts the initial stack, but every subject of a campaign gets the same value.
 pub(crate) fn launch_environment(
     path: Option<String>,
     profile: Option<String>,

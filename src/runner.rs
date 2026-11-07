@@ -253,7 +253,7 @@ fn stage(plan: &Plan, output: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
             .map(|(index, artifact)| {
                 let path = directory.join(format!("{index:0width$}"));
                 std::fs::hard_link(&artifact.executable, &path)
-                    .or_else(|_| std::fs::copy(&artifact.executable, &path).map(drop))
+                    .or_else(|_| crate::artifact::copy_identified(&artifact.executable, &path))
                     .map_err(|error| {
                         io::Error::new(
                             error.kind(),
