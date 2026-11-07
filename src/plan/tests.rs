@@ -201,11 +201,15 @@ fn shuffles_are_seeded_permutations() {
 
 #[test]
 fn launches_use_a_minimal_recorded_environment() {
-    assert_eq!(launch_environment(Some("/bin".to_owned()))["PATH"], "/bin");
+    let environment = launch_environment(Some("/bin".to_owned()), None);
+    assert_eq!(environment["PATH"], "/bin");
+    assert_eq!(environment.len(), 2);
     assert_eq!(
-        launch_environment(None)["PATH"],
+        launch_environment(None, None)["PATH"],
         "/usr/local/bin:/usr/bin:/bin"
     );
+    let coverage = launch_environment(None, Some("/target/%p.profraw".to_owned()));
+    assert_eq!(coverage["LLVM_PROFILE_FILE"], "/target/%p.profraw");
     let mut shuffle = Shuffle::new(9);
     assert!((0..100).all(|_| shuffle.below(STACK_PADDING_LIMIT) < STACK_PADDING_LIMIT));
 }

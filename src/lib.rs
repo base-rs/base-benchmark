@@ -54,7 +54,7 @@ pub use usage::{CurrentProcess, Interval, ResourceSource, ResourceUsage};
 #[cfg(feature = "runner")]
 pub use artifact::{
     Artifact, ArtifactManifest, ArtifactRole, BuildIdentity, ConfigurationFile, DependencyIdentity,
-    MANIFEST_SCHEMA, MANIFEST_VERSION, SourceIdentity, sha256_file,
+    MANIFEST_SCHEMA, MANIFEST_VERSION, SourceIdentity, sha256_file, sha256_identified,
 };
 #[cfg(feature = "runner")]
 pub use config::{METADATA_KEY, Scenario, Suite, Variant, cargo_program, discover, select};

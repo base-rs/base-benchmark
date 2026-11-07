@@ -5,6 +5,8 @@
 - Add `Metric::quantile` and `Measurement::Quantile` for order statistics such as a 99th percentile latency, summarized as `Statistic::Quantile` with the quantile, and reported as, for example, `ns p99`. A metric reported at different quantiles is a different definition, flagged rather than compared.
 - Records are now version 2 and summaries version 2, since both can contain quantiles. The runner still accepts version 1 records, so workloads built against 0.1 keep working. A 0.1 runner rejects 0.2 records: with a version mismatch, or for records with quantiles, with an unknown variant `quantile`.
 - Breaking: `Measurement` and `Statistic` gain variants and are now `#[non_exhaustive]`, so matches on them need a wildcard arm. `Statistic` is no longer `Eq`, since it now carries the quantile.
+- Verify executables without reading them again while their identity is unchanged: device, inode, size, and modification time on Unix, taken from the opened file. Copies made when staging cannot hard-link inherit their source's verified hash. Every sample and every campaign verifies its executable, so smoke runs of unoptimized test builds spent most of their time hashing; a 19-scenario smoke test of a 50 MB debug executable took 27 s. A same-size rewrite that keeps or restores the modification time, or happens within the file system's timestamp granularity, is no longer detected within one process. `sha256_identified` is public.
+- Keep the collector's `LLVM_PROFILE_FILE` in the workload environment outside recorded campaigns, so that coverage runs collect workload profiles instead of leaving `default_*.profraw` files in the workspace.
 
 ## v0.1.1
 
