@@ -8,8 +8,8 @@ use std::io::{self, Write};
 
 /// The schema identifier of a [`ProcessRecord`].
 pub const RECORD_SCHEMA: &str = "base-benchmark/process-record";
-/// The current [`ProcessRecord`] schema version.
-pub const RECORD_VERSION: u32 = 1;
+/// The current [`ProcessRecord`] schema version. Version 2 added quantile measurements; version 1 records, which cannot contain them, are still accepted.
+pub const RECORD_VERSION: u32 = 2;
 
 /// The single record a workload process writes to stdout on success.
 ///
@@ -64,7 +64,7 @@ impl ProcessRecord {
 
     /// Check structural invariants. The runner applies the same checks to every record it receives.
     pub fn validate(&self) -> io::Result<()> {
-        if self.schema != RECORD_SCHEMA || self.version != RECORD_VERSION {
+        if self.schema != RECORD_SCHEMA || !(1..=RECORD_VERSION).contains(&self.version) {
             return Err(invalid(format!(
                 "unsupported record schema {} version {}",
                 self.schema, self.version
@@ -176,7 +176,15 @@ impl Metric {
 
     /// The `quantile` (from 0 to 1) of a distribution the workload observed, such as the 99th percentile latency, 0.99. Like a mean, it is reported as it is and never divided by operations.
     pub fn quantile(name: impl Into<String>, unit: Unit, quantile: f64, value: f64) -> Self {
-        Self::new(name, unit, Measurement::Quantile { quantile, value })
+        // Adding zero turns -0.0 into 0.0, so the minimum has one representation.
+        Self::new(
+            name,
+            unit,
+            Measurement::Quantile {
+                quantile: quantile + 0.0,
+                value,
+            },
+        )
     }
 
     /// A metric that was requested but could not be measured.
@@ -229,7 +237,7 @@ impl Metric {
 
     /// The per-operation value of a measured-phase total.
     ///
-    /// Whole-process and attached-window totals include work outside the measured operations, so they are never normalized by them. Means are reported as they are.
+    /// Whole-process and attached-window totals include work outside the measured operations, so they are never normalized by them. Means and quantiles are reported as they are.
     pub fn per_operation(&self, operations: u64) -> Option<f64> {
         match (&self.measurement, self.phase) {
             (Measurement::Total { value }, Phase::Measured) => {
@@ -276,6 +284,7 @@ impl Metric {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum Measurement {
     Total {
         value: u64,
