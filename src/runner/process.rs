@@ -251,20 +251,29 @@ pub(crate) struct Launch<'a> {
     pub cpus: &'a [usize],
 }
 
-/// Collecting samples needs Linux; see the module documentation.
+/// Whether this platform can collect samples, checked before a campaign creates its directory or builds anything.
+pub(crate) fn check_collection() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "collecting samples needs Linux, for process groups, waitid, and CPU affinity",
+        ))
+    }
+}
+
+/// Collecting samples needs Linux; see the module documentation. Campaigns check first, so this is not reached.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn execute(
-    launch: &Launch,
+    _launch: &Launch,
     _timeout: Duration,
     _cancellation: &Cancellation,
 ) -> io::Result<Execution> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "{}: collecting samples needs Linux, for process groups, waitid, and CPU affinity",
-            launch.program.display()
-        ),
-    ))
+    check_collection().map(|()| unreachable!("collection is unsupported here"))
 }
 
 /// Run one workload process to completion with bounded output, a deadline, CPU placement, and process-group cleanup.
