@@ -93,7 +93,10 @@ fn invalid_samples_fail_the_campaign_and_are_retained() {
     for (body, message) in cases {
         let directory = tempfile::tempdir().unwrap();
         let (mut plan, output) = campaign(directory.path(), body);
-        plan.timeout_ms = 300;
+        // Only the case about the deadline gets a short one, so that a loaded host cannot time out the others before they give their own errors.
+        if message == "timed out" {
+            plan.timeout_ms = 300;
+        }
         let error = run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
         let metadata = read_metadata(&output).unwrap();
