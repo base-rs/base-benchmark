@@ -9,10 +9,10 @@ mod process;
 mod session;
 
 pub use host::{CpuIdentity, HostIdentity};
+use process::Launch;
 #[cfg(not(target_os = "linux"))]
 pub(crate) use process::check_collection;
 pub use process::{Cancellation, SignalGuard};
-pub(crate) use process::{Launch, execute};
 
 use crate::artifact::write_json;
 use crate::plan::{Plan, STACK_PADDING_LIMIT, STACK_PADDING_VARIABLE, Shuffle, Subject};
@@ -172,11 +172,11 @@ pub fn run(
         finished_unix_ms: None,
         error: None,
     };
-    let journal = Journal::create(output, metadata)?;
+    let mut journal = Journal::create(output, metadata)?;
     for warning in crate::summary::placement_warnings(&journal.metadata.plan) {
         let _ = writeln!(progress, "base-benchmark: warning: {warning}");
     }
-    match collect(&journal, cancellation, progress) {
+    match collect(&mut journal, cancellation, progress) {
         Ok(summary) => {
             journal.complete(&summary)?;
             Ok(Campaign::new(output, summary))
@@ -231,13 +231,18 @@ pub fn read_entries(path: &Path) -> io::Result<Vec<SampleEntry>> {
 }
 
 fn collect(
-    journal: &Journal,
+    journal: &mut Journal,
     cancellation: &Cancellation,
     progress: &mut dyn Write,
 ) -> io::Result<Summary> {
-    let plan = journal.metadata.plan.clone();
+    let mut plan = journal.metadata.plan.clone();
     let staged = stage(&plan, &journal.output)?;
     let _lock = HostLock::acquire(&plan.lock, cancellation, progress)?;
+    if !plan.programs.is_empty() {
+        identify_versions(&mut plan, cancellation);
+        journal.metadata.plan.programs = plan.programs.clone();
+        journal.write_metadata()?;
+    }
     let collection = Collection {
         plan: &plan,
         output: &journal.output,
@@ -331,6 +336,60 @@ fn stage(plan: &Plan, output: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
             })
             .collect()
     })
+}
+
+/// How long an external program may take to report its version.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ask each external program for its version, under the host lock so that the probe disturbs no other campaign, on the CPUs of the role that runs it, and under the campaign's cancellation.
+fn identify_versions(plan: &mut Plan, cancellation: &Cancellation) {
+    for index in 0..plan.programs.len() {
+        let program = &plan.programs[index];
+        let cpus = plan
+            .roles
+            .iter()
+            .find(|role| {
+                role.program
+                    == crate::role::RoleProgram::External {
+                        name: program.name.clone(),
+                    }
+            })
+            .map(|role| role.cpus.clone())
+            .unwrap_or_default();
+        let version = reported_version(&program.path, &cpus, &plan.environment, cancellation);
+        plan.programs[index].version = version;
+    }
+}
+
+/// The first non-empty line `program --version` prints, on stdout or else stderr, run with the campaign's environment from the root directory, when it exits successfully within [`VERSION_TIMEOUT`].
+fn reported_version(
+    program: &Path,
+    cpus: &[usize],
+    environment: &BTreeMap<String, String>,
+    cancellation: &Cancellation,
+) -> Option<String> {
+    let arguments = ["--version".to_owned()];
+    let launch = Launch {
+        program,
+        arguments: &arguments,
+        environment,
+        directory: Path::new("/"),
+        cpus,
+    };
+    process::execute_keeping_stderr_head(&launch, VERSION_TIMEOUT, cancellation)
+        .ok()
+        .filter(|execution| execution.succeeded())
+        .and_then(|execution| {
+            [execution.stdout, execution.stderr]
+                .iter()
+                .find_map(|output| {
+                    String::from_utf8_lossy(output)
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map(str::to_owned)
+                })
+        })
 }
 
 /// The key of the helper at `index` among the staged executables. Labels cannot contain `/`, so it is distinct from every artifact's.

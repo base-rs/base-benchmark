@@ -1192,3 +1192,109 @@ fn undeclared_shared_placement_is_reported_when_the_campaign_starts() {
         "{progress}"
     );
 }
+
+/// `plan` with its external program replaced by a shell that answers `--version` by running `version`.
+fn with_version(directory: &Path, mut plan: Plan, version: &str) -> Plan {
+    let program = crate::test_support::write_executable(
+        &directory.join("program"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then\n{version}\nfi\nexec /bin/sh \"$@\"\n"
+        ),
+    );
+    plan.programs[0] = crate::plan::ExternalProgram::identify("shell", &program).unwrap();
+    plan
+}
+
+/// The version a campaign recorded for its external program.
+fn recorded_version(output: &Path) -> Option<String> {
+    read_metadata(output).unwrap().plan.programs[0]
+        .version
+        .clone()
+}
+
+#[test]
+fn external_programs_report_their_versions_when_the_campaign_starts() {
+    let long = "x".repeat(STDERR_LIMIT);
+    for (index, (body, version)) in [
+        (
+            "echo; echo '  tool 1.2.3 '; echo more; exit 0",
+            Some("tool 1.2.3"),
+        ),
+        ("echo 'v2' >&2; exit 0", Some("v2")),
+        // The first line of stderr, however much follows it.
+        (
+            &*format!("echo 'v3' >&2; for i in 1 2 3; do echo {long} >&2; done; exit 0"),
+            Some("v3"),
+        ),
+        ("echo 'tool 1.2.3'; exit 1", None),
+        ("exit 0", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = session(directory.path(), &serving("a:1"), &valid());
+        assert_eq!(plan.programs[0].version, None, "plans do not run programs");
+        let plan = with_version(directory.path(), plan, body);
+        let output = directory.path().join(format!("campaign-{index}"));
+        run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap();
+        assert_eq!(recorded_version(&output).as_deref(), version, "{body}");
+    }
+}
+
+#[test]
+fn versions_are_asked_under_the_host_lock_on_the_roles_cpus() {
+    let directory = tempfile::tempdir().unwrap();
+    let lock = directory.path().join("lock");
+    let plan = session(directory.path(), &serving("a:1"), &valid());
+    let mut plan = with_version(
+        directory.path(),
+        plan,
+        &format!(
+            "echo \"$(grep Cpus_allowed_list /proc/self/status | cut -f2) $(flock -n '{}' true && echo unlocked || echo locked)\"; exit 0",
+            lock.display()
+        ),
+    );
+    plan.roles[1].cpus = vec![0];
+    let output = directory.path().join("campaign");
+    run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap();
+    assert_eq!(recorded_version(&output).as_deref(), Some("0 locked"));
+}
+
+#[test]
+fn cancellation_stops_a_version_probe() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid = directory.path().join("probe.pid");
+    let plan = session(directory.path(), &serving("a:1"), &valid());
+    let plan = with_version(
+        directory.path(),
+        plan,
+        &format!("echo $$ > '{}'; exec sleep 30", pid.display()),
+    );
+    let cancellation = Cancellation::new();
+    let canceller = cancellation.clone();
+    let wait = pid.clone();
+    let stop = std::thread::spawn(move || {
+        while !wait.exists() || std::fs::read_to_string(&wait).unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        canceller.cancel();
+        process::KILLED.with(|killed| killed.take())
+    });
+    let output = directory.path().join("campaign");
+    let error = run(plan, &output, &cancellation, &mut Vec::new()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    // The probe ran under the campaign's cancellation, which killed it.
+    let probe: i32 = std::fs::read_to_string(&pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(stop.join().unwrap(), [probe]);
+    assert_eq!(recorded_version(&output), None);
+    assert!(
+        read_entries(&output.join("samples.jsonl"))
+            .unwrap()
+            .is_empty()
+    );
+}

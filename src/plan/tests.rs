@@ -493,27 +493,6 @@ fn roles_must_be_placed_on_cpus_that_exist_and_are_online() {
 }
 
 #[test]
-fn external_programs_report_their_versions() {
-    let directory = tempfile::tempdir().unwrap();
-    for (index, (body, version)) in [
-        ("echo; echo '  tool 1.2.3 '; echo more", Some("tool 1.2.3")),
-        ("echo 'v2' >&2", Some("v2")),
-        ("echo 'tool 1.2.3'; exit 1", None),
-        (":", None),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let program = crate::test_support::write_executable(
-            &directory.path().join(format!("program-{index}")),
-            &format!("#!/bin/sh\n[ \"$1\" = --version ] || exit 5\n{body}\n"),
-        );
-        let identified = ExternalProgram::identify("tool", &program).unwrap();
-        assert_eq!(identified.version.as_deref(), version, "{body}");
-    }
-}
-
-#[test]
 fn helper_roles_need_prepared_helpers() {
     let mut options = roles_options(Mode::Screening);
     options.suite.scenarios[0].roles[0].program = crate::role::RoleProgram::Binary {

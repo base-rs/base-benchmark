@@ -214,12 +214,9 @@ pub struct ExternalProgram {
     /// The path it was given by, made absolute and canonical on the measuring host.
     pub path: PathBuf,
     pub sha256: String,
-    /// The first line it printed for `--version`, or `None` when that failed, so its version is unknown.
+    /// The first line it printed for `--version` when the campaign started, or `None` when that failed, so its version is unknown, or before the campaign started. Campaigns ask under the host lock, on the CPUs of the role that runs it.
     pub version: Option<String>,
 }
-
-/// How long an external program may take to report its version.
-const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One executable and argument list, run once per round.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -641,7 +638,7 @@ impl ExternalProgram {
         })?;
         Ok(Self {
             name: name.to_owned(),
-            version: reported_version(&resolved),
+            version: None,
             path: resolved,
             sha256,
         })
@@ -668,37 +665,6 @@ impl ExternalProgram {
         }
         Ok(())
     }
-}
-
-/// The first non-empty line `program --version` prints, on stdout or else stderr, run with a minimal environment from the root directory, when it exits successfully within [`VERSION_TIMEOUT`].
-fn reported_version(program: &std::path::Path) -> Option<String> {
-    let arguments = ["--version".to_owned()];
-    let environment = launch_environment(std::env::var("PATH").ok(), None);
-    let launch = crate::runner::Launch {
-        program,
-        arguments: &arguments,
-        environment: &environment,
-        directory: std::path::Path::new("/"),
-        cpus: &[],
-    };
-    crate::runner::execute(
-        &launch,
-        VERSION_TIMEOUT,
-        &crate::runner::Cancellation::new(),
-    )
-    .ok()
-    .filter(|execution| execution.succeeded())
-    .and_then(|execution| {
-        [execution.stdout, execution.stderr]
-            .iter()
-            .find_map(|output| {
-                String::from_utf8_lossy(output)
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .map(str::to_owned)
-            })
-    })
 }
 
 /// CPUs as a comma-separated list.
