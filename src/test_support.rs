@@ -258,3 +258,53 @@ pub fn roles_plan(suite: Suite, lock: &Path) -> Plan {
     options.programs = [("shell".to_owned(), PathBuf::from(SHELL))].into();
     Plan::new(options).unwrap()
 }
+
+/// Run the test named `test`, its path within the crate, again in a child process that starts with `signals` ignored, as `&` in a non-interactive shell leaves `SIGINT` and `SIGQUIT` and `nohup` leaves `SIGHUP`, and require that it passes there. In that child, which first checks that the signals are ignored, run `body` instead.
+pub fn with_signals_ignored(test: &str, signals: &[nix::sys::signal::Signal], body: impl FnOnce()) {
+    use nix::sys::signal::{SigHandler, signal};
+    use std::os::unix::process::CommandExt;
+    const PASSED: &str = "BASE_BENCHMARK_TEST_IGNORING_PASSED";
+    if let Some(passed) = std::env::var_os(PASSED) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let ignored = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigIgn:"))
+            .map(|mask| u64::from_str_radix(mask.trim(), 16).unwrap())
+            .unwrap();
+        for &ignoring in signals {
+            assert_ne!(
+                ignored & (1 << (ignoring as i32 - 1)),
+                0,
+                "{ignoring} is ignored"
+            );
+        }
+        body();
+        std::fs::write(passed, "").unwrap();
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let passed = directory.path().join("passed");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([test, "--exact", "--test-threads=1", "--nocapture"])
+        .env(PASSED, &passed);
+    let signals = signals.to_vec();
+    // SAFETY: between fork and exec, the closure only calls `signal`, which is async-signal-safe, and allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            for &ignoring in &signals {
+                signal(ignoring, SigHandler::SigIgn).map_err(std::io::Error::from)?;
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{report}");
+    // A filter that matches no test also passes.
+    assert!(passed.exists(), "{test} ran in the child: {report}");
+}

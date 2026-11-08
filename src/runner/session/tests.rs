@@ -803,6 +803,37 @@ fn a_panicking_session_kills_and_reaps_its_roles() {
 }
 
 #[test]
+fn services_stop_by_signals_that_base_benchmark_started_with_ignored() {
+    use nix::sys::signal::Signal;
+    crate::test_support::with_signals_ignored(
+        "runner::session::tests::services_stop_by_signals_that_base_benchmark_started_with_ignored",
+        &[Signal::SIGINT, Signal::SIGQUIT, Signal::SIGHUP],
+        || {
+            for signal in ["SIGINT", "SIGQUIT", "SIGHUP"] {
+                let directory = tempfile::tempdir().unwrap();
+                // A shell cannot trap a signal ignored when it started, so with that signal ignored this service would outlast its grace period.
+                let server = format!("trap 'exit 0' {}\n{}", &signal[3..], serving("a:1"));
+                let mut plan = session(directory.path(), &server, &valid());
+                plan.roles[0].stop = Some(Stop::Signal {
+                    signal: signal.to_owned(),
+                    grace_ms: 20_000,
+                });
+                // Longer than the grace period, so that a service that outlasts it is killed and journalled rather than timed out.
+                plan.timeout_ms = 60_000;
+                let output = directory.path().join("campaign");
+                run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap();
+                let server = &read_entries(&output.join("samples.jsonl")).unwrap()[0].roles[0];
+                assert_eq!(
+                    (server.exit_code, server.killed_after_grace),
+                    (Some(0), false),
+                    "{signal}"
+                );
+            }
+        },
+    );
+}
+
+#[test]
 fn a_session_whose_cleanup_panics_partway_still_reaps_every_other_role() {
     let directory = tempfile::tempdir().unwrap();
     let plan = session(directory.path(), &serving("a:1"), "exec sleep 30");

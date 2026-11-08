@@ -293,7 +293,9 @@ pub(crate) fn execute(
     check_collection().map(|()| unreachable!("collection is unsupported here"))
 }
 
-/// Start a process leading its own group, with the launch's environment, directory, and CPUs, piped stdout and stderr, and `stdin`, and register its group with `cancellation`. Returns the child and its group.
+/// Start a process leading its own group, with the launch's environment, directory, and CPUs, piped stdout and stderr, `stdin`, and every stop signal at its default disposition, and register its group with `cancellation`. Returns the child and its group.
+///
+/// Signals this process ignores, such as `SIGINT` and `SIGQUIT` after `&` in a non-interactive shell or `SIGHUP` under `nohup`, would otherwise stay ignored in the child, so that a service would outlast its stop signal and be killed after its grace period. The stop signals include the termination signals.
 #[cfg(target_os = "linux")]
 pub(crate) fn start(
     launch: &Launch,
@@ -311,11 +313,37 @@ pub(crate) fn start(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    // SAFETY: `reset_stop_signals` is async-signal-safe, so it can run between fork and exec.
+    unsafe {
+        command.pre_exec(reset_stop_signals);
+    }
     let child = with_affinity(cpus, || spawn(&mut command))
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", program.display())))?;
     let group = i32::try_from(child.id()).expect("process IDs fit in pid_t");
     cancellation.register(group);
     Ok((child, group))
+}
+
+/// The signals a service may be stopped with, [`crate::role::STOP_SIGNALS`], which include the termination signals.
+#[cfg(target_os = "linux")]
+const STOP_SIGNALS: [Signal; 6] = [
+    Signal::SIGTERM,
+    Signal::SIGINT,
+    Signal::SIGHUP,
+    Signal::SIGQUIT,
+    Signal::SIGUSR1,
+    Signal::SIGUSR2,
+];
+
+/// Reset every stop signal to its default disposition. It runs between fork and exec, so it only calls `signal`, which is async-signal-safe, and allocates nothing. Resetting a signal other than `SIGKILL` or `SIGSTOP` cannot fail.
+#[cfg(target_os = "linux")]
+fn reset_stop_signals() -> io::Result<()> {
+    use nix::sys::signal::{SigHandler, signal};
+    for stop in STOP_SIGNALS {
+        // SAFETY: the default disposition runs no handler.
+        let _ = unsafe { signal(stop, SigHandler::SigDfl) };
+    }
+    Ok(())
 }
 
 /// Wait for a group's leader to exit without reaping it, so its process ID, and therefore the group ID, stays reserved during cleanup.
