@@ -47,7 +47,7 @@ impl ArtifactManifest {
         write_json(path, self)
     }
 
-    /// Describe an executable built outside [`crate::prepare`], such as a test binary, as the only baseline artifact.
+    /// Describe an executable built outside [`prepare`](fn@crate::prepare), such as a test binary, as the only baseline artifact.
     ///
     /// Its source and build are unknown, so it can be used for smoke and screening runs but never satisfies recorded prerequisites. Its features are unknown too, so it serves every scenario; callers choose which scenarios it can run.
     pub fn unprepared(suite: &crate::config::Suite, executable: &Path) -> io::Result<Self> {
