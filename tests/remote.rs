@@ -468,6 +468,46 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
     assert!(dotted.join("artifacts.json").is_file());
     assert!(host.join(format!("mirror{}", dotted.display())).is_dir());
 
+    // An output named through a symlink maps as an input through it does, so its artifacts can be run.
+    let real = directory.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = directory.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let linked_output = link.join("prepared");
+    explicit
+        .execute_now(
+            "prepare",
+            arguments(&[
+                "--manifest-path",
+                &plain,
+                "--output",
+                &linked_output.display().to_string(),
+            ]),
+        )
+        .unwrap();
+    assert!(
+        host.join(format!("mirror{}/prepared", real.display()))
+            .is_dir()
+    );
+    explicit
+        .execute_now(
+            "run",
+            arguments(&[
+                "work",
+                "--manifest-path",
+                &plain,
+                "--artifacts",
+                &linked_output.join("artifacts.json").display().to_string(),
+                "--mode",
+                "smoke",
+                "--lock",
+                &lock,
+                "--output",
+                &link.join("campaign").display().to_string(),
+            ]),
+        )
+        .unwrap();
+    assert!(real.join("campaign/summary.json").is_file());
     // A linked worktree keeps its Git state on the host, whose mirror names the mirrored repository.
     let repository = directory.path().join("repository");
     support::workspace(&repository, "");
@@ -503,10 +543,20 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
     let stopped = directory.path().join("stopped");
     let slow = script(
         &directory.path().join("slow"),
-        "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) output=$2; shift;; esac; shift; done\nmkdir -p \"$output\"\ntrap 'echo stopped > \"$output/status\"; kill $s; exit 7' TERM\nsleep 30 >/dev/null 2>&1 &\ns=$!\ntouch \"$output/started\"\nwait $s\n",
+        "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) output=$2; shift;; esac; shift; done\nmkdir -p \"$output\"\nif [ -e /dev/fd/3 ]; then touch \"$output/descriptor\"; fi\ntrap 'echo stopped > \"$output/status\"; kill $s; exit 7' TERM\nsleep 30 >/dev/null 2>&1 &\ns=$!\ntouch \"$output/started\"\nwait $s\n",
+    );
+    // SSH, here and for rsync, records the signals it starts with ignored, then runs as before.
+    let ignored = directory.path().join("ignored");
+    let recording_ssh = script(
+        &directory.path().join("recording-ssh"),
+        &format!(
+            "#!/bin/sh\ngrep SigIgn /proc/$$/status >> {} 2>/dev/null\nshift\nexec \"$@\"\n",
+            ignored.display()
+        ),
     );
     let slow = Remote {
         program: Some(slow.display().to_string()),
+        ssh: recording_ssh,
         ..remote.clone()
     };
     let started = host.join(format!("mirror{}/started", stopped.display()));
@@ -538,6 +588,23 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
         std::fs::read_to_string(stopped.join("status")).unwrap(),
         "stopped\n"
     );
+    assert!(
+        !stopped.join("descriptor").exists(),
+        "the host's command does not inherit the watcher's input"
+    );
+    // SIGINT (2) and SIGQUIT (3) are ignored in the command's SSH, so a terminal's interrupt reaches only this process.
+    #[cfg(target_os = "linux")]
+    {
+        // rsync's connections record theirs too; the command's connection is the one with both ignored.
+        let recorded = std::fs::read_to_string(&ignored).unwrap();
+        let both = recorded
+            .lines()
+            .filter_map(|line| line.split_whitespace().last())
+            .map(|mask| u64::from_str_radix(mask, 16).unwrap())
+            .filter(|mask| mask & 0b110 == 0b110)
+            .count();
+        assert_eq!(both, 1, "{recorded}");
+    }
     // A cancelled command never starts.
     let error = slow.execute("run", run, &cancellation).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");

@@ -84,7 +84,7 @@ impl Remote {
         for (name, value) in std::mem::take(&mut invocation.named) {
             let argument = match name.as_str() {
                 "output" => {
-                    let path = normalized(&std::path::absolute(&value)?);
+                    let path = located(Path::new(&value))?;
                     output = Some(path.clone());
                     Argument::Path(path)
                 }
@@ -335,23 +335,27 @@ impl Remote {
 
     /// Run a POSIX shell script on the host and return its standard output. The script goes to `sh -s` on standard input, so the remote user's login shell, such as fish, never parses it.
     ///
-    /// With a cancellation, standard input stays open until the script ends or the cancellation is cancelled, and SSH runs in its own process group, so a terminal's interrupt reaches only this process, which cancels. A [`stoppable`] script stops its command when its input closes.
+    /// With a cancellation, standard input stays open until the script ends or the cancellation is cancelled, and SSH starts with SIGINT and SIGQUIT ignored, which it keeps, so a terminal's interrupt reaches only this process, which cancels. SSH stays in the terminal's process group, so it can still prompt there, for example for a password. A [`stoppable`] script stops its command when its input closes.
     fn shell(
         &self,
         description: &str,
         script: &str,
         cancellation: Option<&Cancellation>,
     ) -> io::Result<String> {
-        let mut ssh = Command::new(&self.ssh);
+        // Ignored signals stay ignored across `exec`, and SSH keeps them so.
+        let mut ssh = match cancellation {
+            Some(_) if cfg!(unix) => {
+                let mut ssh = Command::new("/bin/sh");
+                ssh.args(["-c", "trap '' INT QUIT; exec \"$0\" \"$@\""])
+                    .arg(&self.ssh);
+                ssh
+            }
+            _ => Command::new(&self.ssh),
+        };
         ssh.args([self.host.as_str(), "sh", "-s"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        #[cfg(unix)]
-        if cancellation.is_some() {
-            use std::os::unix::process::CommandExt;
-            ssh.process_group(0);
-        }
         let mut child = ssh.spawn().map_err(|error| {
             io::Error::new(error.kind(), format!("{}: {error}", self.ssh.display()))
         })?;
@@ -413,7 +417,7 @@ fn stoppable(setup: &[String], command: &str) -> String {
         setup.join(" && ")
     };
     format!(
-        "{{\nexec 3<&0\n{setup} || exit $?\n{command} &\npid=$!\n{{ while read -r _ <&3; do :; done; kill -TERM \"$pid\"; }} >/dev/null 2>&1 &\nwatcher=$!\nwait \"$pid\"\nstatus=$?\nkill \"$watcher\" 2>/dev/null\nexit \"$status\"\n}}\n"
+        "{{\nexec 3<&0\n{setup} || exit $?\n{command} 3<&- &\npid=$!\n{{ while read -r _ <&3; do :; done; kill -TERM \"$pid\"; }} >/dev/null 2>&1 &\nwatcher=$!\nwait \"$pid\"\nstatus=$?\nkill \"$watcher\" 2>/dev/null\nexit \"$status\"\n}}\n"
     )
 }
 
@@ -513,6 +517,22 @@ impl Invocation {
 fn existing(path: &Path) -> io::Result<PathBuf> {
     path.canonicalize()
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+}
+
+/// A local output path as the mirror names it: its longest existing ancestor made canonical, as inputs are, so that a later command naming something inside it through the same symlink, such as `/tmp` on macOS, finds the same mirror; and the rest without `..` components.
+fn located(path: &Path) -> io::Result<PathBuf> {
+    let path = normalized(&std::path::absolute(path)?);
+    // The root always exists, so an ancestor is always found; the normalized path is only a fallback.
+    let found = path.ancestors().find_map(|ancestor| {
+        let rest = path
+            .strip_prefix(ancestor)
+            .expect("an ancestor is a prefix");
+        ancestor.canonicalize().ok().map(|canonical| {
+            rest.components()
+                .fold(canonical, |path, name| path.join(name))
+        })
+    });
+    Ok(found.unwrap_or(path))
 }
 
 /// An absolute path without `..` components, which would let a mirrored path leave the mirror. Components of an absolute path never include `.`.
