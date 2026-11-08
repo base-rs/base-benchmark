@@ -96,7 +96,7 @@ pub enum Statistic {
     Quantile(f64),
     /// A total over a window wider than the measured operations, such as the whole process, or a service's total over the driver's window. It is not divided by operations.
     Total,
-    /// A service's CPU time over the driver's measured window divided by the driver's operations, all of them successful ones: CPU per request. It is approximate, since the window's edges, failed requests, and work such as draining after the stop marker are not exactly the counted operations.
+    /// A service's CPU time over the driver's measured window divided by the driver's operations, all of them successful ones: CPU per request. It is approximate, since the window's edges, failed requests, and work such as draining after the stop marker are not exactly the counted operations. It counts only time accounted to the service's own threads, so softirq time spent on its behalf, such as network processing, is missing and the value understates the service's cost.
     ApproximatePerOperation,
 }
 
