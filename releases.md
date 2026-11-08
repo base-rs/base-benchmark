@@ -1,6 +1,6 @@
 # Releases
 
-## Unreleased
+## v0.3.0
 
 - Read Cargo metadata for path dependencies again with network access when reading it offline fails, still locked, saying so on standard error first. Building only the workload package does not download packages that only other workspace members need, so on a host with a fresh Cargo cache every artifact recorded its path dependencies as unknown, which was noticed only when a recorded campaign refused them. Preparation now warns when metadata still cannot be read, naming the tree and giving Cargo's errors from both attempts. Metadata is read once per tree rather than once per feature set, not again with network access once preparation is cancelled, and in the tree, as builds are, so that its Cargo configuration, such as source replacement or `net.offline`, applies; it was read in the current directory, as was the metadata `--host` reads to find path dependencies to mirror.
 - Don't copy a remote command's output back when the command failed before creating it on the host. rsync's errors about the missing directory followed, and buried, the host's own error. Outputs that exist, such as those of failed or cancelled campaigns, still come back.
