@@ -765,13 +765,15 @@ fn metadata_read_online_follows_the_trees_cargo_configuration() {
     let directory = tempfile::tempdir().unwrap();
     // `net.offline` in the tree keeps the second attempt offline too, so it fails as the first did, without contacting a registry.
     let tree = configured_tree(directory.path(), "[net]\noffline = true\n");
-    let error = path_dependencies(
-        &crate::config::cargo_program(),
-        &tree,
-        None,
-        &Cancellation::new(),
-    )
-    .unwrap_err();
+    // `CARGO_NET_OFFLINE` would override the tree's configuration, so the test's Cargo runs without it.
+    let cargo = write_executable(
+        &directory.path().join("cargo"),
+        &format!(
+            "#!/bin/sh\nunset CARGO_NET_OFFLINE\nexec '{}' \"$@\"\n",
+            crate::config::cargo_program().display()
+        ),
+    );
+    let error = path_dependencies(&cargo, &tree, None, &Cancellation::new()).unwrap_err();
     let (offline, online) = error.split_once("; online, ").unwrap();
     assert!(offline.starts_with("offline, "), "{error}");
     for attempt in [offline, online] {
