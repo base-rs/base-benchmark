@@ -37,6 +37,8 @@ mod plan;
 #[cfg(feature = "runner")]
 mod prepare;
 #[cfg(feature = "runner")]
+pub mod remote;
+#[cfg(feature = "runner")]
 mod runner;
 #[cfg(feature = "runner")]
 mod summary;

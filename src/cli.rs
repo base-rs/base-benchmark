@@ -5,6 +5,7 @@
 use crate::config::invalid_input;
 use crate::plan::parse_cpus;
 use crate::prepare::Tree;
+use crate::remote::Remote;
 use crate::runner::{Cancellation, summarize_directory};
 use crate::workspace::{PrepareRequest, RunRequest, Workspace};
 use std::io::{self, Write};
@@ -25,6 +26,10 @@ usage: base-benchmark COMMAND [--name value]...
              [--timeout-seconds N] [--lock PATH] [--output DIR] [--decision-rule TEXT] [--idle-host true]
              [--stack-padding false]
   summarize  DIR
+  version
+
+Prepare, run, and smoke also accept --host HOST [--remote-directory DIR] [--remote-program PATH] to run on
+another host over SSH, mirroring local paths there with rsync and copying the output back.
 
 Run, smoke, and summarize print a report on stdout; list and prepare print JSON. Progress goes to stderr.";
 
@@ -46,6 +51,28 @@ fn execute(arguments: Vec<String>, out: &mut dyn Write, errors: &mut dyn Write) 
     let mut arguments = arguments.into_iter();
     let command = arguments.next().unwrap_or_default();
     let mut options = Options::parse(arguments)?;
+    if matches!(command.as_str(), "prepare" | "run" | "smoke") {
+        if let Some(host) = options.take("host")? {
+            let mut remote = Remote::new(host);
+            if let Some(directory) = options.take("remote-directory")? {
+                remote.directory = directory;
+            }
+            remote.program = options.take("remote-program")?;
+            let arguments = std::mem::take(&mut options.positional)
+                .into_iter()
+                .chain(
+                    std::mem::take(&mut options.named)
+                        .into_iter()
+                        .flat_map(|(name, value)| [format!("--{name}"), value]),
+                )
+                .collect();
+            // A termination signal cancels the host's command, whose output is still copied back.
+            let cancellation = Cancellation::new();
+            let _signals = cancellation.on_termination_signals();
+            let outcome = remote.execute(&command, arguments, &cancellation)?;
+            return write!(out, "{}", outcome.stdout);
+        }
+    }
     let cancellation = Cancellation::new();
     match command.as_str() {
         "list" => {
@@ -123,6 +150,7 @@ fn execute(arguments: Vec<String>, out: &mut dyn Write, errors: &mut dyn Write) 
             let campaign = summarize_directory(&PathBuf::from(&options.positional[0]))?;
             write!(out, "{}", campaign.report)
         }
+        "version" | "--version" => writeln!(out, "base-benchmark {}", env!("CARGO_PKG_VERSION")),
         "help" | "--help" | "-h" => writeln!(out, "{USAGE}"),
         _ => Err(invalid_input(format!(
             "unknown command {command:?}\n{USAGE}"

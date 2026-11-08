@@ -750,3 +750,51 @@ fn overlays_need_a_workload_below_the_workspace_root() {
         "{error}"
     );
 }
+
+#[test]
+fn run_outputs_are_made_absolute() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = workspace(&directory.path().join("project"));
+    let prepared = workspace
+        .prepare(
+            PrepareRequest {
+                output: Some(directory.path().join("prepared")),
+                ..PrepareRequest::default()
+            },
+            &Cancellation::new(),
+        )
+        .unwrap();
+    // Workloads start in the workspace root, so a relative output must not be resolved there.
+    let relative = Path::new("target").join(format!("relative-campaign-{}", std::process::id()));
+    // Removed even when an assertion fails, since it is inside the package rather than a temporary directory.
+    struct Removed<'a>(&'a Path);
+    impl Drop for Removed<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0);
+        }
+    }
+    let _removed = Removed(&relative);
+    let campaign = workspace
+        .run(
+            RunRequest {
+                mode: Some(Mode::Smoke),
+                output: Some(relative.clone()),
+                ..request(&prepared.manifest_path, &directory.path().join("lock"))
+            },
+            &Cancellation::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert!(campaign.output.is_absolute());
+    let error = workspace
+        .run(
+            RunRequest {
+                output: Some(std::path::PathBuf::new()),
+                ..request(&prepared.manifest_path, &directory.path().join("lock"))
+            },
+            &Cancellation::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+}

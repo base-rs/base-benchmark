@@ -147,12 +147,13 @@ impl Workspace {
         let suite = self.suite(request.package.as_deref())?;
         let artifacts = ArtifactManifest::read(&request.artifacts)?;
         let mode = request.mode.unwrap_or(Mode::Screening);
-        let output = request.output.unwrap_or_else(|| {
+        // Absolute, since workloads start in the workspace root, where staged executables must still be found.
+        let output = std::path::absolute(request.output.unwrap_or_else(|| {
             default_output(
                 &suite.workspace_root,
                 &format!("{}-{mode}", request.scenario),
             )
-        });
+        }))?;
         let plan = Plan::new(PlanOptions {
             rounds: request.rounds,
             seed: request.seed,
@@ -278,7 +279,7 @@ impl Workspace {
 }
 
 /// A new directory under the workspace's Cargo target directory.
-fn default_output(workspace_root: &Path, name: &str) -> PathBuf {
+pub(crate) fn default_output(workspace_root: &Path, name: &str) -> PathBuf {
     workspace_root
         .join("target")
         .join("base-benchmark")
