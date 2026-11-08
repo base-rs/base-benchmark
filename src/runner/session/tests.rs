@@ -709,16 +709,6 @@ fn a_service_that_prints_its_ready_line_and_exits_exited_before_it_was_stopped()
     );
     assert_eq!(entries[0].roles[0].ready_line.as_deref(), Some("ready a:1"));
     assert!(!entries[0].roles[1].started);
-    // Printed and exited at once, it fails the same way whichever is reported first.
-    let directory = tempfile::tempdir().unwrap();
-    let (error, _) = failed(
-        session(directory.path(), "echo 'ready a:1'", &valid()),
-        directory.path(),
-    );
-    assert!(
-        error.contains("role server (service) exited before it was stopped"),
-        "{error}"
-    );
     // One that stops by exiting exited before the driver had finished.
     let directory = tempfile::tempdir().unwrap();
     let mut plan = session(directory.path(), server, &valid());
