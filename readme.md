@@ -19,7 +19,7 @@ See [Using the Shared Benchmark Tooling](context/usage.md) for writing a workloa
 
 ## Design and findings
 
-- [Architecture](context/architecture.md) and [requirements](design/architecture.md).
+- [Architecture](context/architecture.md) and [requirements](design/architecture.md), including the agreed, not yet implemented, [multi-process roles](design/roles.md).
 - [`base-html` integration review](reports/base-html-integration.md): what the first migration exposed and what changed.
 - [Organization-wide benchmarking audit](reports/benchmarking-landscape.md), and the [scheduler consumer feedback and response](reports/external-review-response.md).
 - [Investigation records, including rejected attempts](context/investigations.md), with a [template](templates/investigation.md).

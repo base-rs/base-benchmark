@@ -58,11 +58,11 @@ Deferred:
 
 ## Not yet implemented
 
-- Multi-process roles: server/client placement, readiness, endpoint transfer, and final statistics validation. Validate these against scheduler echo and HTTP client/hello before generalizing.
-- Per-role resource sources such as `wait4` lifetime usage and `/proc` interval snapshots.
+- Multi-process roles, specified in [design/roles.md](https://github.com/base-rs/base-benchmark/blob/main/design/roles.md) and delivered in its milestones: services and one driver per sample, ready-line readiness and endpoint transfer, per-role CPU sets with physical-core sharing checks, external program provenance, the driver's window markers with service CPU snapshots and approximate CPU per request (M1); scheduler echo and competitor servers in every round (M2); latency histograms with labelled merged summaries, and base-benchmark-load's fixed-rate mode (M3); profiling and a separate client host (M4). Validate these against scheduler echo and HTTP hello before generalizing.
+- Per-role resource sources beyond the window snapshots in design/roles.md, such as `wait4` lifetime usage of services, which is one of its open questions.
 - Downstream workloads, in another repository, built against each tree through `[patch]` overrides, and revision archives as tree inputs. Callers create trees themselves, for example with `git worktree add`. A workload in the same workspace can be overlaid onto older trees with `--overlay`.
-- Unchanged external comparators as plan subjects alongside variants, a same-binary repeat subject, and predeclared expected-error outcome contracts beyond reporting them as ordinary metrics.
-- Phase-matched hardware counters. `perf stat` totals are whole-process only and are never divided by measured operations. Multiplexing percentages are not checked, and on hybrid CPUs, which report one line per PMU, only the first line is used.
+- A same-binary repeat subject, and predeclared expected-error outcome contracts beyond reporting them as ordinary metrics. Competitors run in every round are specified in design/roles.md.
+- Phase-matched hardware counters. `perf stat` totals are whole-process only and are never divided by measured operations. Multiplexing percentages are not checked, and on hybrid CPUs, which report one line per PMU, only the first line is used. Counters over the driver's window are design/roles.md's M3.
 - Several samples per process exist in the schema, but only single-sample workloads have been exercised. Markdown's batches are the intended test.
 - The longitudinal history and analysis follow-up in [history](history.md), and investigation record generation. The [investigation convention](investigations.md) is documentation only.
 
@@ -77,4 +77,4 @@ Deferred:
 - If writing metadata fails after `summary.json` is written, the summary exists while the campaign is still recorded as `in_progress`.
 - The runner builds on every platform, so a project's task package, such as one that depends on `bake-benchmark`, builds in CI on macOS and Windows. Collecting samples needs Linux: process groups, `waitid` without reaping, and CPU affinity. The host lock and replica copies of symbolic links need Unix. Elsewhere these operations return `Unsupported` errors; listing scenarios, preparing artifacts, and summarizing work. Tests and coverage run only on Linux; CI also checks that the library and command build on macOS and Windows.
 
-Do not invent numeric performance thresholds, portable PMU support, peak-memory guarantees, pooled latency percentiles, automatic revision checkout, or one universal workload trait. Hosted CI validates correctness and failure handling, not performance.
+Do not invent numeric performance thresholds, portable PMU support, peak-memory guarantees, pooled latency percentiles other than the labelled merged histogram that [design/roles.md](https://github.com/base-rs/base-benchmark/blob/main/design/roles.md) requires, automatic revision checkout, or one universal workload trait. Hosted CI validates correctness and failure handling, not performance.

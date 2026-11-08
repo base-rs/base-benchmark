@@ -46,7 +46,7 @@ Tests cover:
 - empty smoke pairs;
 - each interpretation warning.
 
-Test differing workload shapes while keeping oracles project-owned. So far only single-process, single-sample workloads (`base-html`) have been exercised; multi-sample batches and multi-process roles remain to be validated against Markdown and scheduler echo before they are claimed. Test declared performance outcomes separately from invalid, correctness, and completion failures. Failures are tested; declared outcome contracts are not implemented, so nothing yet distinguishes them.
+Test differing workload shapes while keeping oracles project-owned. So far only single-process, single-sample workloads (`base-html`) have been exercised; multi-sample batches remain to be validated against Markdown, and the [multi-process roles](roles.md) against scheduler echo and HTTP hello, before they are claimed. Test declared performance outcomes separately from invalid, correctness, and completion failures. Failures are tested; declared outcome contracts are not implemented, so nothing yet distinguishes them.
 
 The shared coverage task requires every measured source region to be covered.
 
