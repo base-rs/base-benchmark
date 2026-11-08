@@ -52,3 +52,21 @@ fn only_preparation_and_collection_run_remotely() {
         "{error}"
     );
 }
+
+#[test]
+fn path_dependencies_follow_the_trees_cargo_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path().canonicalize().unwrap();
+    // Only Cargo running in the tree finds the vendored dependency that no registry has.
+    let tree = crate::test_support::vendored_tree(&directory);
+    let remote = Remote {
+        local_cargo: crate::test_support::recording_cargo(&directory),
+        ..Remote::new("host")
+    };
+    assert_eq!(remote.path_dependencies(&tree), [directory.join("outside")]);
+    let calls = std::fs::read_to_string(directory.join("recording-cargo.calls")).unwrap();
+    assert!(
+        calls.starts_with(&format!("{} ", tree.display())),
+        "{calls}"
+    );
+}

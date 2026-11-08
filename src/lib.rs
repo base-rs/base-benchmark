@@ -77,8 +77,9 @@ pub use runner::{
 };
 #[cfg(feature = "runner")]
 pub use summary::{
-    Distribution, GENERATOR, MetricSummary, PairMetric, PairSummary, RESOLUTION_FACTOR,
-    SUMMARY_SCHEMA, SUMMARY_VERSION, Statistic, SubjectSummary, Summary, sign_test, summarize,
+    Distribution, GENERATOR, MetricSummary, OverlaidArtifact, PairMetric, PairSummary,
+    RESOLUTION_FACTOR, SUMMARY_SCHEMA, SUMMARY_VERSION, Statistic, SubjectSummary, Summary,
+    sign_test, summarize,
 };
 #[cfg(feature = "runner")]
 pub use workspace::{DEFAULT_TIMEOUT, PrepareRequest, RunRequest, Workspace};

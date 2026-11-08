@@ -2,22 +2,20 @@
 // Copyright, 2026, by Samuel Williams.
 
 use super::*;
-use crate::test_support::suite;
+use crate::test_support::{
+    configured_tree, recording_cargo, suite, vendored_tree, write_executable,
+};
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 
 /// A fake `cargo`: `-Vv` prints a version, `metadata` prints `metadata`, and `build` runs `behavior`, then writes and reports an executable in its target directory.
 fn fake_cargo(directory: &Path, name: &str, behavior: &str, metadata: &str) -> PathBuf {
-    let path = directory.join(name);
-    std::fs::write(
-        &path,
-        format!(
+    write_executable(
+        &directory.join(name),
+        &format!(
             "#!/bin/sh\ncase \"$1\" in -Vv) echo 'cargo fake'; exit 0;; metadata) echo '{metadata}'; exit 0;; esac\nwhile [ $# -gt 0 ]; do case \"$1\" in --target-dir) target=$2; shift;; --manifest-path) manifest=$2; shift;; esac; shift; done\noutput=$(dirname \"$(dirname \"$target\")\")\n{behavior}\nmkdir -p \"$target\"\nprintf 'binary' > \"$target/fixture\"\necho '{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"fixture\",\"kind\":[\"bin\"]}},\"executable\":\"'\"$target/fixture\"'\"}}'\n"
         ),
     )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
 }
 
 fn cargo(directory: &Path) -> PathBuf {
@@ -513,6 +511,225 @@ fn unreadable_metadata_leaves_path_dependencies_unknown() {
         artifacts[1].source.path_dependencies, None,
         "a replica repeats its baseline's"
     );
+}
+
+/// A fake `cargo` whose `metadata` fails offline, as on a host whose Cargo cache lacks packages of other workspace members, and records each `metadata` invocation in `calls`.
+fn cargo_needing_the_network(directory: &Path, name: &str, metadata: &str) -> PathBuf {
+    let cargo = fake_cargo(directory, name, ":", metadata);
+    let calls = directory.join(format!("{name}.calls"));
+    write_executable(
+        &cargo,
+        &std::fs::read_to_string(&cargo).unwrap().replace(
+            "metadata) echo",
+            &format!(
+                "metadata) echo \"$*\" >> '{}'; case \"$*\" in *--offline*) echo 'error: failed to download, offline' >&2; exit 101;; esac; echo",
+                calls.display()
+            ),
+        ),
+    );
+    cargo
+}
+
+#[test]
+fn metadata_that_needs_the_network_is_read_online() {
+    let directory = tempfile::tempdir().unwrap();
+    let dependency = directory.path().join("dependency");
+    std::fs::create_dir(&dependency).unwrap();
+    let base = tree(directory.path(), "base");
+    let metadata = json!({ "packages": [
+        { "name": "dependency", "source": null, "manifest_path": dependency.join("Cargo.toml") },
+    ] });
+    let cargo = cargo_needing_the_network(directory.path(), "cargo", &metadata.to_string());
+    let artifact = prepared(&options(directory.path(), vec![base], cargo))
+        .unwrap()
+        .manifest
+        .artifacts
+        .remove(0);
+    let names: Vec<_> = artifact
+        .source
+        .path_dependencies
+        .unwrap()
+        .into_iter()
+        .map(|dependency| dependency.name)
+        .collect();
+    assert_eq!(names, ["dependency"]);
+    // Offline first, then online, and both locked.
+    let calls = std::fs::read_to_string(directory.path().join("cargo.calls")).unwrap();
+    let calls: Vec<_> = calls.lines().collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[0].contains("--offline"), "{calls:?}");
+    assert!(!calls[1].contains("--offline"), "{calls:?}");
+    assert!(
+        calls.iter().all(|call| call.contains("--locked")),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn unreadable_metadata_reports_cargos_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = tree(directory.path(), "base");
+    // Failing online too, the error is Cargo's, so a warning can say why.
+    let cargo = cargo_needing_the_network(directory.path(), "cargo", "{}");
+    write_executable(
+        &cargo,
+        &std::fs::read_to_string(&cargo)
+            .unwrap()
+            .replace("*--offline*)", "*)"),
+    );
+    let error = path_dependencies(&cargo, &base.path, None, &Cancellation::new()).unwrap_err();
+    // Both attempts' errors, since the offline one may be the informative one.
+    assert!(
+        error.starts_with("offline, cargo metadata failed with"),
+        "{error}"
+    );
+    assert!(
+        error.contains("; online, cargo metadata failed with"),
+        "{error}"
+    );
+    assert_eq!(
+        error.matches("error: failed to download").count(),
+        2,
+        "{error}"
+    );
+    assert!(error.contains("101"), "{error}");
+    // Preparation continues, recording them as unknown.
+    let artifacts = prepared(&options(directory.path(), vec![base.clone()], cargo))
+        .unwrap()
+        .manifest
+        .artifacts;
+    assert_eq!(artifacts[0].source.path_dependencies, None);
+    let error = path_dependencies(
+        Path::new("/nonexistent/cargo"),
+        &base.path,
+        None,
+        &Cancellation::new(),
+    )
+    .unwrap_err();
+    assert!(error.contains("cannot run /nonexistent/cargo"), "{error}");
+    let invalid = fake_cargo(directory.path(), "invalid", ":", "not json");
+    let error = path_dependencies(&invalid, &base.path, None, &Cancellation::new()).unwrap_err();
+    assert!(error.contains("invalid JSON"), "{error}");
+}
+
+#[test]
+fn metadata_is_read_once_per_tree() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut options = options(
+        directory.path(),
+        vec![tree(directory.path(), "base")],
+        cargo_needing_the_network(directory.path(), "cargo", "{}"),
+    );
+    options.replicas = Some(1);
+    options.feature_sets = vec![Vec::new(), vec!["extra".to_owned()]];
+    let artifacts = prepared(&options).unwrap().manifest.artifacts;
+    assert_eq!(artifacts.len(), 4);
+    assert!(
+        artifacts
+            .iter()
+            .all(|artifact| artifact.source.path_dependencies == Some(Vec::new()))
+    );
+    // One offline and one online read for the baseline, whatever its feature sets, and none for its replica.
+    let calls = std::fs::read_to_string(directory.path().join("cargo.calls")).unwrap();
+    assert_eq!(calls.lines().count(), 2, "{calls}");
+}
+
+#[test]
+fn cancelled_preparation_does_not_read_metadata_online() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = tree(directory.path(), "base");
+    let cargo = cargo_needing_the_network(directory.path(), "cargo", "{}");
+    let cancellation = Cancellation::new();
+    cancellation.cancel();
+    let error = path_dependencies(&cargo, &base.path, None, &cancellation).unwrap_err();
+    assert!(error.ends_with("preparation was cancelled"), "{error}");
+    assert!(error.contains("error: failed to download"), "{error}");
+    let calls = std::fs::read_to_string(directory.path().join("cargo.calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "only offline: {calls}");
+}
+
+#[test]
+fn preparation_cancelled_during_a_build_does_not_read_metadata_online() {
+    let directory = tempfile::tempdir().unwrap();
+    let started = directory.path().join("started");
+    let resume = directory.path().join("resume");
+    for fifo in [&started, &resume] {
+        assert!(Command::new("mkfifo").arg(fifo).status().unwrap().success());
+    }
+    let cargo = cargo_needing_the_network(directory.path(), "cargo", "{}");
+    // The build says it has started, then waits until the test has cancelled preparation.
+    write_executable(
+        &cargo,
+        &std::fs::read_to_string(&cargo).unwrap().replace(
+            "\n:\n",
+            &format!(
+                "\necho started > '{}'\nread resumed < '{}'\n",
+                started.display(),
+                resume.display()
+            ),
+        ),
+    );
+    let options = options(
+        directory.path(),
+        vec![tree(directory.path(), "base")],
+        cargo,
+    );
+    let cancellation = Cancellation::new();
+    let preparation = std::thread::spawn({
+        let cancellation = cancellation.clone();
+        move || prepare(&options, &cancellation)
+    });
+    std::fs::read_to_string(&started).unwrap();
+    cancellation.cancel();
+    std::fs::write(&resume, "resumed\n").unwrap();
+    let artifacts = preparation.join().unwrap().unwrap().manifest.artifacts;
+    // The build finished, but its path dependencies are unknown, without a second attempt, or a warning, since no campaign will be recorded.
+    assert_eq!(artifacts[0].source.path_dependencies, None);
+    let calls = std::fs::read_to_string(directory.path().join("cargo.calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "only offline: {calls}");
+}
+
+#[test]
+fn metadata_follows_the_trees_cargo_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path().canonicalize().unwrap();
+    // Source replacement in the tree provides the dependency no registry has, offline.
+    let tree = vendored_tree(&directory);
+    let cargo = recording_cargo(&directory);
+    let dependencies = path_dependencies(&cargo, &tree, None, &Cancellation::new()).unwrap();
+    let names: Vec<_> = dependencies
+        .iter()
+        .map(|dependency| dependency.name.as_str())
+        .collect();
+    assert_eq!(names, ["outside"]);
+    let calls = std::fs::read_to_string(directory.join("recording-cargo.calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "read offline: {calls}");
+    assert!(
+        calls.starts_with(&format!("{} ", tree.display())),
+        "{calls}"
+    );
+}
+
+#[test]
+fn metadata_read_online_follows_the_trees_cargo_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    // `net.offline` in the tree keeps the second attempt offline too, so it fails as the first did, without contacting a registry.
+    let tree = configured_tree(directory.path(), "[net]\noffline = true\n");
+    let error = path_dependencies(
+        &crate::config::cargo_program(),
+        &tree,
+        None,
+        &Cancellation::new(),
+    )
+    .unwrap_err();
+    let (offline, online) = error.split_once("; online, ").unwrap();
+    assert!(offline.starts_with("offline, "), "{error}");
+    for attempt in [offline, online] {
+        assert!(
+            attempt.contains("base-benchmark-absent-fixture") && attempt.contains("offline mode"),
+            "{error}"
+        );
+    }
 }
 
 #[test]

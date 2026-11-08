@@ -8,7 +8,9 @@ use crate::artifact::{
 };
 use crate::config::{Scenario, Suite, Variant};
 use crate::plan::{Mode, Plan, PlanOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub const SHELL: &str = "/bin/sh";
@@ -25,6 +27,21 @@ pub fn script(directory: &Path, name: &str, body: &str) -> PathBuf {
     let path = directory.join(name);
     std::fs::write(&path, body).unwrap();
     path
+}
+
+/// Write an executable script through a child process. Written here, another thread could fork while it is open for writing, and running it would then fail with `ETXTBSY` until that child execs.
+pub fn write_executable(path: &Path, body: &str) -> PathBuf {
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = writer.stdin.take().unwrap();
+    input.write_all(body.as_bytes()).unwrap();
+    drop(input);
+    assert!(writer.wait().unwrap().success());
+    path.to_owned()
 }
 
 pub fn artifact(label: &str, role: ArtifactRole, executable: &Path) -> Artifact {
@@ -109,4 +126,68 @@ pub fn plan(script: &Path, variants: &[&str], roles: &[(&str, ArtifactRole)], lo
     options.lock = lock.to_owned();
     options.timeout = Duration::from_secs(20);
     Plan::new(options).unwrap()
+}
+
+/// A tree with a `.cargo/config.toml`, a registry dependency that no registry has, locked, and a path dependency outside it.
+pub fn configured_tree(directory: &Path, configuration: &str) -> PathBuf {
+    let tree = directory.join("configured");
+    let outside = directory.join("outside");
+    for (path, contents) in [
+        (
+            tree.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"configured\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nbase-benchmark-absent-fixture = \"0.1\"\noutside = {{ path = \"{}\" }}\n",
+                outside.display()
+            ),
+        ),
+        (tree.join("src/lib.rs"), String::new()),
+        (
+            tree.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"base-benchmark-absent-fixture\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\n\n[[package]]\nname = \"configured\"\nversion = \"0.1.0\"\ndependencies = [\n \"base-benchmark-absent-fixture\",\n \"outside\",\n]\n\n[[package]]\nname = \"outside\"\nversion = \"0.1.0\"\n".to_owned(),
+        ),
+        (tree.join(".cargo/config.toml"), configuration.to_owned()),
+        (
+            outside.join("Cargo.toml"),
+            "[package]\nname = \"outside\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_owned(),
+        ),
+        (outside.join("src/lib.rs"), String::new()),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    tree
+}
+
+/// Real Cargo, never with network access, recording the directory and arguments of each call.
+pub fn recording_cargo(directory: &Path) -> PathBuf {
+    write_executable(
+        &directory.join("recording-cargo"),
+        &format!(
+            "#!/bin/sh\necho \"$PWD $*\" >> '{calls}'\nCARGO_NET_OFFLINE=true exec '{cargo}' \"$@\"\n",
+            calls = directory.join("recording-cargo.calls").display(),
+            cargo = crate::config::cargo_program().display(),
+        ),
+    )
+}
+
+/// A configured tree whose `.cargo/config.toml` replaces crates.io with a `vendor` directory that has the dependency no registry has, so only Cargo running in the tree can read its metadata offline.
+pub fn vendored_tree(directory: &Path) -> PathBuf {
+    let tree = configured_tree(
+        directory,
+        "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = \"vendor\"\n",
+    );
+    let vendored = tree.join("vendor/base-benchmark-absent-fixture");
+    std::fs::create_dir_all(vendored.join("src")).unwrap();
+    std::fs::write(
+        vendored.join("Cargo.toml"),
+        "[package]\nname = \"base-benchmark-absent-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(vendored.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        vendored.join(".cargo-checksum.json"),
+        "{\"files\":{},\"package\":\"0000000000000000000000000000000000000000000000000000000000000000\"}",
+    )
+    .unwrap();
+    tree
 }

@@ -1,7 +1,7 @@
 // Released under the MIT License.
 // Copyright, 2026, by Samuel Williams.
 
-use crate::artifact::ArtifactRole;
+use crate::artifact::{ArtifactRole, DependencyIdentity};
 use crate::plan::{Mode, PairKind, Plan};
 use crate::record::{Direction, Measurement, Metric, Phase, Source, Unit};
 use crate::runner::SampleEntry;
@@ -20,8 +20,11 @@ pub const RESOLUTION_FACTOR: f64 = 100.0;
 pub const GENERATOR: &str = concat!("base-benchmark ", env!("CARGO_PKG_VERSION"));
 
 /// Descriptive statistics regenerated from raw samples. It contains no acceptance verdict.
+///
+/// Summaries are produced by [`summarize`] or read from `summary.json`, not constructed by callers, so this, [`SubjectSummary`], [`PairSummary`], [`PairMetric`], and [`OverlaidArtifact`] are `#[non_exhaustive]`: adding a field to them does not break callers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Summary {
     pub schema: String,
     pub version: u32,
@@ -37,12 +40,28 @@ pub struct Summary {
     pub aggregation: String,
     pub subjects: Vec<SubjectSummary>,
     pub pairs: Vec<PairSummary>,
-    /// Interpretation hazards found in this campaign. They describe the evidence; they are not verdicts.
+    /// Interpretation hazards found in this campaign. They describe the evidence; they are not verdicts. Each names every metric with the same hazard in one comparison or subject, and they are ordered by hazard: build layout first, then metric definitions, campaign controls, and metrics that changed in both directions.
     pub warnings: Vec<String>,
+    /// Artifacts built with the current workload package overlaid onto their trees, and what that changed in their lockfiles. Omitted when nothing was overlaid, so summaries of other campaigns are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlays: Vec<OverlaidArtifact>,
+}
+
+/// An artifact whose tree was built with another workload package in place of its own.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct OverlaidArtifact {
+    pub label: String,
+    /// The workload package that replaced the tree's own, with its Git state.
+    pub package: DependencyIdentity,
+    /// Versions the tree locks that the build changed, and added packages that resolved differently from the current workspace.
+    pub lockfile_changes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SubjectSummary {
     pub label: String,
     pub processes: usize,
@@ -109,6 +128,7 @@ impl Distribution {
 /// Per-round comparisons of a candidate with its baseline in the same round.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PairSummary {
     pub baseline: String,
     pub candidate: String,
@@ -118,6 +138,7 @@ pub struct PairSummary {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PairMetric {
     pub name: String,
     pub unit: Unit,
@@ -252,7 +273,7 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
             .or_default()
             .push((entry.round, process_values(entry)));
     }
-    let mut warnings = Vec::new();
+    let mut warnings = Warnings::default();
 
     let subjects = plan
         .subjects
@@ -263,13 +284,13 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
             for (_, values) in processes {
                 for (name, value) in values {
                     if value.conflict {
-                        warnings.push(format!("{}: metric {name} has conflicting definitions within a process and is not summarized", subject.label));
+                        warnings.add(Hazard::Definition, format!("{}: conflicting definitions within a process, so not summarized", subject.label), Some(name.clone()));
                         continue;
                     }
                     let slot = metrics.entry(name.as_str()).or_insert((value, Vec::new(), 0));
                     if !slot.0.compatible(value) {
                         // The first definition is summarized; later processes that redefine the metric are excluded.
-                        warnings.push(format!("{}: metric {name} changes definition between processes; differing processes are excluded", subject.label));
+                        warnings.add(Hazard::Definition, format!("{}: definitions change between processes, so differing processes are excluded", subject.label), Some(name.clone()));
                         continue;
                     }
                     // Describe the metric by a process that measured it.
@@ -345,19 +366,33 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
             }
             for (name, comparison) in &comparisons {
                 if comparison.incompatible > 0 {
-                    warnings.push(format!("{} -> {}: {name} is defined differently by baseline and candidate in {} round(s), which are not compared", pair.baseline, pair.candidate, comparison.incompatible));
+                    warnings.add(Hazard::Definition, format!("{} -> {}: defined differently by baseline and candidate, so those rounds are not compared", pair.baseline, pair.candidate), Some(format!("{name} ({} round(s))", comparison.incompatible)));
                 }
                 if comparison.missing > 0 {
-                    warnings.push(format!("{} -> {}: {name} is missing from the candidate in {} round(s)", pair.baseline, pair.candidate, comparison.missing));
+                    warnings.add(Hazard::Definition, format!("{} -> {}: missing from the candidate", pair.baseline, pair.candidate), Some(format!("{name} ({} round(s))", comparison.missing)));
                 }
             }
             PairSummary { baseline: pair.baseline.clone(), candidate: pair.candidate.clone(), kind: pair.kind, metrics: comparisons.into_values().map(Comparison::into_metric).collect() }
         })
         .collect();
 
-    warnings.extend(interpretation_warnings(plan, &pairs));
-    let mut seen = std::collections::BTreeSet::new();
-    warnings.retain(|warning| seen.insert(warning.clone()));
+    interpretation_warnings(plan, &pairs, &mut warnings);
+    let overlays = plan
+        .artifacts
+        .artifacts
+        .iter()
+        .filter_map(|artifact| {
+            artifact
+                .source
+                .overlay
+                .clone()
+                .map(|package| OverlaidArtifact {
+                    label: artifact.label.clone(),
+                    package,
+                    lockfile_changes: artifact.source.lockfile_changes.clone(),
+                })
+        })
+        .collect();
     Summary {
         schema: SUMMARY_SCHEMA.to_owned(),
         version: SUMMARY_VERSION,
@@ -371,7 +406,60 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
         aggregation: "each process contributes the median of its samples; subject distributions are across processes; pair differences, changes, and better or worse counts are per round, with differences below the measurement quantum counted as ties; there is no same-binary repeat subject, so run-to-run variation appears only as each subject's spread".to_owned(),
         subjects,
         pairs,
-        warnings,
+        warnings: warnings.into_lines(),
+        overlays,
+    }
+}
+
+/// What a warning is about, in the order warnings are reported: build layout first, since it most often reverses a conclusion, and metrics that merely moved both ways last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Hazard {
+    IdenticalReplica,
+    OppositeInReplica,
+    UnresolvedInReplica,
+    WithinReplicas,
+    NoReplicaChange,
+    NoReplica,
+    Definition,
+    Control,
+    Direction,
+}
+
+/// Warnings gathered so that each line names every metric with the same hazard in the same comparison or subject, rather than one line per metric.
+#[derive(Default)]
+struct Warnings(Vec<(Hazard, String, Vec<String>)>);
+
+impl Warnings {
+    /// Add `item`, such as a metric, to the warning that begins with `head`, or add the warning alone.
+    fn add(&mut self, hazard: Hazard, head: String, item: Option<String>) {
+        let index = self
+            .0
+            .iter()
+            .position(|(other, text, _)| *other == hazard && *text == head)
+            .unwrap_or_else(|| {
+                self.0.push((hazard, head, Vec::new()));
+                self.0.len() - 1
+            });
+        let items = &mut self.0[index].2;
+        // Processes repeat a subject's warnings.
+        if let Some(item) = item.filter(|item| !items.contains(item)) {
+            items.push(item);
+        }
+    }
+
+    /// One line per warning, ordered by hazard, and otherwise in the order found.
+    fn into_lines(mut self) -> Vec<String> {
+        self.0.sort_by_key(|(hazard, _, _)| *hazard);
+        self.0
+            .into_iter()
+            .map(|(_, head, items)| {
+                if items.is_empty() {
+                    head
+                } else {
+                    format!("{head}: {}", items.join(", "))
+                }
+            })
+            .collect()
     }
 }
 
@@ -433,13 +521,12 @@ pub fn sign_test(improved: usize, regressed: usize) -> f64 {
 }
 
 /// Hazards that make a comparison weaker than its numbers suggest.
-fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
-    let mut warnings = Vec::new();
+fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary], warnings: &mut Warnings) {
     if plan.mode != Mode::Smoke && plan.cpus.is_empty() {
-        warnings.push("no CPU placement: workload processes may run on different cores or core types between rounds".to_owned());
+        warnings.add(Hazard::Control, "no CPU placement: workload processes may run on different cores or core types between rounds".to_owned(), None);
     }
     if plan.mode != Mode::Smoke && !plan.stack_padding {
-        warnings.push("stack padding disabled: every process of a subject starts with the same stack alignment, which can bias comparisons".to_owned());
+        warnings.add(Hazard::Control, "stack padding disabled: every process of a subject starts with the same stack alignment, which can bias comparisons".to_owned(), None);
     }
     // A replica identical to its baseline measures the same executable again, not build layout.
     let artifacts = &plan.artifacts.artifacts;
@@ -451,10 +538,14 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
             .iter()
             .find(|artifact| Some(&artifact.label) == replica.source.replica_of.as_ref());
         if original.is_some_and(|original| original.sha256 == replica.sha256) {
-            warnings.push(format!(
-                "layout replica {} is byte-identical to its baseline, so it samples run-to-run variation only, not build layout",
-                replica.label
-            ));
+            warnings.add(
+                Hazard::IdenticalReplica,
+                format!(
+                    "layout replica {} is byte-identical to its baseline, so it samples run-to-run variation only, not build layout",
+                    replica.label
+                ),
+                None,
+            );
         }
     }
     let timed = |metric: &&PairMetric| {
@@ -467,16 +558,17 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
             .filter(timed)
             .filter(|metric| metric.improved > 0 && metric.regressed > 0)
         {
-            warnings.push(format!(
-                "{} -> {}: {} changed in both directions (better {}/{}, worse {}/{}); inconclusive",
-                pair.baseline,
-                pair.candidate,
-                metric.name,
-                metric.improved,
-                metric.rounds,
-                metric.regressed,
-                metric.rounds
-            ));
+            warnings.add(
+                Hazard::Direction,
+                format!(
+                    "{} -> {}: changed in both directions, so inconclusive",
+                    pair.baseline, pair.candidate
+                ),
+                Some(format!(
+                    "{} (better {}/{}, worse {}/{})",
+                    metric.name, metric.improved, metric.rounds, metric.regressed, metric.rounds
+                )),
+            );
         }
     }
     for pair in pairs.iter().filter(|pair| pair.kind == PairKind::Build) {
@@ -485,10 +577,14 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
             .filter(|other| other.kind == PairKind::Replica && other.baseline == pair.baseline)
             .collect();
         if replicas.is_empty() {
-            warnings.push(format!(
-                "{} -> {}: no layout replica, so build-layout variation is not controlled",
-                pair.baseline, pair.candidate
-            ));
+            warnings.add(
+                Hazard::NoReplica,
+                format!(
+                    "{} -> {}: no layout replica, so build-layout variation is not controlled",
+                    pair.baseline, pair.candidate
+                ),
+                None,
+            );
             continue;
         }
         for metric in pair.metrics.iter().filter(timed) {
@@ -508,21 +604,30 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
                 continue;
             };
             let Some(bound) = bound else {
-                warnings.push(format!(
-                    "{} -> {}: {} has no resolved layout-replica change to compare with",
-                    pair.baseline, pair.candidate, metric.name
-                ));
+                warnings.add(
+                    Hazard::NoReplicaChange,
+                    format!(
+                        "{} -> {}: no resolved layout-replica change to compare with",
+                        pair.baseline, pair.candidate
+                    ),
+                    Some(metric.name.clone()),
+                );
                 continue;
             };
             if change.median.abs() <= bound {
-                warnings.push(format!(
-                    "{} -> {}: {} median change {:+.2}% is within the layout replicas' range of ±{:.2}%",
-                    pair.baseline,
-                    pair.candidate,
-                    metric.name,
-                    change.median * 100.0,
-                    bound * 100.0
-                ));
+                warnings.add(
+                    Hazard::WithinReplicas,
+                    format!(
+                        "{} -> {}: median change within the layout replicas' range",
+                        pair.baseline, pair.candidate
+                    ),
+                    Some(format!(
+                        "{} {:+.2}% (range ±{:.2}%)",
+                        metric.name,
+                        change.median * 100.0,
+                        bound * 100.0
+                    )),
+                );
             }
         }
     }
@@ -533,7 +638,7 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
         .iter()
         .any(|artifact| artifact.role == ArtifactRole::LayoutReplica);
     if !has_replica && pairs.iter().any(|pair| pair.kind == PairKind::Variant) {
-        warnings.push("no layout replica: variant comparisons inside one executable can depend on its build layout; prepare with --replicas 1 to check".to_owned());
+        warnings.add(Hazard::NoReplica, "no layout replica: variant comparisons inside one executable can depend on its build layout; prepare with --replicas 1 to check".to_owned(), None);
     }
     for replica in plan
         .artifacts
@@ -570,30 +675,38 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
                     .find(|other| other.name == metric.name)
                     .and_then(|other| other.change);
                 let Some(other) = other else {
-                    warnings.push(format!(
-                        "{} -> {}: {} has no resolved comparison in the layout replica {}",
-                        pair.baseline, pair.candidate, metric.name, replica.label
-                    ));
+                    warnings.add(
+                        Hazard::UnresolvedInReplica,
+                        format!(
+                            "{} -> {}: no resolved comparison in the layout replica {}",
+                            pair.baseline, pair.candidate, replica.label
+                        ),
+                        Some(metric.name.clone()),
+                    );
                     continue;
                 };
                 if change.median * other.median < 0.0 {
-                    warnings.push(format!(
-                        "{} -> {}: {} median change {:+.2}% has the opposite sign in the layout replica ({:+.2}%); the conclusion depends on build layout",
-                        pair.baseline,
-                        pair.candidate,
-                        metric.name,
-                        change.median * 100.0,
-                        other.median * 100.0
-                    ));
+                    warnings.add(
+                        Hazard::OppositeInReplica,
+                        format!(
+                            "{} -> {}: median change with the opposite sign in the layout replica {}, so the conclusion depends on build layout",
+                            pair.baseline, pair.candidate, replica.label
+                        ),
+                        Some(format!(
+                            "{} {:+.2}% (replica {:+.2}%)",
+                            metric.name,
+                            change.median * 100.0,
+                            other.median * 100.0
+                        )),
+                    );
                 }
             }
         }
     }
-    warnings
 }
 
 impl Summary {
-    /// A compact text report: evidence class, pair comparisons, subject medians, and warnings. Smoke reports omit pair comparisons.
+    /// A compact text report: evidence class, the overlaid workload package and each overlaid artifact's lockfile changes, pair comparisons, subject medians, and warnings. Smoke reports omit pair comparisons.
     pub fn report(&self) -> String {
         let mut text = String::new();
         let _ = writeln!(text, "{}", self.evidence);
@@ -604,6 +717,52 @@ impl Summary {
         );
         if let Some(rule) = &self.decision_rule {
             let _ = writeln!(text, "decision rule: {rule}");
+        }
+        // Overlaid trees did not build their own workload, and their builds may not have kept the versions they lock.
+        let mut packages: Vec<(&DependencyIdentity, Vec<&str>)> = Vec::new();
+        for overlaid in &self.overlays {
+            match packages
+                .iter_mut()
+                .find(|(package, _)| **package == overlaid.package)
+            {
+                Some((_, labels)) => labels.push(&overlaid.label),
+                None => packages.push((&overlaid.package, vec![&overlaid.label])),
+            }
+        }
+        for (package, labels) in &packages {
+            let revision = package
+                .revision
+                .as_deref()
+                .map_or("unknown revision", |revision| {
+                    revision.get(..12).unwrap_or(revision)
+                });
+            let state = match package.dirty {
+                Some(false) => "",
+                Some(true) => ", modified",
+                None => ", state unknown",
+            };
+            let _ = writeln!(
+                text,
+                "overlaid workload {} ({revision}{state}) onto {}",
+                package.name,
+                labels.join(", ")
+            );
+        }
+        let changed: Vec<_> = self
+            .overlays
+            .iter()
+            .filter(|overlaid| !overlaid.lockfile_changes.is_empty())
+            .collect();
+        for overlaid in &changed {
+            let _ = writeln!(
+                text,
+                "lockfile changes in {}: {}",
+                overlaid.label,
+                overlaid.lockfile_changes.join(", ")
+            );
+        }
+        if changed.is_empty() && !packages.is_empty() {
+            let _ = writeln!(text, "overlaid builds kept every locked version");
         }
         if self.mode == Mode::Smoke {
             let _ = writeln!(text, "pair comparisons are omitted from smoke reports");

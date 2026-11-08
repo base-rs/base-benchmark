@@ -385,10 +385,31 @@ fn build_feature_sets(
             };
             build.run(options, source.clone(), cancellation)
         })
-        .collect();
+        .collect::<io::Result<Vec<_>>>();
     // The frozen copies are all that collection uses; the build directory is only disk space.
     let _ = std::fs::remove_dir_all(&target);
-    artifacts
+    let mut artifacts = artifacts?;
+    // Path dependencies are the tree's, whatever its features, so they are read once, after its builds have fetched what they need. A replica repeats its baseline's.
+    if role != ArtifactRole::LayoutReplica {
+        let platform = artifacts
+            .first()
+            .and_then(|artifact| host(&artifact.build.toolchain));
+        let dependencies = path_dependencies(&options.cargo, tree, platform, cancellation)
+            .map_err(|error| {
+                // Recorded mode refuses unknown path dependencies, so say why now rather than when a campaign is refused. A cancelled preparation records no campaign.
+                if !cancellation.is_cancelled() {
+                    eprintln!(
+                        "base-benchmark: warning: {label}: cannot read the Cargo metadata of {}, so its path dependencies are unknown and recorded campaigns will refuse it: {error}",
+                        tree.display()
+                    );
+                }
+            })
+            .ok();
+        for artifact in &mut artifacts {
+            artifact.source.path_dependencies = dependencies.clone();
+        }
+    }
+    Ok(artifacts)
 }
 
 /// One build of a tree with one feature set.
@@ -519,9 +540,6 @@ impl Build<'_> {
             })
         };
         let toolchain = version(&options.rustc)?;
-        if role != ArtifactRole::LayoutReplica {
-            source.path_dependencies = path_dependencies(&options.cargo, tree, host(&toolchain));
-        }
         Ok(Artifact {
             label: label.to_owned(),
             role,
@@ -768,30 +786,38 @@ pub(crate) fn configuration_files(
         .collect()
 }
 
-/// Path dependencies outside `tree`, each with its Git state, or `None` when Cargo metadata cannot be read.
+/// Path dependencies outside `tree`, each with its Git state, or Cargo's errors when its metadata cannot be read.
 ///
-/// Metadata is filtered to the host platform when it is known, so it needs no packages beyond those a host build can use.
+/// Metadata is filtered to the host platform when it is known, so it needs no packages beyond those a host build can use. It is read in the tree, as a build is, so the tree's Cargo configuration, such as source replacement or `net.offline`, applies. It is read offline first, and, if that fails, again with network access, still locked, unless preparation was cancelled: building one package downloads only what that package needs, so on a host with a fresh Cargo cache the workspace's other members can need packages that are not downloaded.
 fn path_dependencies(
     cargo: &Path,
     tree: &Path,
     host: Option<&str>,
-) -> Option<Vec<DependencyIdentity>> {
-    let mut command = Command::new(cargo);
-    command
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--locked",
-            "--offline",
-            "--manifest-path",
-        ])
-        .arg(tree.join("Cargo.toml"));
-    if let Some(host) = host {
-        command.args(["--filter-platform", host]);
-    }
-    let metadata =
-        capture(&mut command).and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+    cancellation: &Cancellation,
+) -> Result<Vec<DependencyIdentity>, String> {
+    let metadata = |offline: bool| {
+        let mut command = Command::new(cargo);
+        command.args(["metadata", "--format-version", "1", "--locked"]);
+        if offline {
+            command.arg("--offline");
+        }
+        command.arg("--manifest-path").arg(tree.join("Cargo.toml"));
+        if let Some(host) = host {
+            command.args(["--filter-platform", host]);
+        }
+        cargo_metadata(command.current_dir(tree))
+    };
+    let metadata = metadata(true).or_else(|offline| {
+        if cancellation.is_cancelled() {
+            return Err(format!("offline, {offline}; preparation was cancelled"));
+        }
+        // Fetching can take a while, so it should not be a silent pause.
+        eprintln!(
+            "base-benchmark: reading the Cargo metadata of {} with network access, since reading it offline failed",
+            tree.display()
+        );
+        metadata(false).map_err(|online| format!("offline, {offline}; online, {online}"))
+    })?;
     let dependencies = external_path_packages(&metadata, tree)
         .into_iter()
         .map(|(name, path)| DependencyIdentity {
@@ -801,7 +827,26 @@ fn path_dependencies(
             path,
         })
         .collect();
-    Some(dependencies)
+    Ok(dependencies)
+}
+
+/// Run `cargo metadata` and parse its output, or describe why that failed, with Cargo's own error.
+fn cargo_metadata(command: &mut Command) -> Result<Value, String> {
+    let output = command.stdin(Stdio::null()).output().map_err(|error| {
+        format!(
+            "cannot run {}: {error}",
+            Path::new(command.get_program()).display()
+        )
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("cargo metadata printed invalid JSON: {error}"))
 }
 
 /// The host target triple from `rustc -Vv`.
