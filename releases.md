@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Chain a rustc wrapper set in Cargo configuration, such as a global sccache in `~/.cargo/config.toml`, when salting layout replicas, instead of refusing to prepare them. The wrapper is found as Cargo finds it: the environment, then `build.rustc-wrapper` in the configuration nearest the tree, then `$CARGO_HOME`'s, with configured paths resolved as Cargo resolves them.
+- Chain a rustc wrapper set in Cargo configuration, such as a global sccache in `~/.cargo/config.toml`, when salting layout replicas, instead of refusing to prepare them. The wrapper is found as Cargo finds it: the environment, then `build.rustc-wrapper` in the configuration nearest the tree, then `$CARGO_HOME`'s, including files they `include`, with relative paths resolved as Cargo resolves them. An empty `$CARGO_HOME` counts as unset, and a relative one is relative to the tree, as for Cargo. Invalid configuration files are reported with their parse location.
 
 ## v0.2.0
 

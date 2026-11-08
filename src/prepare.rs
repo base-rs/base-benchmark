@@ -465,7 +465,11 @@ impl Build<'_> {
             .stderr(Stdio::inherit());
         let configuration = configuration_files(
             tree,
-            cargo_home(std::env::var_os("CARGO_HOME"), std::env::var_os("HOME")),
+            cargo_home(
+                std::env::var_os("CARGO_HOME"),
+                std::env::var_os("HOME"),
+                tree,
+            ),
         );
         let salted = salt.as_ref().map_or(Ok(()), |salt| {
             existing_wrapper(
@@ -474,6 +478,7 @@ impl Build<'_> {
                     std::env::var_os("CARGO_BUILD_RUSTC_WRAPPER"),
                 ],
                 &configuration,
+                tree,
             )
             .and_then(|existing| salt_crates(&mut cargo, target, salt, existing))
         });
@@ -536,15 +541,20 @@ impl Build<'_> {
     }
 }
 
-/// The rustc wrapper a build of a tree would use, which the salting wrapper must run in turn, by Cargo's precedence: `RUSTC_WRAPPER`, then `CARGO_BUILD_RUSTC_WRAPPER`, then `build.rustc-wrapper` in the first of `configuration`, the tree's Cargo configuration files from the nearest to `$CARGO_HOME`'s, that sets it. An empty value means none.
+/// The rustc wrapper a build of `tree` would use, which the salting wrapper must run in turn, by Cargo's precedence: `RUSTC_WRAPPER`, then `CARGO_BUILD_RUSTC_WRAPPER`, then `build.rustc-wrapper` in the first of `configuration`, the tree's Cargo configuration files from the nearest to `$CARGO_HOME`'s, that sets it, itself or through the files it includes. An empty value means none.
 ///
-/// A configured path containing `/` is relative to the directory that holds the `.cargo` directory, as Cargo resolves it; a bare program name is found on `PATH` when it runs.
+/// Paths containing `/` are resolved as Cargo resolves them: from the environment, against the tree, where Cargo runs; from a file, against the directory that holds its `.cargo` directory. A bare program name is found on `PATH` when it runs. As for Cargo, an environment value that is not UTF-8 is ignored.
 pub(crate) fn existing_wrapper(
     environment: [Option<std::ffi::OsString>; 2],
     configuration: &[ConfigurationFile],
+    tree: &Path,
 ) -> io::Result<Option<std::ffi::OsString>> {
-    if let Some(value) = environment.into_iter().flatten().next() {
-        return Ok(Some(value).filter(|value| !value.is_empty()));
+    if let Some(value) = environment
+        .iter()
+        .flatten()
+        .find_map(|value| value.to_str())
+    {
+        return Ok(wrapper_path(value, tree));
     }
     for file in configuration {
         // Cargo reads only `config` from a directory that also has `config.toml`.
@@ -555,36 +565,83 @@ pub(crate) fn existing_wrapper(
         if shadowed {
             continue;
         }
-        if let Some(wrapper) = configured_wrapper(&file.path)? {
+        if let Some(wrapper) = configured_wrapper(&file.path, &mut Vec::new())? {
             return Ok(wrapper);
         }
     }
     Ok(None)
 }
 
-/// `build.rustc-wrapper` in one Cargo configuration file: `None` when the file does not set it, otherwise the wrapper, or `Some(None)` for an empty value.
-fn configured_wrapper(path: &Path) -> io::Result<Option<Option<std::ffi::OsString>>> {
+/// A wrapper as a program to run: none when empty, a path containing `/` joined to `base`, or a bare program name.
+fn wrapper_path(value: &str, base: &Path) -> Option<std::ffi::OsString> {
+    match value {
+        "" => None,
+        value if value.contains('/') => Some(base.join(value).into_os_string()),
+        value => Some(value.into()),
+    }
+}
+
+/// `build.rustc-wrapper` set by one Cargo configuration file, or by the files it includes: `None` when none sets it, otherwise the wrapper, or `Some(None)` for an empty value.
+///
+/// As for Cargo, the file's own value wins over the files it includes, and a later include over an earlier one. Includes are relative to the including file; a missing optional include is skipped. `including` holds the files that include this one, to report a cycle.
+fn configured_wrapper(
+    path: &Path,
+    including: &mut Vec<PathBuf>,
+) -> io::Result<Option<Option<std::ffi::OsString>>> {
     let invalid = |reason: String| invalid_input(format!("{}: {reason}", path.display()));
+    if including.iter().any(|other| other == path) {
+        return Err(invalid("includes itself".to_owned()));
+    }
     let table: toml::Table = std::fs::read_to_string(path)
         .map_err(|error| invalid(error.to_string()))?
         .parse()
-        .map_err(|error: toml::de::Error| invalid(error.message().to_owned()))?;
-    let Some(value) = table
-        .get("build")
-        .and_then(|build| build.get("rustc-wrapper"))
-    else {
-        return Ok(None);
+        .map_err(|error: toml::de::Error| invalid(error.to_string()))?;
+    let wrapper = match table.get("build") {
+        Some(toml::Value::Table(build)) => build.get("rustc-wrapper"),
+        Some(_) => return Err(invalid("build must be a table".to_owned())),
+        None => None,
     };
-    let wrapper = value
-        .as_str()
-        .ok_or_else(|| invalid("build.rustc-wrapper must be a string".to_owned()))?;
-    // The file is `DIRECTORY/.cargo/config.toml`, or `$CARGO_HOME/config.toml`; paths are relative to DIRECTORY, or to `$CARGO_HOME`'s parent.
-    let base = path.ancestors().nth(2).unwrap_or(Path::new("/"));
-    Ok(Some(match wrapper {
-        "" => None,
-        wrapper if wrapper.contains('/') => Some(base.join(wrapper).into_os_string()),
-        wrapper => Some(wrapper.into()),
-    }))
+    if let Some(wrapper) = wrapper {
+        let wrapper = wrapper
+            .as_str()
+            .ok_or_else(|| invalid("build.rustc-wrapper must be a string".to_owned()))?;
+        // The file is `DIRECTORY/.cargo/config.toml`, or `$CARGO_HOME/config.toml`; paths are relative to DIRECTORY, or to `$CARGO_HOME`'s parent.
+        let base = path.ancestors().nth(2).unwrap_or(Path::new("/"));
+        return Ok(Some(wrapper_path(wrapper, base)));
+    }
+    let includes = match table.get("include") {
+        Some(toml::Value::Array(includes)) => includes.as_slice(),
+        Some(_) => return Err(invalid("include must be an array".to_owned())),
+        None => &[],
+    };
+    let directory = path.parent().unwrap_or(Path::new("/"));
+    including.push(path.to_owned());
+    for include in includes.iter().rev() {
+        let (included, optional) = match include {
+            toml::Value::String(included) => (included.as_str(), false),
+            toml::Value::Table(include) => match (include.get("path"), include.get("optional")) {
+                (Some(toml::Value::String(included)), None) => (included.as_str(), false),
+                (Some(toml::Value::String(included)), Some(toml::Value::Boolean(optional))) => {
+                    (included.as_str(), *optional)
+                }
+                _ => {
+                    return Err(invalid(
+                        "an include needs a string path and a boolean optional".to_owned(),
+                    ));
+                }
+            },
+            _ => return Err(invalid("an include must be a path or a table".to_owned())),
+        };
+        let included = directory.join(included);
+        if optional && !included.exists() {
+            continue;
+        }
+        if let Some(wrapper) = configured_wrapper(&included, including)? {
+            return Ok(Some(wrapper));
+        }
+    }
+    including.pop();
+    Ok(None)
 }
 
 /// Build every crate with `-C metadata=SALT` added, through a `RUSTC_WRAPPER` script that runs `existing`, the wrapper the build would otherwise use, in turn. `RUSTFLAGS` and Cargo configuration are untouched.
@@ -750,13 +807,15 @@ pub(crate) fn host(toolchain: &str) -> Option<&str> {
         .find_map(|line| line.strip_prefix("host: "))
 }
 
-/// Cargo's home directory: `$CARGO_HOME`, or `.cargo` in the home directory.
+/// Cargo's home directory for a build in `tree`: `$CARGO_HOME`, relative to the tree, where Cargo runs, or `.cargo` in the home directory. An empty `$CARGO_HOME` counts as unset, as it does for Cargo.
 pub(crate) fn cargo_home(
     cargo_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
+    tree: &Path,
 ) -> Option<PathBuf> {
     cargo_home
-        .map(PathBuf::from)
+        .filter(|cargo_home| !cargo_home.is_empty())
+        .map(|cargo_home| tree.join(cargo_home))
         .or_else(|| home.map(|home| PathBuf::from(home).join(".cargo")))
 }
 
