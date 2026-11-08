@@ -12,7 +12,7 @@ use super::{Collection, RoleEntry, SampleEntry, cancelled};
 use crate::plan::{PlannedRole, Subject};
 use crate::record::invalid;
 use crate::role::{Pattern, RoleKind, RoleProgram, Stop, substitute};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
@@ -574,7 +574,7 @@ fn read_ready(
     role: usize,
     events: &Sender<Event>,
 ) -> Vec<u8> {
-    let mut tail = Vec::new();
+    let mut tail = VecDeque::new();
     let mut line = Vec::new();
     let mut buffer = [0; 8192];
     loop {
@@ -582,7 +582,7 @@ fn read_ready(
         if count == 0 {
             keep(&mut tail, &line);
             let _ = events.send(Event::Unready { role });
-            return tail;
+            return tail.into();
         }
         let mut chunk = &buffer[..count];
         while let Some(newline) = chunk.iter().position(|byte| *byte == b'\n') {
@@ -599,7 +599,7 @@ fn read_ready(
                     captures,
                 });
                 let _ = io::copy(&mut reader, &mut io::sink());
-                return tail;
+                return tail.into();
             }
             line.push(b'\n');
             keep(&mut tail, &line);
@@ -615,9 +615,9 @@ fn extend(line: &mut Vec<u8>, bytes: &[u8]) {
     line.extend_from_slice(&bytes[..bytes.len().min(room)]);
 }
 
-/// Append to the retained end of the output.
-fn keep(tail: &mut Vec<u8>, bytes: &[u8]) {
-    tail.extend_from_slice(bytes);
+/// Append to the retained end of the output, in time proportional to the bytes appended once the limit is reached.
+fn keep(tail: &mut VecDeque<u8>, bytes: &[u8]) {
+    tail.extend(bytes);
     if tail.len() > STDERR_LIMIT {
         tail.drain(..tail.len() - STDERR_LIMIT);
     }
