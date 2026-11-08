@@ -5,7 +5,7 @@
 
 mod support;
 
-use base_benchmark::{CampaignStatus, read_metadata};
+use base_benchmark::{CampaignStatus, read_entries, read_metadata};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -185,13 +185,14 @@ fn signal(child: &Child, signal: nix::sys::signal::Signal) {
 fn the_binary_stops_and_records_cancelled_campaigns_on_sigterm() {
     let directory = tempfile::tempdir().unwrap();
     let (child, campaign) = waiting_campaign(directory.path(), "slow");
-    let started = Instant::now();
     signal(&child, nix::sys::signal::Signal::SIGTERM);
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(1));
+    // A slow workload that was not killed would finish, and its sample would be journaled without an error.
+    let entries = read_entries(&campaign.join("samples.jsonl")).unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "the slow workload was not killed"
+        entries.iter().all(|entry| entry.error.is_some()),
+        "the slow workload was not killed: {entries:?}"
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("stopping the campaign"));
     assert_eq!(

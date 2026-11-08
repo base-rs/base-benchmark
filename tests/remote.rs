@@ -604,7 +604,7 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
     assert!(source.revision.is_some(), "{source:?}");
     assert_eq!(source.dirty, Some(false), "{source:?}");
 
-    // Cancelling stops the host's command, and what it wrote still comes back.
+    // Cancelling stops the host's command, and what it wrote still comes back: its TERM trap writes the status, which waiting for its sleep would not.
     let stopped = directory.path().join("stopped");
     let slow = script(
         &directory.path().join("slow"),
@@ -635,7 +635,6 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
             cancellation.cancel();
         })
     };
-    let begun = std::time::Instant::now();
     let run = arguments(&[
         "work",
         "--manifest-path",
@@ -648,7 +647,6 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
     let error = slow.execute("run", run.clone(), &cancellation).unwrap_err();
     canceller.join().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-    assert!(begun.elapsed() < std::time::Duration::from_secs(20));
     assert_eq!(
         std::fs::read_to_string(stopped.join("status")).unwrap(),
         "stopped\n"
