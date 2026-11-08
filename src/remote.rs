@@ -259,6 +259,8 @@ impl Remote {
                 "--manifest-path",
             ])
             .arg(tree.join("Cargo.toml"))
+            // In the tree, as a build is, so that its Cargo configuration applies.
+            .current_dir(tree)
             .stderr(Stdio::null())
             .output()
             .ok()

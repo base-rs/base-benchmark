@@ -89,7 +89,7 @@ Recorded runs require:
 
 All unmet prerequisites are reported together.
 
-Preparation finds out-of-tree path dependencies with `cargo metadata`: offline, then, if that fails, with network access, since a fresh Cargo cache lacks packages that only other workspace members need. If it still cannot read them, it warns, with Cargo's error, and records them as unknown, which recorded runs refuse.
+Preparation finds out-of-tree path dependencies with `cargo metadata`, once per tree, run in the tree so that its Cargo configuration applies: offline, then, if that fails, with network access, which it says first, since a fresh Cargo cache lacks packages that only other workspace members need. If it still cannot read them, it warns, with Cargo's errors from both attempts, and records them as unknown, which recorded runs refuse. A cancelled preparation does not try again with network access.
 
 Progress and the human report go to stderr; Bake's result is a compact JSON object with the campaign directory, `summary.json` path, evidence class, and warnings.
 
