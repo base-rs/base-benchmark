@@ -522,15 +522,25 @@ fn hosts_and_cargo_homes_are_resolved() {
         Some("x86_64-unknown-linux-gnu")
     );
     assert_eq!(host("-Vv"), None);
+    let tree = Path::new("/tree");
     assert_eq!(
-        cargo_home(Some("/cargo".into()), Some("/home".into())),
+        cargo_home(Some("/cargo".into()), Some("/home".into()), tree),
         Some(PathBuf::from("/cargo"))
     );
+    // A relative `$CARGO_HOME` is relative to the tree, where Cargo runs, and an empty one is unset.
     assert_eq!(
-        cargo_home(None, Some("/home".into())),
+        cargo_home(Some("cargo".into()), None, tree),
+        Some(PathBuf::from("/tree/cargo"))
+    );
+    assert_eq!(
+        cargo_home(Some("".into()), Some("/home".into()), tree),
         Some(PathBuf::from("/home/.cargo"))
     );
-    assert_eq!(cargo_home(None, None), None);
+    assert_eq!(
+        cargo_home(None, Some("/home".into()), tree),
+        Some(PathBuf::from("/home/.cargo"))
+    );
+    assert_eq!(cargo_home(None, None, tree), None);
 }
 
 #[test]
@@ -717,81 +727,235 @@ fn layout_salt_wrappers_add_the_salt_after_any_existing_wrapper() {
 }
 
 #[test]
-fn salting_chains_the_environment_wrapper_and_refuses_a_configured_one() {
+fn wrappers_follow_cargos_precedence_and_paths() {
     let directory = tempfile::tempdir().unwrap();
+    let tree = directory.path().join("project");
     let os = |value: &str| Some(std::ffi::OsString::from(value));
     assert_eq!(
-        existing_wrapper([os("sccache"), os("other")], &[]).unwrap(),
+        existing_wrapper([os("sccache"), os("other")], &[], &tree).unwrap(),
         os("sccache")
     );
     assert_eq!(
-        existing_wrapper([None, os("other")], &[]).unwrap(),
+        existing_wrapper([None, os("other")], &[], &tree).unwrap(),
         os("other")
     );
-    // An empty value means no wrapper, also overriding configuration.
-    let configured = directory.path().join("config.toml");
-    std::fs::write(&configured, "[build]\nrustc-wrapper = \"sccache\"\n").unwrap();
-    let files = [ConfigurationFile {
-        path: configured.clone(),
+    let nearest = directory.path().join("project/.cargo");
+    let home = directory.path().join("home/.cargo");
+    std::fs::create_dir_all(&nearest).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let file = |path: PathBuf| ConfigurationFile {
+        path,
         sha256: String::new(),
-    }];
-    assert_eq!(existing_wrapper([os(""), None], &files).unwrap(), None);
-    let error = existing_wrapper([None, None], &files).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("set RUSTC_WRAPPER in the environment instead"),
-        "{error}"
+    };
+    let files = [
+        file(nearest.join("config.toml")),
+        file(home.join("config.toml")),
+    ];
+    let write = |path: &Path, text: &str| std::fs::write(path, text).unwrap();
+    write(
+        &home.join("config.toml"),
+        "[build]\nrustc-wrapper = \"sccache\"\n",
     );
-    std::fs::write(&configured, "build.rustc-wrapper=\"sccache\"\n").unwrap();
-    assert!(existing_wrapper([None, None], &files).is_err());
+    // The nearest file that sets the wrapper wins; one that does not defers to the next.
+    write(
+        &nearest.join("config.toml"),
+        "[build]\njobs = 4 # rustc-wrapper = \"x\"\n",
+    );
+    assert_eq!(
+        existing_wrapper([None, None], &files, &tree).unwrap(),
+        os("sccache")
+    );
+    // Without a file that sets it, there is no wrapper.
+    assert_eq!(
+        existing_wrapper([None, None], &files[..1], &tree).unwrap(),
+        None
+    );
+    // A path from the environment is relative to the tree, where Cargo runs; a value that is not UTF-8 is ignored, as Cargo ignores it.
+    assert_eq!(
+        existing_wrapper([os("bin/wrap"), None], &files, &tree).unwrap(),
+        Some(tree.join("bin/wrap").into_os_string())
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = Some(std::ffi::OsString::from_vec(vec![0xff]));
+        assert_eq!(
+            existing_wrapper([invalid, os("other")], &files, &tree).unwrap(),
+            os("other")
+        );
+    }
+    // An empty value in the environment overrides every configuration.
+    assert_eq!(
+        existing_wrapper([os(""), None], &files, &tree).unwrap(),
+        None
+    );
+    // A path with a slash is relative to the directory holding `.cargo`; every TOML spelling of the key counts.
+    let relative = directory.path().join("project/bin/wrap").into_os_string();
     for spelling in [
-        "build = { rustc-wrapper = \"sccache\" }\n",
-        "[build]\n\"rustc-wrapper\" = \"sccache\"\n",
-        "build = { jobs = 4, rustc-wrapper=\"sccache\" }\n",
-        "[build]\nrustc-wrapper = \"/opt/#tools/sccache\" # a comment\n",
+        "[build]\nrustc-wrapper = \"bin/wrap\"\n",
+        "build.rustc-wrapper = \"bin/wrap\"\n",
+        "build = { jobs = 4, rustc-wrapper = \"bin/wrap\" }\n",
+        "[build]\n\"rustc-wrapper\" = \"bin/wrap\" # a comment\n",
     ] {
-        std::fs::write(&configured, spelling).unwrap();
-        assert!(
-            existing_wrapper([None, None], &files).is_err(),
+        write(&nearest.join("config.toml"), spelling);
+        assert_eq!(
+            existing_wrapper([None, None], &files, &tree).unwrap(),
+            Some(relative.clone()),
             "{spelling}"
         );
     }
-    std::fs::write(
-        &configured,
-        "[build]\nrustc-workspace-wrapper = \"x\"\nrustc-wrapperish = 1\nmy-rustc-wrapper = 2\n# rustc-wrapper = \"sccache\"\njobs = 4 # rustc-wrapper = \"sccache\" would be faster\n",
-    )
-    .unwrap();
-    assert_eq!(existing_wrapper([None, None], &files).unwrap(), None);
+    write(
+        &nearest.join("config.toml"),
+        "[build]\nrustc-wrapper = \"/opt/#tools/wrap\"\n",
+    );
+    assert_eq!(
+        existing_wrapper([None, None], &files, &tree).unwrap(),
+        os("/opt/#tools/wrap")
+    );
+    // An empty configured value overrides the files after it.
+    write(
+        &nearest.join("config.toml"),
+        "[build]\nrustc-wrapper = \"\"\n",
+    );
+    assert_eq!(existing_wrapper([None, None], &files, &tree).unwrap(), None);
+    // Cargo reads `config` instead of a `config.toml` beside it.
+    write(&nearest.join("config"), "[build]\njobs = 2\n");
+    let shadowed = [
+        file(nearest.join("config.toml")),
+        file(nearest.join("config")),
+        file(home.join("config.toml")),
+    ];
+    assert_eq!(
+        existing_wrapper([None, None], &shadowed, &tree).unwrap(),
+        os("sccache")
+    );
+    // Files Cargo could not read are errors that name them.
+    for (text, message) in [
+        ("[build\n", "config.toml"),
+        (
+            "[build]\nrustc-wrapper = 3\n",
+            "build.rustc-wrapper must be a string",
+        ),
+    ] {
+        write(&nearest.join("config.toml"), text);
+        let error = existing_wrapper([None, None], &files, &tree)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(message), "{message}: {error}");
+    }
+    let unreadable = [file(directory.path().to_owned())];
+    assert!(existing_wrapper([None, None], &unreadable, &tree).is_err());
 }
 
 #[test]
-fn replicas_are_not_salted_over_a_configured_wrapper() {
+fn replicas_chain_a_configured_wrapper() {
     let directory = tempfile::tempdir().unwrap();
     let tree = tree(directory.path(), "t");
     std::fs::create_dir_all(tree.path.join(".cargo")).unwrap();
     std::fs::write(
         tree.path.join(".cargo/config.toml"),
-        "[build]\nrustc-wrapper = \"sccache\"\n",
+        "[build]\nrustc-wrapper = \"configured-wrapper\"\n",
     )
     .unwrap();
-    let mut options = options(directory.path(), vec![tree], cargo(directory.path()));
+    // The replica's build keeps a copy of the salting script it was given.
+    let cargo = fake_cargo(
+        directory.path(),
+        "copying-cargo",
+        "case \"$manifest\" in *replica*) cp \"$RUSTC_WRAPPER\" \"$output/salting\";; esac",
+        "{}",
+    );
+    let mut options = options(directory.path(), vec![tree], cargo);
     options.replicas = Some(1);
-    // A wrapper in the environment, as `cargo llvm-cov` sets, takes precedence over the configured one, which then never runs.
-    let wrapped = ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"]
+    prepared(&options).unwrap();
+    let script = std::fs::read_to_string(directory.path().join("prepared/salting")).unwrap();
+    // A wrapper in the environment, as `cargo llvm-cov` sets, takes precedence over the configured one, as it does for Cargo.
+    let expected = ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"]
         .iter()
-        .any(|name| std::env::var_os(name).is_some());
-    let result = prepared(&options)
-        .map(drop)
-        .map_err(|error| error.to_string());
-    if wrapped {
-        assert_eq!(result, Ok(()));
-    } else {
-        assert!(
-            result
-                .as_ref()
-                .is_err_and(|error| error.contains("sets build.rustc-wrapper")),
-            "{result:?}"
-        );
+        .find_map(|name| std::env::var(name).ok())
+        .unwrap_or_else(|| "configured-wrapper".to_owned());
+    assert!(
+        script.contains(&format!("exec '{expected}' \"$@\" -C metadata=")),
+        "{script}"
+    );
+}
+
+#[test]
+fn included_configuration_sets_wrappers_as_cargo_includes_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home/.cargo");
+    std::fs::create_dir_all(&home).unwrap();
+    let config = home.join("config.toml");
+    let files = [ConfigurationFile {
+        path: config.clone(),
+        sha256: String::new(),
+    }];
+    let write = |name: &str, text: &str| std::fs::write(home.join(name), text).unwrap();
+    let wrapper = || existing_wrapper([None, None], &files, directory.path());
+    let found = |name: &str| Some(std::ffi::OsString::from(name));
+    // A path in an included file is relative to the directory holding its directory, here the home directory.
+    write("config.toml", "include = [\"sccache.toml\"]\n");
+    write("sccache.toml", "[build]\nrustc-wrapper = \"bin/wrap\"\n");
+    assert_eq!(
+        wrapper().unwrap(),
+        Some(directory.path().join("home/bin/wrap").into_os_string())
+    );
+    // The including file's own value wins, and a later include over an earlier one.
+    write("a.toml", "build.rustc-wrapper = \"a\"\n");
+    write("b.toml", "build.rustc-wrapper = \"b\"\n");
+    write(
+        "config.toml",
+        "include = [\"a.toml\", \"b.toml\"]\nbuild.rustc-wrapper = \"own\"\n",
+    );
+    assert_eq!(wrapper().unwrap(), found("own"));
+    write("config.toml", "include = [\"a.toml\", \"b.toml\"]\n");
+    assert_eq!(wrapper().unwrap(), found("b"));
+    // An include that does not set it defers to the one before; includes nest; missing optional ones are skipped.
+    write(
+        "b.toml",
+        "include = [{ path = \"c.toml\", optional = false }]\n",
+    );
+    write("c.toml", "[build]\njobs = 1\n");
+    write(
+        "config.toml",
+        "include = [\"a.toml\", \"b.toml\", { path = \"missing.toml\", optional = true }]\n",
+    );
+    assert_eq!(wrapper().unwrap(), found("a"));
+    write("c.toml", "build.rustc-wrapper = \"c\"\n");
+    assert_eq!(wrapper().unwrap(), found("c"));
+    write("config.toml", "include = [{ path = \"a.toml\" }]\n");
+    assert_eq!(wrapper().unwrap(), found("a"));
+    // `..` in an include is normalized, so a relative wrapper in it is relative to the directory holding the included file's directory.
+    std::fs::write(
+        directory.path().join("home/wrap.toml"),
+        "build.rustc-wrapper = \"bin/w\"\n",
+    )
+    .unwrap();
+    write("config.toml", "include = [\"../wrap.toml\"]\n");
+    assert_eq!(
+        wrapper().unwrap(),
+        Some(directory.path().join("bin/w").into_os_string())
+    );
+    // Malformed or missing includes, cycles, and a `build` that is not a table are errors, as for Cargo.
+    for (text, message) in [
+        ("include = [\"missing.toml\"]\n", "missing.toml"),
+        ("include = \"a.toml\"\n", "include must be an array"),
+        ("include = [3]\n", "an include must be a path or a table"),
+        (
+            "include = [{ path = 3 }]\n",
+            "an include needs a string path",
+        ),
+        (
+            "include = [{ path = \"a.toml\", optional = \"yes\" }]\n",
+            "an include needs a string path",
+        ),
+        ("include = [\"config.toml\"]\n", "includes itself"),
+        ("include = [\"../.cargo/config.toml\"]\n", "includes itself"),
+        ("include = [\"a.txt\"]\n", "must end with .toml"),
+        ("build = 1\n", "build must be a table"),
+        ("build = [\n", "line 1"),
+    ] {
+        write("config.toml", text);
+        let error = wrapper().unwrap_err().to_string();
+        assert!(error.contains(message), "{text}: {message}: {error}");
     }
 }

@@ -536,7 +536,7 @@ fn located(path: &Path) -> io::Result<PathBuf> {
 }
 
 /// An absolute path without `..` components, which would let a mirrored path leave the mirror. Components of an absolute path never include `.`.
-fn normalized(path: &Path) -> PathBuf {
+pub(crate) fn normalized(path: &Path) -> PathBuf {
     let mut normal = PathBuf::new();
     for component in path.components() {
         match component {

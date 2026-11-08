@@ -19,7 +19,7 @@ reviewers = ["base-rs/maintainers"]
 [features]
 default = ["runner"]
 # Preparation, collection, summaries, and the `base-benchmark` command. Workloads need only records and `Interval`: depend with `default-features = false`.
-runner = ["dep:sha2", "dep:signal-hook", "nix/fs", "nix/process", "nix/sched", "nix/signal"]
+runner = ["dep:sha2", "dep:signal-hook", "dep:toml", "nix/fs", "nix/process", "nix/sched", "nix/signal"]
 
 [[bin]]
 name = "base-benchmark"
@@ -30,6 +30,7 @@ required-features = ["runner"]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = { version = "0.10.9", optional = true }
+toml = { version = "1.2.1", default-features = false, features = ["parse", "serde", "std"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["resource"] }
