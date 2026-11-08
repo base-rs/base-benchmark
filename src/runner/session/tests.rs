@@ -1395,6 +1395,12 @@ fn invalid_responses_make_comparisons_invalid_in_screening() {
             .aggregation
             .contains("per successful operation")
     );
+    assert!(
+        campaign
+            .summary
+            .aggregation
+            .contains("the others are the driver's record")
+    );
 
     // Without invalid responses, the comparison is made.
     let directory = tempfile::tempdir().unwrap();
