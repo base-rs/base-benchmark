@@ -49,6 +49,7 @@ pub fn artifact(label: &str, role: ArtifactRole, executable: &Path) -> Artifact 
             cargo: "cargo test".to_owned(),
             environment: Default::default(),
             configuration: Vec::new(),
+            layout_salt: None,
         },
     }
 }
