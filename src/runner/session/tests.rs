@@ -801,3 +801,46 @@ fn a_panicking_session_kills_and_reaps_its_roles() {
         "the service was killed and reaped"
     );
 }
+
+#[test]
+fn a_session_whose_cleanup_panics_partway_still_reaps_every_other_role() {
+    let directory = tempfile::tempdir().unwrap();
+    let plan = session(directory.path(), &serving("a:1"), "exec sleep 30");
+    let staged = plan
+        .artifacts
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.label.clone(), artifact.executable.clone()))
+        .collect();
+    let cancellation = Cancellation::new();
+    let collection = Collection {
+        plan: &plan,
+        output: directory.path(),
+        staged: &staged,
+        cancellation: &cancellation,
+        host: None,
+    };
+    let mut session = Session::new(&collection, Instant::now());
+    session.identify(&plan.subjects[0], &[None, None]).unwrap();
+    session.start(0).unwrap();
+    session.wait_ready(0).unwrap();
+    session.start(1).unwrap();
+    let group = |index: usize| session.running[index].as_ref().unwrap().group;
+    let (server, driver) = (group(0), group(1));
+    // Reaped behind the session's back, the driver, reaped first, cannot be reaped again, so cleanup panics there.
+    let pid = nix::unistd::Pid::from_raw(driver);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
+    nix::sys::wait::waitpid(pid, None).unwrap();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.finish()));
+    assert!(unwound.is_err());
+    let server = format!("/proc/{server}");
+    assert!(
+        Path::new(&server).exists(),
+        "the server was killed but is not reaped yet"
+    );
+    drop(session);
+    assert!(
+        !Path::new(&server).exists(),
+        "dropping the session reaped the server"
+    );
+}

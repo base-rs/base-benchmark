@@ -65,6 +65,8 @@ struct Running {
     stdout: Option<(Vec<u8>, bool)>,
     /// A descendant that left the group kept its output open after it exited.
     escaped: bool,
+    /// Reaping it has been attempted, so its process ID may be reused and its group must not be signalled again.
+    reaped: bool,
 }
 
 struct Session<'a> {
@@ -79,7 +81,7 @@ struct Session<'a> {
     deadline: Instant,
     timed_out: bool,
     captured: BTreeMap<String, BTreeMap<String, String>>,
-    /// Every role has been killed if need be and reaped.
+    /// Every role has been killed if need be and reaped, and its output collected.
     finished: bool,
 }
 
@@ -253,6 +255,19 @@ impl<'a> Session<'a> {
         let (outputs, received) = mpsc::channel();
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
+        // Kept before any thread starts, since starting one can panic, so that the session kills and reaps the role whatever happens next.
+        self.running[index] = Some(Running {
+            child,
+            group,
+            started,
+            outputs: received,
+            exited: false,
+            unready: false,
+            stopping: None,
+            stdout: None,
+            escaped: false,
+            reaped: false,
+        });
         let stdout_sender = outputs.clone();
         match &role.ready {
             Some(ready) => {
@@ -275,17 +290,6 @@ impl<'a> Session<'a> {
         std::thread::spawn(move || {
             process::wait_exit(group);
             events.send(Event::Exited { role: index })
-        });
-        self.running[index] = Some(Running {
-            child,
-            group,
-            started,
-            outputs: received,
-            exited: false,
-            unready: false,
-            stopping: None,
-            stdout: None,
-            escaped: false,
         });
         Ok(())
     }
@@ -429,9 +433,9 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Kill every group still running, in reverse start order, then reap every role, also in reverse start order, killing what remains of its group, and collect its output. Only the first call does anything.
+    /// Kill every group still running, in reverse start order, then reap every role, also in reverse start order, killing what remains of its group, and collect its output. Once this has completed, later calls do nothing; a call after one that panicked partway, as when the session is dropped, does what remains, reaping each role at most once.
     fn finish(&mut self) {
-        if std::mem::replace(&mut self.finished, true) {
+        if self.finished {
             return;
         }
         for running in self.running.iter().rev().flatten() {
@@ -447,7 +451,11 @@ impl<'a> Session<'a> {
         }
         let cancellation = self.collection.cancellation;
         for (index, running) in self.running.iter_mut().enumerate().rev() {
-            let Some(running) = running else { continue };
+            let Some(running) = running.as_mut().filter(|running| !running.reaped) else {
+                continue;
+            };
+            // Marked first: a role whose reaping panicked is not reaped again, nor its group, which may then be another's, killed again.
+            running.reaped = true;
             let status = process::reap(&mut running.child, running.group, cancellation);
             let entry = &mut self.entries[index];
             entry.exit_code = status.code();
@@ -479,6 +487,7 @@ impl<'a> Session<'a> {
                 RoleKind::Driver => running.stdout = stdout,
             }
         }
+        self.finished = true;
     }
 
     /// After a session that ran to the end: no escaped descendants, a successful driver and successfully stopped services, and the driver's valid record.
