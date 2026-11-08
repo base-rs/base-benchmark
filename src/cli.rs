@@ -18,7 +18,7 @@ usage: base-benchmark COMMAND [--name value]...
 
   list       [--manifest-path PATH]
   prepare    [--manifest-path PATH] [--package NAME] [--tree LABEL=PATH]... [--replicas N] [--output DIR]
-             [--scenario NAME]...
+             [--scenario NAME]... [--overlay true]
   smoke      [--manifest-path PATH] [--package NAME] [--output DIR] [--lock PATH]
   run        SCENARIO --artifacts FILE [--mode smoke|screening|recorded] [--package NAME]
              [--manifest-path PATH] [--rounds N] [--seed N] [--cpus 0,2] [--perf-event EVENT]...
@@ -67,6 +67,7 @@ fn execute(arguments: Vec<String>, out: &mut dyn Write, errors: &mut dyn Write) 
                 replicas: options.parsed("replicas")?,
                 output: options.take("output")?.map(PathBuf::from),
                 scenarios: options.take_all("scenario"),
+                overlay: options.parsed("overlay")?.unwrap_or(false),
             };
             options.finish(0)?;
             let _signals = cancellation.on_termination_signals();

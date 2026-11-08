@@ -66,7 +66,7 @@ pub use plan::{
     STACK_PADDING_VARIABLE, Subject, default_lock_path, parse_cpus,
 };
 #[cfg(feature = "runner")]
-pub use prepare::{PrepareOptions, Prepared, Tree, prepare};
+pub use prepare::{Overlay, PrepareOptions, Prepared, Tree, prepare};
 #[cfg(feature = "runner")]
 pub use runner::{
     CAMPAIGN_SCHEMA, CAMPAIGN_VERSION, Campaign, CampaignMetadata, CampaignStatus, Cancellation,

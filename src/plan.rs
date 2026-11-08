@@ -342,8 +342,12 @@ impl Plan {
             } else {
                 ""
             };
+            let overlay = match artifact.source.overlay {
+                Some(_) => ", and overlaid workload",
+                None => "",
+            };
             missing.push(format!(
-                "committed, unmodified source and path dependencies for {}{reason}",
+                "committed, unmodified source and path dependencies{overlay} for {}{reason}",
                 artifact.label
             ));
         }

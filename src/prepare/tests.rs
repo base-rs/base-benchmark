@@ -60,6 +60,7 @@ fn options(directory: &Path, trees: Vec<Tree>, cargo: PathBuf) -> PrepareOptions
         replicas: None,
         output: directory.join("prepared"),
         feature_sets: Vec::new(),
+        overlay: None,
         cargo,
         rustc: PathBuf::from("/bin/echo"),
     }
@@ -556,4 +557,27 @@ fn feature_sets_are_canonical_and_built_once() {
             .command
             .ends_with(&["--features".to_owned(), "a,b".to_owned()])
     );
+}
+
+#[test]
+fn overlay_failures_stop_preparation_and_remove_every_copy() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut options = options(
+        directory.path(),
+        vec![tree(directory.path(), "t")],
+        cargo(directory.path()),
+    );
+    options.replicas = Some(1);
+    options.overlay = Some(Overlay {
+        relative: PathBuf::from("bench"),
+        source: directory.path().join("missing"),
+    });
+    let error = prepared(&options).unwrap_err();
+    assert!(error.to_string().contains("missing"), "{error}");
+    let leftovers = std::fs::read_dir(directory.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+        .count();
+    assert_eq!(leftovers, 0, "reserved copies are removed after a failure");
 }

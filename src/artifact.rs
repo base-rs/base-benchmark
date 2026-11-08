@@ -71,6 +71,7 @@ impl ArtifactManifest {
                     lockfile_sha256: None,
                     replica_of: None,
                     path_dependencies: None,
+                    overlay: None,
                 },
                 build: BuildIdentity {
                     command: Vec::new(),
@@ -272,10 +273,13 @@ pub struct SourceIdentity {
     pub replica_of: Option<String>,
     /// Path dependencies outside the tree. `Cargo.lock` does not pin them, so each is identified by its own Git state. `None` when Cargo metadata could not be read, so they are unknown and the source is not frozen. A replica repeats its baseline's.
     pub path_dependencies: Option<Vec<DependencyIdentity>>,
+    /// The workload package built in place of the tree's own, from the workspace that prepared it, when preparation overlaid it.
+    #[serde(default)]
+    pub overlay: Option<DependencyIdentity>,
 }
 
 impl SourceIdentity {
-    /// A committed, unmodified revision whose out-of-tree path dependencies are committed and unmodified too.
+    /// A committed, unmodified revision whose out-of-tree path dependencies, and overlaid workload package, are committed and unmodified too.
     pub fn is_frozen(&self) -> bool {
         self.revision.is_some()
             && self.dirty == Some(false)
@@ -283,6 +287,10 @@ impl SourceIdentity {
                 .path_dependencies
                 .as_ref()
                 .is_some_and(|dependencies| dependencies.iter().all(DependencyIdentity::is_frozen))
+            && self
+                .overlay
+                .as_ref()
+                .is_none_or(DependencyIdentity::is_frozen)
     }
 }
 

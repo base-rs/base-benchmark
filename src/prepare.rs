@@ -48,8 +48,63 @@ pub struct PrepareOptions {
     pub output: PathBuf,
     /// The feature sets to build each tree with, each sorted and without duplicates: those of the scenarios to be run. Empty means the suite's features alone.
     pub feature_sets: Vec<Vec<String>>,
+    /// Build every tree with this workload package in place of the tree's own.
+    pub overlay: Option<Overlay>,
     pub cargo: PathBuf,
     pub rustc: PathBuf,
+}
+
+/// A workload package copied into every tree before building, so that revisions from before the workload existed, or with an older version of it, run the same harness.
+///
+/// Trees are never modified: each is copied to a sibling directory, so relative path dependencies still resolve, the package directory is replaced, and the copy is built without `--locked`, since the harness may add dependencies the tree's lockfile lacks. Cargo keeps the tree's locked versions where they satisfy the harness, and each artifact records the lockfile it was built with. The tree's workspace must list the package as a member.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Overlay {
+    /// The package directory, relative to the workspace root.
+    pub relative: PathBuf,
+    /// The package directory to copy in.
+    pub source: PathBuf,
+}
+
+impl Overlay {
+    /// The workload package of `suite`, which must be a member below its workspace root.
+    pub fn of(suite: &Suite) -> io::Result<Self> {
+        let source = suite
+            .manifest_path
+            .parent()
+            .unwrap_or(&suite.manifest_path)
+            .to_owned();
+        let relative = source
+            .strip_prefix(&suite.workspace_root)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .ok_or_else(|| {
+                invalid_input(format!(
+                    "{} is not in a directory below its workspace root, so it cannot be overlaid onto other trees",
+                    suite.package
+                ))
+            })?
+            .to_owned();
+        Ok(Self { relative, source })
+    }
+
+    fn identity(&self, package: &str) -> DependencyIdentity {
+        DependencyIdentity {
+            name: package.to_owned(),
+            path: self.source.clone(),
+            revision: git(&self.source, &["rev-parse", "--verify", "HEAD"]),
+            // Only the package's own files are copied, so only their state matters.
+            dirty: git(&self.source, &["status", "--porcelain", "--", "."])
+                .map(|status| !status.is_empty()),
+        }
+    }
+
+    /// Replace the package directory of the tree copied to `copy`.
+    fn apply(&self, copy: &Path, output: &Path) -> io::Result<()> {
+        let package = copy.join(&self.relative);
+        let _ = std::fs::remove_dir_all(&package);
+        std::fs::create_dir_all(&package)
+            .and_then(|()| copy_contents(&self.source, &package, output))
+    }
 }
 
 /// The prepared manifest and where it was written.
@@ -63,7 +118,7 @@ pub struct Prepared {
 ///
 /// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at a different path changes Cargo's package metadata hashes and therefore code layout; comparing the baseline with its replicas shows how much a change of that kind alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds.
 pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Result<Prepared> {
-    let (trees, replicas) = validate(options)?;
+    let (trees, copies) = validate(options)?;
     let output = std::path::absolute(&options.output)?;
     std::fs::create_dir_all(output.parent().unwrap_or(&output))
         .and_then(|()| std::fs::create_dir(&output))
@@ -79,11 +134,22 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
     let output = output
         .canonicalize()
         .expect("the new output directory exists");
-    // Reserve every replica copy before building, so a concurrent preparation cannot claim the same directory.
-    let copies = replicas
+    // Reserve every copy before building, so a concurrent preparation cannot claim the same directory.
+    let mut copies = copies
         .into_iter()
         .map(|(label, path)| TemporaryCopy::create(path).map(|copy| (label, copy)))
         .collect::<io::Result<Vec<_>>>()?;
+    // Overlaid copies of the trees follow the replicas, one per tree.
+    let mut overlaid = copies
+        .split_off(
+            copies.len()
+                - if options.overlay.is_some() {
+                    trees.len()
+                } else {
+                    0
+                },
+        )
+        .into_iter();
 
     // Canonical sets, without duplicates, so that each matches its scenarios and each tree is built once per set.
     let mut feature_sets: Vec<Vec<String>> = Vec::new();
@@ -100,6 +166,10 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
             feature_sets.push(features);
         }
     }
+    let overlay = options
+        .overlay
+        .as_ref()
+        .map(|overlay| overlay.identity(&options.suite.package));
     let mut artifacts = Vec::new();
     for (index, (label, path)) in trees.iter().enumerate() {
         let role = if index == 0 {
@@ -107,21 +177,33 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         } else {
             ArtifactRole::Candidate
         };
+        let source = SourceIdentity {
+            overlay: overlay.clone(),
+            ..source_identity(path)
+        };
+        // With an overlay, the tree is built from its overlaid copy, removed when this iteration ends.
+        let copy = overlaid.next().map(|(_, copy)| copy);
+        let directory = copy
+            .as_ref()
+            .map_or(path.as_path(), |copy| copy.0.as_path());
+        if directory != path.as_path() {
+            overlay_copy(path, directory, options, &output)?;
+        }
         artifacts.extend(build_feature_sets(
             options,
             &feature_sets,
             &output,
             label,
             role,
-            path,
-            &source_identity(path),
+            directory,
+            &source,
             cancellation,
         )?);
     }
     // The baseline's source identity is the same for each of its feature sets.
     let baseline = artifacts[0].source.clone();
     for (label, copy) in copies {
-        copy_contents(&baseline.path, &copy.0, &output)?;
+        overlay_copy(&baseline.path, &copy.0, options, &output)?;
         let source = SourceIdentity {
             path: copy.0.clone(),
             revision: baseline.revision.clone(),
@@ -129,6 +211,7 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
             lockfile_sha256: None,
             replica_of: Some(trees[0].0.clone()),
             path_dependencies: baseline.path_dependencies.clone(),
+            overlay: baseline.overlay.clone(),
         };
         artifacts.extend(build_feature_sets(
             options,
@@ -159,7 +242,7 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
     })
 }
 
-/// Canonical labelled trees, and each layout replica's label and copy location.
+/// Canonical labelled trees, and the label and location of each copy to build: layout replicas of the baseline, then, with an overlay, each tree's overlaid copy.
 type Validated = (Vec<(String, PathBuf)>, Vec<(String, PathBuf)>);
 
 /// Check labels and paths before building anything.
@@ -196,13 +279,19 @@ fn validate(options: &PrepareOptions) -> io::Result<Validated> {
         })?;
         trees.push((tree.label.clone(), path));
     }
-    let replicas = replica_labels
-        .into_iter()
-        .map(|label| {
-            sibling_copy_path(&trees[0].1, &label, &options.output).map(|path| (label, path))
+    // Each copy is a sibling of the tree it copies: replicas copy the baseline.
+    let replicas = replica_labels.into_iter().map(|label| (label, &trees[0].1));
+    let overlays = trees
+        .iter()
+        .filter(|_| options.overlay.is_some())
+        .map(|(label, path)| (format!("{label}-overlay"), path));
+    let copies = replicas
+        .chain(overlays)
+        .map(|(label, tree)| {
+            sibling_copy_path(tree, &label, &options.output).map(|path| (label, path))
         })
         .collect::<io::Result<_>>()?;
-    Ok((trees, replicas))
+    Ok((trees, copies))
 }
 
 /// An exclusively created replica source directory, removed when dropped, including after a failed build.
@@ -300,10 +389,12 @@ impl Build<'_> {
             ));
         }
         let suite = &options.suite;
-        let mut command = vec![
-            options.cargo.display().to_string(),
-            "build".to_owned(),
-            "--locked".to_owned(),
+        let mut command = vec![options.cargo.display().to_string(), "build".to_owned()];
+        // An overlaid harness may need dependencies the tree's lockfile lacks.
+        if options.overlay.is_none() {
+            command.push("--locked".to_owned());
+        }
+        command.extend([
             "--message-format=json-render-diagnostics".to_owned(),
             "--manifest-path".to_owned(),
             tree.join("Cargo.toml").display().to_string(),
@@ -315,7 +406,7 @@ impl Build<'_> {
             suite.profile.clone(),
             "--target-dir".to_owned(),
             target.display().to_string(),
-        ];
+        ]);
         if !features.is_empty() {
             command.extend(["--features".to_owned(), features.join(",")]);
         }
@@ -532,7 +623,23 @@ fn source_identity(path: &Path) -> SourceIdentity {
         lockfile_sha256: None,
         replica_of: None,
         path_dependencies: None,
+        overlay: None,
     }
+}
+
+/// Copy `tree` into the reserved directory `copy`, then overlay the workload package, if any, onto the copy.
+fn overlay_copy(
+    tree: &Path,
+    copy: &Path,
+    options: &PrepareOptions,
+    output: &Path,
+) -> io::Result<()> {
+    copy_contents(tree, copy, output).and_then(|()| {
+        options
+            .overlay
+            .as_ref()
+            .map_or(Ok(()), |harness| harness.apply(copy, output))
+    })
 }
 
 fn git(path: &Path, arguments: &[&str]) -> Option<String> {

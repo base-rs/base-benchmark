@@ -57,7 +57,7 @@ Deferred:
 
 - Multi-process roles: server/client placement, readiness, endpoint transfer, and final statistics validation. Validate these against scheduler echo and HTTP client/hello before generalizing.
 - Per-role resource sources such as `wait4` lifetime usage and `/proc` interval snapshots.
-- Downstream workloads built against each tree through `[patch]` overrides, and revision archives as tree inputs. Callers create trees themselves, for example with `git worktree add`.
+- Downstream workloads, in another repository, built against each tree through `[patch]` overrides, and revision archives as tree inputs. Callers create trees themselves, for example with `git worktree add`. A workload in the same workspace can be overlaid onto older trees with `--overlay`.
 - Unchanged external comparators as plan subjects alongside variants, a same-binary repeat subject, and predeclared expected-error outcome contracts beyond reporting them as ordinary metrics.
 - Phase-matched hardware counters. `perf stat` totals are whole-process only and are never divided by measured operations. Multiplexing percentages are not checked, and on hybrid CPUs, which report one line per PMU, only the first line is used.
 - Several samples per process exist in the schema, but only single-sample workloads have been exercised. Markdown's batches are the intended test.

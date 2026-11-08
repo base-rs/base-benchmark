@@ -183,9 +183,26 @@ fn recorded_campaigns_report_every_missing_prerequisite() {
     options.decision_rule = Some("median instructions improve beyond the replica range".to_owned());
     options.idle_host = true;
     options.seed = None;
-    let plan = Plan::new(options).unwrap();
+    let plan = Plan::new(options.clone()).unwrap();
     assert_eq!(plan.rounds, 10);
     assert!(plan.seed > 0);
+
+    // An overlaid workload must be committed too.
+    for artifact in &mut options.artifacts.artifacts {
+        artifact.source.overlay = Some(crate::artifact::DependencyIdentity {
+            name: "workload".to_owned(),
+            path: PathBuf::from("/workspace/bench"),
+            revision: Some("0123".to_owned()),
+            dirty: Some(true),
+        });
+    }
+    let error = Plan::new(options).unwrap_err().to_string();
+    assert!(
+        error.contains(
+            "unmodified source and path dependencies, and overlaid workload for baseline"
+        ),
+        "{error}"
+    );
 }
 
 #[test]

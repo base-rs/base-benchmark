@@ -41,6 +41,7 @@ pub fn artifact(label: &str, role: ArtifactRole, executable: &Path) -> Artifact 
             lockfile_sha256: None,
             replica_of: (role == ArtifactRole::LayoutReplica).then(|| "baseline".to_owned()),
             path_dependencies: Some(Vec::new()),
+            overlay: None,
         },
         build: BuildIdentity {
             command: vec!["cargo".to_owned(), "build".to_owned()],
