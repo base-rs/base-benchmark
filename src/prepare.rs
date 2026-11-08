@@ -1114,7 +1114,7 @@ fn sibling_copy_path(tree: &Path, label: &str, output: &Path) -> io::Result<Path
 
 /// Copy a source tree's contents into an existing directory, skipping version control, Cargo target directories (marked by `CACHEDIR.TAG`), and the preparation output.
 ///
-/// Symbolic links are copied as links, so absolute links still point into the original tree. Build scripts that need `.git` see no repository.
+/// Symbolic links are copied as links, so absolute links still point into the original tree. Build scripts that need `.git` see no repository. Files are written in this process, unlike frozen executables (see [`artifact::write_executable`]), so a program in the tree that the build runs, such as a rustc wrapper or linker given by a path into it, can be busy if another thread forks a child that never execs while the file is open.
 pub(crate) fn copy_contents(from: &Path, to: &Path, exclude: &Path) -> io::Result<()> {
     let entries = std::fs::read_dir(from)
         .and_then(|entries| {
