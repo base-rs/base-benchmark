@@ -34,6 +34,31 @@ fn options_are_strict() {
     assert!(failure(&["run", "--artifacts", "a.json"]).contains("expected 1 positional"));
     assert!(failure(&["run", "s"]).contains("--artifacts is required"));
     assert!(failure(&["summarize"]).contains("positional"));
+    assert!(
+        failure(&["run", "s", "--artifacts", "a.json", "--role-cpus", "server"])
+            .contains("expected ROLE=CPUS")
+    );
+    assert!(
+        failure(&["run", "s", "--artifacts", "a.json", "--role-cpus", "=1"])
+            .contains("expected ROLE=CPUS")
+    );
+    assert!(
+        failure(&[
+            "run",
+            "s",
+            "--artifacts",
+            "a.json",
+            "--role-cpus",
+            "server=x"
+        ])
+        .contains("invalid CPU list")
+    );
+    assert!(failure(&["smoke", "--program", "load"]).contains("expected NAME=PATH"));
+    assert!(failure(&["smoke", "--program", "load="]).contains("expected NAME=PATH"));
+    assert!(
+        failure(&["run", "s", "--program", "a=1", "--program", "a=2"])
+            .contains("--program a was given more than once")
+    );
     assert!(failure(&["summarize", "/nonexistent"]).contains("metadata.json"));
     let mut out = Vec::new();
     assert_eq!(

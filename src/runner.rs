@@ -5,6 +5,8 @@ mod host;
 mod lock;
 mod perf;
 mod process;
+#[cfg(target_os = "linux")]
+mod session;
 
 pub use host::{CpuIdentity, HostIdentity};
 #[cfg(not(target_os = "linux"))]
@@ -14,6 +16,7 @@ pub use process::{Cancellation, SignalGuard};
 use crate::artifact::write_json;
 use crate::plan::{Plan, STACK_PADDING_LIMIT, STACK_PADDING_VARIABLE, Shuffle, Subject};
 use crate::record::{Metric, ProcessRecord, invalid};
+use crate::role::RoleKind;
 use crate::summary::{Summary, summarize};
 use lock::HostLock;
 use process::Launch;
@@ -25,7 +28,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const CAMPAIGN_SCHEMA: &str = "base-benchmark/campaign";
-pub const CAMPAIGN_VERSION: u32 = 1;
+/// Version 2 adds each role's entry to the samples of multi-process scenarios, which samples of single-process scenarios omit.
+pub const CAMPAIGN_VERSION: u32 = 2;
 
 /// `metadata.json`: the plan, host, and completion state of a campaign directory.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -55,6 +59,8 @@ pub enum CampaignStatus {
 }
 
 /// One line of `samples.jsonl`. Failed samples are retained as evidence and stop the campaign.
+///
+/// In a multi-process scenario a sample is one session of every role: `roles` describes each process, `record` is the driver's, and `command`, `cpus`, `stack_padding`, `executable_sha256`, `exit_code`, `signal`, and `stderr`, which describe a single workload process, are empty. `duration_ns`, `timed_out`, and `error` describe the whole session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SampleEntry {
@@ -76,6 +82,38 @@ pub struct SampleEntry {
     pub record: Option<ProcessRecord>,
     /// Whole-process metrics collected around the workload, such as `perf stat` counters.
     pub process_metrics: Vec<Metric>,
+    /// Every role of a multi-process scenario's session, in start order, also those a failure left unstarted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<RoleEntry>,
+}
+
+/// One role's process in a session.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleEntry {
+    pub role: String,
+    pub kind: RoleKind,
+    /// The host it ran on, by name, when known.
+    pub host: Option<String>,
+    /// Its program and arguments: as started, with captured values, or as planned when it never started.
+    pub command: Vec<String>,
+    pub cpus: Vec<usize>,
+    /// The length of its random stack-padding variable, when padding is enabled.
+    pub stack_padding: Option<usize>,
+    pub executable_sha256: String,
+    /// Whether it was started. A failure before its turn leaves it unstarted, with no status.
+    pub started: bool,
+    /// The line that made a service ready, and the values its pattern captured from it.
+    pub ready_line: Option<String>,
+    pub captures: BTreeMap<String, String>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    /// A service whose group was killed because it had not exited within the grace period after its stop signal. This is journalled, and does not fail the sample.
+    pub killed_after_grace: bool,
+    /// The end of a service's stdout before its ready line, if any. A driver's stdout is its record.
+    pub stdout: String,
+    /// The end of its stderr.
+    pub stderr: String,
 }
 
 /// A finished campaign directory and its summary.
@@ -125,7 +163,7 @@ pub fn run(
         status: CampaignStatus::InProgress,
         evidence: plan.mode.evidence().to_owned(),
         generator: crate::summary::GENERATOR.to_owned(),
-        host: HostIdentity::capture(&plan.cpus),
+        host: HostIdentity::capture(&plan.placed_cpus()),
         plan,
         started_unix_ms: unix_ms(),
         finished_unix_ms: None,
@@ -199,6 +237,7 @@ fn collect(
         output: &journal.output,
         staged: &staged,
         cancellation,
+        host: journal.metadata.host.hostname.as_deref(),
     };
     let mut shuffle = Shuffle::new(plan.seed);
     // A separate stream, so padding does not change the round order of a given seed.
@@ -219,10 +258,14 @@ fn collect(
                 position + 1,
                 subject.label
             );
-            let stack_padding = plan
-                .stack_padding
-                .then(|| padding.below(STACK_PADDING_LIMIT));
-            let entry = collection.sample(subject, round, position, stack_padding, &mut expected);
+            // One length for each process of the sample: the workload, or every role in start order.
+            let stack_padding: Vec<Option<usize>> = (0..plan.roles.len().max(1))
+                .map(|_| {
+                    plan.stack_padding
+                        .then(|| padding.below(STACK_PADDING_LIMIT))
+                })
+                .collect();
+            let entry = collection.sample(subject, round, position, &stack_padding, &mut expected);
             journal.append(&entry)?;
             if let Some(error) = &entry.error {
                 if cancellation.is_cancelled() {
@@ -276,6 +319,8 @@ struct Collection<'a> {
     output: &'a Path,
     staged: &'a BTreeMap<String, PathBuf>,
     cancellation: &'a Cancellation,
+    /// The measuring host's name, which every role runs on.
+    host: Option<&'a str>,
 }
 
 impl Collection<'_> {
@@ -284,16 +329,21 @@ impl Collection<'_> {
         subject: &Subject,
         round: u32,
         position: usize,
-        stack_padding: Option<usize>,
+        stack_padding: &[Option<usize>],
         expected: &mut Expectations,
     ) -> SampleEntry {
+        let session = !self.plan.roles.is_empty();
         let mut entry = SampleEntry {
             round,
             position,
             subject: subject.label.clone(),
             command: Vec::new(),
-            cpus: self.plan.cpus.clone(),
-            stack_padding,
+            cpus: if session {
+                Vec::new()
+            } else {
+                self.plan.cpus.clone()
+            },
+            stack_padding: if session { None } else { stack_padding[0] },
             executable_sha256: String::new(),
             duration_ns: 0,
             exit_code: None,
@@ -303,11 +353,77 @@ impl Collection<'_> {
             stderr: String::new(),
             record: None,
             process_metrics: Vec::new(),
+            roles: Vec::new(),
         };
-        if let Err(error) = self.collect_sample(subject, expected, &mut entry) {
+        let result = if session {
+            self.collect_session(subject, stack_padding, expected, &mut entry)
+        } else {
+            self.collect_sample(subject, expected, &mut entry)
+        };
+        if let Err(error) = result {
             entry.error = Some(error.to_string());
         }
         entry
+    }
+
+    /// The artifact a subject runs.
+    fn artifact(&self, subject: &Subject) -> &crate::artifact::Artifact {
+        self.plan
+            .artifacts
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.label == subject.artifact)
+            .expect("plans only name their own artifacts")
+    }
+
+    /// Run one session of every role.
+    #[cfg(target_os = "linux")]
+    fn collect_session(
+        &self,
+        subject: &Subject,
+        stack_padding: &[Option<usize>],
+        expected: &mut Expectations,
+        entry: &mut SampleEntry,
+    ) -> io::Result<()> {
+        session::collect(self, subject, stack_padding, entry)?;
+        let record = entry
+            .record
+            .as_ref()
+            .expect("a successful session has the driver's record");
+        expected.check(subject, record)
+    }
+
+    // Campaigns check first that collection is supported, so this is not reached.
+    #[cfg(not(target_os = "linux"))]
+    fn collect_session(
+        &self,
+        _subject: &Subject,
+        _stack_padding: &[Option<usize>],
+        _expected: &mut Expectations,
+        _entry: &mut SampleEntry,
+    ) -> io::Result<()> {
+        check_collection()
+    }
+
+    /// The environment of one process, with its stack padding.
+    fn environment(&self, stack_padding: Option<usize>) -> BTreeMap<String, String> {
+        let mut environment = self.plan.environment.clone();
+        if let Some(length) = stack_padding {
+            environment.insert(STACK_PADDING_VARIABLE.to_owned(), "x".repeat(length));
+        }
+        environment
+    }
+
+    /// Parse a workload's stdout as exactly one valid record.
+    fn record(stdout: &[u8], truncated: bool) -> io::Result<ProcessRecord> {
+        if truncated {
+            return Err(invalid("workload stdout exceeded the record size limit"));
+        }
+        let record: ProcessRecord = serde_json::from_slice(stdout).map_err(|error| {
+            invalid(format!("stdout is not exactly one process record: {error}"))
+        })?;
+        record.validate()?;
+        Ok(record)
     }
 
     fn collect_sample(
@@ -317,12 +433,7 @@ impl Collection<'_> {
         entry: &mut SampleEntry,
     ) -> io::Result<()> {
         let plan = self.plan;
-        let artifact = plan
-            .artifacts
-            .artifacts
-            .iter()
-            .find(|artifact| artifact.label == subject.artifact)
-            .expect("plans only name their own artifacts");
+        let artifact = self.artifact(subject);
         let executable = &self.staged[&subject.artifact];
         entry.executable_sha256 = artifact.sha256.clone();
         artifact.verify_at(executable)?;
@@ -343,10 +454,7 @@ impl Collection<'_> {
         entry.command = std::iter::once(program.display().to_string())
             .chain(arguments.iter().cloned())
             .collect();
-        let mut environment = plan.environment.clone();
-        if let Some(length) = entry.stack_padding {
-            environment.insert(STACK_PADDING_VARIABLE.to_owned(), "x".repeat(length));
-        }
+        let environment = self.environment(entry.stack_padding);
         let launch = Launch {
             program: &program,
             arguments: &arguments,
@@ -381,14 +489,7 @@ impl Collection<'_> {
                 execution.code, execution.signal
             )));
         }
-        if execution.stdout_truncated {
-            return Err(invalid("workload stdout exceeded the record size limit"));
-        }
-        let record: ProcessRecord = serde_json::from_slice(&execution.stdout).map_err(|error| {
-            invalid(format!("stdout is not exactly one process record: {error}"))
-        })?;
-        record.validate()?;
-        entry.record = Some(record);
+        entry.record = Some(Self::record(&execution.stdout, execution.stdout_truncated)?);
         let record = entry.record.as_ref().expect("the record was just stored");
         expected.check(subject, record)?;
         if !plan.perf_events.is_empty() {

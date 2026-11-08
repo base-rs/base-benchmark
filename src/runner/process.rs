@@ -69,17 +69,17 @@ fn spawn(command: &mut Command) -> io::Result<std::process::Child> {
     }
 }
 
-/// Stops a running campaign: the active workload process group is killed and no further samples start.
+/// Stops a running campaign: the active workload process groups are killed, in reverse start order, and no further samples start.
 ///
-/// Every process the runner starts leads its own process group, so wrapper descendants such as a `perf` child are killed with it. The lock is released only after that cleanup. A cancellation tracks one workload process at a time.
+/// Every process the runner starts leads its own process group, so wrapper descendants such as a `perf` child are killed with it. The lock is released only after that cleanup. A cancellation tracks the processes of one sample at a time: one workload, or every role of a session.
 #[derive(Clone, Default)]
 pub struct Cancellation(Arc<CancellationState>);
 
 #[derive(Default)]
 struct CancellationState {
     cancelled: AtomicBool,
-    /// The running workload's process group.
-    active: Mutex<Option<i32>>,
+    /// The running workload process groups, in start order.
+    active: Mutex<Vec<i32>>,
 }
 
 /// Cancellations guarded against termination signals, shared with the process-wide handler thread.
@@ -99,9 +99,7 @@ impl Cancellation {
             .active
             .lock()
             .expect("cancellation state is never poisoned");
-        if let Some(group) = *active {
-            kill_group(group);
-        }
+        active.iter().rev().copied().for_each(kill_group);
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -141,7 +139,7 @@ impl Cancellation {
             .active
             .lock()
             .expect("cancellation state is never poisoned");
-        *active = Some(group);
+        active.push(group);
         if self.is_cancelled() {
             kill_group(group);
         }
@@ -156,7 +154,7 @@ impl Cancellation {
             .lock()
             .expect("cancellation state is never poisoned");
         kill_group(group);
-        *active = None;
+        active.retain(|active| *active != group);
     }
 }
 
@@ -211,7 +209,7 @@ impl Drop for SignalGuard {
 }
 
 #[cfg(target_os = "linux")]
-fn kill_group(group: i32) {
+pub(crate) fn kill_group(group: i32) {
     // An empty group (ESRCH) is the normal case after a clean exit.
     let _ = killpg(Pid::from_raw(group), Signal::SIGKILL);
 }
@@ -219,6 +217,23 @@ fn kill_group(group: i32) {
 // Only Linux starts workloads, so elsewhere no group is ever registered to kill.
 #[cfg(not(target_os = "linux"))]
 fn kill_group(_group: i32) {}
+
+/// Send `signal`, by name, to a process group. A group that is already empty is not an error.
+#[cfg(target_os = "linux")]
+pub(crate) fn signal_group(group: i32, signal: &str) {
+    let signal: Signal = signal
+        .parse()
+        .expect("plans name only supported stop signals");
+    let _ = killpg(Pid::from_raw(group), signal);
+}
+
+/// The number of a signal, by name, on this system.
+#[cfg(target_os = "linux")]
+pub(crate) fn signal_number(signal: &str) -> i32 {
+    signal
+        .parse::<Signal>()
+        .expect("plans name only supported stop signals") as i32
+}
 
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -270,13 +285,13 @@ pub(crate) fn execute(
     check_collection().map(|()| unreachable!("collection is unsupported here"))
 }
 
-/// Run one workload process to completion with bounded output, a deadline, CPU placement, and process-group cleanup.
+/// Start a process leading its own group, with the launch's environment, directory, and CPUs, piped stdout and stderr, and `stdin`, and register its group with `cancellation`. Returns the child and its group.
 #[cfg(target_os = "linux")]
-pub(crate) fn execute(
+pub(crate) fn start(
     launch: &Launch,
-    timeout: Duration,
+    stdin: Stdio,
     cancellation: &Cancellation,
-) -> io::Result<Execution> {
+) -> io::Result<(std::process::Child, i32)> {
     let (program, cpus) = (launch.program, launch.cpus);
     let mut command = Command::new(program);
     command
@@ -284,15 +299,64 @@ pub(crate) fn execute(
         .env_clear()
         .envs(launch.environment)
         .current_dir(launch.directory)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let started = Instant::now();
-    let mut child = with_affinity(cpus, || spawn(&mut command))
+    let child = with_affinity(cpus, || spawn(&mut command))
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", program.display())))?;
     let group = i32::try_from(child.id()).expect("process IDs fit in pid_t");
     cancellation.register(group);
+    Ok((child, group))
+}
+
+/// Wait for a group's leader to exit without reaping it, so its process ID, and therefore the group ID, stays reserved during cleanup.
+#[cfg(target_os = "linux")]
+pub(crate) fn wait_exit(group: i32) {
+    let _ = std::iter::repeat_with(|| {
+        waitid(
+            Id::Pid(Pid::from_raw(group)),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+        )
+    })
+    .find(|result| *result != Err(Errno::EINTR));
+}
+
+/// Whether a group's leader has exited, without reaping it.
+#[cfg(target_os = "linux")]
+pub(crate) fn has_exited(group: i32) -> bool {
+    use nix::sys::wait::WaitStatus;
+    let status = std::iter::repeat_with(|| {
+        waitid(
+            Id::Pid(Pid::from_raw(group)),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG,
+        )
+    })
+    .find(|result| *result != Err(Errno::EINTR));
+    status != Some(Ok(WaitStatus::StillAlive))
+}
+
+/// Kill what remains of an exited leader's group, then reap the leader.
+#[cfg(target_os = "linux")]
+pub(crate) fn reap(
+    child: &mut std::process::Child,
+    group: i32,
+    cancellation: &Cancellation,
+) -> std::process::ExitStatus {
+    cancellation.finish(group);
+    // After `waitid` reported the exit, reaping our own child cannot fail.
+    child.wait().expect("an exited child can be reaped")
+}
+
+/// Run one workload process to completion with bounded output, a deadline, CPU placement, and process-group cleanup.
+#[cfg(target_os = "linux")]
+pub(crate) fn execute(
+    launch: &Launch,
+    timeout: Duration,
+    cancellation: &Cancellation,
+) -> io::Result<Execution> {
+    let started = Instant::now();
+    let (mut child, group) = start(launch, Stdio::null(), cancellation)?;
 
     let (sender, outputs) = mpsc::channel();
     let stdout = child.stdout.take().expect("stdout is piped");
@@ -313,19 +377,10 @@ pub(crate) fn execute(
         })
     };
 
-    // Wait for the leader to exit without reaping it, so its process ID, and therefore the group ID, stays reserved during cleanup.
-    let _ = std::iter::repeat_with(|| {
-        waitid(
-            Id::Pid(Pid::from_raw(group)),
-            WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
-        )
-    })
-    .find(|result| *result != Err(Errno::EINTR));
+    wait_exit(group);
     drop(done);
     watchdog.join().expect("the watchdog does not panic");
-    cancellation.finish(group);
-    // After `waitid` reported the exit, reaping our own child cannot fail.
-    let status = child.wait().expect("an exited child can be reaped");
+    let status = reap(&mut child, group, cancellation);
     // A descendant that left the group survives cleanup and may hold the pipes open. Stop waiting for it rather than hold the lock indefinitely.
     let deadline = Instant::now() + OUTPUT_GRACE;
     let (mut stdout, mut stderr) = (None, None);
@@ -355,7 +410,7 @@ pub(crate) fn execute(
 ///
 /// A read error ends the stream; the record parser then rejects incomplete output.
 #[cfg(target_os = "linux")]
-fn read_head(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
+pub(crate) fn read_head(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
     let mut head = Vec::new();
     let _ = (&mut reader).take(limit as u64 + 1).read_to_end(&mut head);
     let truncated = head.len() > limit;
@@ -366,7 +421,7 @@ fn read_head(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
 
 /// Keep the last `limit` bytes.
 #[cfg(target_os = "linux")]
-fn read_tail(mut reader: impl Read, limit: usize) -> Vec<u8> {
+pub(crate) fn read_tail(mut reader: impl Read, limit: usize) -> Vec<u8> {
     let mut tail = Vec::new();
     let mut buffer = [0; 8192];
     loop {

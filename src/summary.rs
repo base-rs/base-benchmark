@@ -524,8 +524,12 @@ pub fn sign_test(improved: usize, regressed: usize) -> f64 {
 
 /// Hazards that make a comparison weaker than its numbers suggest.
 fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary], warnings: &mut Warnings) {
-    if plan.mode != Mode::Smoke && plan.cpus.is_empty() {
+    if plan.mode != Mode::Smoke && plan.roles.is_empty() && plan.cpus.is_empty() {
         warnings.add(Hazard::Control, "no CPU placement: workload processes may run on different cores or core types between rounds".to_owned(), None);
+    }
+    let unplaced = plan.unplaced_roles();
+    if plan.mode != Mode::Smoke && !unplaced.is_empty() {
+        warnings.add(Hazard::Control, format!("no CPU placement for role(s) {}: their processes may run on different cores or core types between rounds, and share cores with other roles", unplaced.join(", ")), None);
     }
     if plan.mode != Mode::Smoke && !plan.stack_padding {
         warnings.add(Hazard::Control, "stack padding disabled: every process of a subject starts with the same stack alignment, which can bias comparisons".to_owned(), None);

@@ -39,6 +39,8 @@ mod prepare;
 #[cfg(feature = "runner")]
 pub mod remote;
 #[cfg(feature = "runner")]
+mod role;
+#[cfg(feature = "runner")]
 mod runner;
 #[cfg(feature = "runner")]
 mod summary;
@@ -64,16 +66,22 @@ pub use config::{
 };
 #[cfg(feature = "runner")]
 pub use plan::{
-    Mode, PLAN_SCHEMA, PLAN_VERSION, Pair, PairKind, Plan, PlanOptions, STACK_PADDING_LIMIT,
-    STACK_PADDING_VARIABLE, Subject, default_lock_path, parse_cpus,
+    ExternalProgram, Mode, PLAN_SCHEMA, PLAN_VERSION, Pair, PairKind, Plan, PlanOptions,
+    PlannedRole, STACK_PADDING_LIMIT, STACK_PADDING_VARIABLE, Subject, default_lock_path,
+    parse_cpus,
 };
 #[cfg(feature = "runner")]
 pub use prepare::{Overlay, PrepareOptions, Prepared, Tree, prepare};
 #[cfg(feature = "runner")]
+pub use role::{
+    DEFAULT_READY_TIMEOUT_MS, DEFAULT_STOP_GRACE_MS, ReadyLine, Role, RoleKind, RoleProgram,
+    STOP_SIGNALS, Stop,
+};
+#[cfg(feature = "runner")]
 pub use runner::{
     CAMPAIGN_SCHEMA, CAMPAIGN_VERSION, Campaign, CampaignMetadata, CampaignStatus, Cancellation,
-    CpuIdentity, HostIdentity, SampleEntry, SignalGuard, read_entries, read_metadata, run,
-    summarize_directory,
+    CpuIdentity, HostIdentity, RoleEntry, SampleEntry, SignalGuard, read_entries, read_metadata,
+    run, summarize_directory,
 };
 #[cfg(feature = "runner")]
 pub use summary::{

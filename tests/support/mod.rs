@@ -8,9 +8,15 @@
 
 use std::path::{Path, PathBuf};
 
-/// A workload that prints a valid record. `fast` lowers its wall time; `fail` exits unsuccessfully; `slow` creates the file named by the next argument, if any, and then sleeps for 30 seconds.
+/// A workload that prints a valid record. `fast` lowers its wall time; `fail` exits unsuccessfully; `slow` creates the file named by the next argument, if any, and then sleeps for 30 seconds; `serve` prints `listening on 127.0.0.1:PID`, with `fast` if given, and waits to be stopped, as a service.
 const MAIN: &str = r##"fn main() {
     let arguments: Vec<String> = std::env::args().collect();
+    if arguments.iter().any(|argument| argument == "serve") {
+        let fast = if arguments.iter().any(|argument| argument == "fast") { " fast" } else { "" };
+        println!("listening on 127.0.0.1:{}{fast}", std::process::id());
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return;
+    }
     if arguments.iter().any(|argument| argument == "fail") {
         std::process::exit(3);
     }

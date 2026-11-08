@@ -297,3 +297,23 @@ fn each_guard_releases_only_its_own_registration() {
     drop(second);
     assert_eq!(count(), 0);
 }
+
+#[test]
+fn exits_are_observed_without_reaping() {
+    let arguments = vec!["-c".to_owned(), "sleep 30".to_owned()];
+    let environment = environment();
+    let launch = Launch {
+        program: Path::new(SHELL),
+        arguments: &arguments,
+        environment: &environment,
+        directory: Path::new("/"),
+        cpus: &[],
+    };
+    let cancellation = Cancellation::new();
+    let (mut child, group) = start(&launch, Stdio::null(), &cancellation).unwrap();
+    assert!(!has_exited(group));
+    kill_group(group);
+    wait_exit(group);
+    assert!(has_exited(group), "an exited leader stays unreaped");
+    assert_eq!(reap(&mut child, group, &cancellation).signal(), Some(9));
+}

@@ -1,8 +1,9 @@
 // Released under the MIT License.
 // Copyright, 2026, by Samuel Williams.
 
-use crate::artifact::{ArtifactManifest, ArtifactRole};
+use crate::artifact::{ArtifactManifest, ArtifactRole, sha256_identified};
 use crate::config::{Suite, invalid_input};
+use crate::role::{ReadyLine, RoleKind, RoleProgram, Stop};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -12,8 +13,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 pub const PLAN_SCHEMA: &str = "base-benchmark/plan";
-/// Version 2 embeds a version 2 artifact manifest, with features per artifact.
-pub const PLAN_VERSION: u32 = 2;
+/// Version 2 embeds a version 2 artifact manifest, with features per artifact. Version 3 adds the roles and external programs of multi-process scenarios, which plans of single-process scenarios omit.
+pub const PLAN_VERSION: u32 = 3;
 
 /// How results may be used. The mode is recorded with every campaign.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,8 +83,12 @@ pub struct PlanOptions {
     pub mode: Mode,
     pub rounds: Option<u32>,
     pub seed: Option<u64>,
-    /// CPUs every workload process is pinned to. Required for recorded runs.
+    /// CPUs every workload process of a single-process scenario is pinned to. Required for recorded runs.
     pub cpus: Vec<usize>,
+    /// CPUs each role of a multi-process scenario is pinned to, by role name. Recorded runs require a set for every role.
+    pub role_cpus: BTreeMap<String, Vec<usize>>,
+    /// External programs by name, as paths on the measuring host; see [`ExternalProgram`].
+    pub programs: BTreeMap<String, PathBuf>,
     /// `perf stat` events counted for the whole workload process.
     pub perf_events: Vec<String>,
     pub perf_program: PathBuf,
@@ -114,6 +119,8 @@ impl PlanOptions {
             rounds: None,
             seed: None,
             cpus: Vec::new(),
+            role_cpus: BTreeMap::new(),
+            programs: BTreeMap::new(),
             perf_events: Vec::new(),
             perf_program: PathBuf::from("perf"),
             timeout: Duration::from_secs(300),
@@ -159,6 +166,38 @@ pub struct Plan {
     pub subjects: Vec<Subject>,
     pub pairs: Vec<Pair>,
     pub artifacts: ArtifactManifest,
+    /// A multi-process scenario's roles, in the order they start: services in declared order, then the driver. Empty for a single-process scenario.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<PlannedRole>,
+    /// The external programs its roles run, identified when the plan was made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<ExternalProgram>,
+}
+
+/// One role of every sample. The role that runs the subject takes each subject's program and arguments; every other role runs the same program with the same arguments for every subject.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedRole {
+    pub name: String,
+    pub kind: RoleKind,
+    pub program: RoleProgram,
+    /// Its arguments, with the mode's, for a role that does not run the subject. `{ROLE.NAME}` references are replaced by captured values when it starts.
+    pub arguments: Vec<String>,
+    /// The CPUs it is pinned to; empty when it is not placed.
+    pub cpus: Vec<usize>,
+    pub ready: Option<ReadyLine>,
+    pub stop: Option<Stop>,
+}
+
+/// A program outside the workspace that a role runs, identified on the measuring host. Its hash is verified before every sample, so a program changed during the campaign fails it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalProgram {
+    /// The name roles declare it by.
+    pub name: String,
+    /// The path it was given by, made absolute and canonical on the measuring host.
+    pub path: PathBuf,
+    pub sha256: String,
 }
 
 /// One executable and argument list, run once per round.
@@ -214,6 +253,7 @@ impl Plan {
         if rounds == 0 || options.timeout.is_zero() {
             return Err(invalid_input("rounds and timeout must be positive"));
         }
+        let (roles, programs) = plan_roles(&scenario, &options)?;
         let variants: Vec<Option<&crate::config::Variant>> = if scenario.variants.is_empty() {
             vec![None]
         } else {
@@ -306,6 +346,8 @@ impl Plan {
             subjects,
             pairs,
             artifacts: options.artifacts,
+            roles,
+            programs,
         };
         plan.check_prerequisites()?;
         Ok(plan)
@@ -313,6 +355,28 @@ impl Plan {
 
     pub fn subject(&self, label: &str) -> Option<&Subject> {
         self.subjects.iter().find(|subject| subject.label == label)
+    }
+
+    /// The roles without a CPU set.
+    pub fn unplaced_roles(&self) -> Vec<&str> {
+        self.roles
+            .iter()
+            .filter(|role| role.cpus.is_empty())
+            .map(|role| role.name.as_str())
+            .collect()
+    }
+
+    /// Every CPU a workload process may be pinned to: the single-process placement, or every role's.
+    pub fn placed_cpus(&self) -> Vec<usize> {
+        let mut cpus: Vec<usize> = self
+            .cpus
+            .iter()
+            .chain(self.roles.iter().flat_map(|role| &role.cpus))
+            .copied()
+            .collect();
+        cpus.sort_unstable();
+        cpus.dedup();
+        cpus
     }
 
     /// Recorded campaigns must declare what makes them acceptance evidence. All unmet prerequisites are reported together.
@@ -324,8 +388,14 @@ impl Plan {
         if self.rounds < 10 {
             missing.push("at least 10 rounds".to_owned());
         }
-        if self.cpus.is_empty() {
+        let unplaced = self.unplaced_roles();
+        if self.roles.is_empty() && self.cpus.is_empty() {
             missing.push("explicit CPU placement".to_owned());
+        } else if !unplaced.is_empty() {
+            missing.push(format!(
+                "explicit CPU placement for every role ({} has none)",
+                unplaced.join(", ")
+            ));
         }
         if self.decision_rule.is_none() {
             missing.push("a predeclared decision rule".to_owned());
@@ -387,6 +457,138 @@ impl Plan {
                 missing.join(", ")
             )))
         }
+    }
+}
+
+/// Expand a scenario's roles in start order, and identify the external programs they run.
+fn plan_roles(
+    scenario: &crate::config::Scenario,
+    options: &PlanOptions,
+) -> io::Result<(Vec<PlannedRole>, Vec<ExternalProgram>)> {
+    if scenario.roles.is_empty() {
+        if let Some(role) = options.role_cpus.keys().next() {
+            return Err(invalid_input(format!(
+                "scenario {:?} has no roles, so role {role:?} cannot be placed; use --cpus",
+                scenario.name
+            )));
+        }
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if !options.cpus.is_empty() {
+        return Err(invalid_input(format!(
+            "scenario {:?} has roles; place each with --role-cpus ROLE=CPUS rather than --cpus",
+            scenario.name
+        )));
+    }
+    if !options.perf_events.is_empty() {
+        return Err(invalid_input(format!(
+            "scenario {:?} has roles, whose processes cannot be counted with perf stat yet",
+            scenario.name
+        )));
+    }
+    if let Some(role) = options
+        .role_cpus
+        .keys()
+        .find(|name| !scenario.roles.iter().any(|role| &role.name == *name))
+    {
+        return Err(invalid_input(format!(
+            "scenario {:?} has no role {role:?} to place",
+            scenario.name
+        )));
+    }
+    let services = scenario
+        .roles
+        .iter()
+        .filter(|role| role.kind == RoleKind::Service);
+    let drivers = scenario
+        .roles
+        .iter()
+        .filter(|role| role.kind == RoleKind::Driver);
+    let mut programs: Vec<ExternalProgram> = Vec::new();
+    let mut roles = Vec::new();
+    for role in services.chain(drivers) {
+        let arguments = match role.program {
+            RoleProgram::Subject => Vec::new(),
+            _ => {
+                let mode_arguments = if options.mode == Mode::Smoke {
+                    &role.smoke_arguments
+                } else {
+                    &role.measure_arguments
+                };
+                role.arguments
+                    .iter()
+                    .chain(mode_arguments)
+                    .cloned()
+                    .collect()
+            }
+        };
+        if let RoleProgram::External { name } = &role.program {
+            if !programs.iter().any(|program| &program.name == name) {
+                let path = options.programs.get(name).ok_or_else(|| {
+                    invalid_input(format!(
+                        "role {:?} runs the external program {name:?}; give its path with --program {name}=PATH",
+                        role.name
+                    ))
+                })?;
+                programs.push(ExternalProgram::identify(name, path)?);
+            }
+        }
+        roles.push(PlannedRole {
+            name: role.name.clone(),
+            kind: role.kind,
+            program: role.program.clone(),
+            arguments,
+            cpus: options
+                .role_cpus
+                .get(&role.name)
+                .cloned()
+                .unwrap_or_default(),
+            ready: role.ready.clone(),
+            stop: role.stop.clone(),
+        });
+    }
+    Ok((roles, programs))
+}
+
+impl ExternalProgram {
+    /// Resolve `path` on this host, relative to the current directory, and hash it.
+    pub fn identify(name: &str, path: &std::path::Path) -> io::Result<Self> {
+        let resolved = path.canonicalize().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("external program {name}, {}: {error}", path.display()),
+            )
+        })?;
+        let sha256 = sha256_identified(&resolved).map_err(|error| {
+            io::Error::new(error.kind(), format!("external program {name}: {error}"))
+        })?;
+        Ok(Self {
+            name: name.to_owned(),
+            path: resolved,
+            sha256,
+        })
+    }
+
+    /// Fail if the program changed since the plan identified it.
+    pub fn verify(&self) -> io::Result<()> {
+        let actual = sha256_identified(&self.path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("external program {}: {error}", self.name),
+            )
+        })?;
+        if actual != self.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "external program {} changed during the campaign: {} no longer has SHA-256 {}",
+                    self.name,
+                    self.path.display(),
+                    self.sha256
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 

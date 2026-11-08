@@ -240,3 +240,163 @@ fn launches_use_a_minimal_recorded_environment() {
     let mut shuffle = Shuffle::new(9);
     assert!((0..100).all(|_| shuffle.below(STACK_PADDING_LIMIT) < STACK_PADDING_LIMIT));
 }
+
+fn roles_options(mode: Mode) -> PlanOptions {
+    let artifacts = manifest(vec![artifact(
+        "baseline",
+        ArtifactRole::Baseline,
+        Path::new(SHELL),
+    )]);
+    let suite = crate::test_support::roles_suite(
+        Path::new("/server.sh"),
+        Path::new("/client.sh"),
+        &["base", "fast"],
+    );
+    let mut options = PlanOptions::new(suite, "work", artifacts, mode);
+    options.programs = [("shell".to_owned(), PathBuf::from(SHELL))].into();
+    options
+}
+
+#[test]
+fn roles_start_services_first_and_variants_change_only_the_subject() {
+    let mut options = roles_options(Mode::Smoke);
+    options.role_cpus = [("server".to_owned(), vec![1, 2])].into();
+    let plan = Plan::new(options).unwrap();
+    let roles: Vec<_> = plan
+        .roles
+        .iter()
+        .map(|role| (role.name.as_str(), role.cpus.clone()))
+        .collect();
+    assert_eq!(roles, [("server", vec![1, 2]), ("client", Vec::new())]);
+    assert_eq!(plan.unplaced_roles(), ["client"]);
+    assert_eq!(plan.placed_cpus(), [1, 2]);
+    // The driver takes its smoke arguments; the subject's role takes each subject's.
+    assert_eq!(
+        plan.roles[1].arguments,
+        ["/client.sh", "{server.address}", "smoke"]
+    );
+    assert!(plan.roles[0].arguments.is_empty());
+    let arguments: Vec<_> = plan
+        .subjects
+        .iter()
+        .map(|subject| subject.arguments.clone())
+        .collect();
+    assert_eq!(
+        arguments,
+        [
+            ["/server.sh", "base", "smoke"],
+            ["/server.sh", "fast", "smoke"]
+        ]
+    );
+    let shell = Path::new(SHELL).canonicalize().unwrap();
+    assert_eq!(
+        plan.programs,
+        [ExternalProgram {
+            name: "shell".to_owned(),
+            path: shell.clone(),
+            sha256: crate::artifact::sha256_file(&shell).unwrap()
+        }]
+    );
+    plan.programs[0].verify().unwrap();
+    // Plans without roles serialize as before.
+    let single = Plan::new(options_single()).unwrap();
+    let value = serde_json::to_value(&single).unwrap();
+    assert!(value.get("roles").is_none() && value.get("programs").is_none());
+    assert_eq!(
+        serde_json::from_value::<Plan>(serde_json::to_value(&plan).unwrap()).unwrap(),
+        plan
+    );
+
+    let measured = Plan::new(roles_options(Mode::Screening)).unwrap();
+    assert_eq!(
+        measured.roles[1].arguments,
+        ["/client.sh", "{server.address}", "measure"]
+    );
+}
+
+fn options_single() -> PlanOptions {
+    options(&[("baseline", ArtifactRole::Baseline)], &[], Mode::Smoke)
+}
+
+#[test]
+fn roles_need_their_programs_and_their_own_placement() {
+    type Change = fn(&mut PlanOptions);
+    let cases: [(Change, &str); 6] = [
+        (
+            |options| options.cpus = vec![1],
+            "place each with --role-cpus",
+        ),
+        (
+            |options| options.perf_events = vec!["cycles".to_owned()],
+            "cannot be counted with perf stat",
+        ),
+        (
+            |options| {
+                options.role_cpus.insert("missing".to_owned(), vec![1]);
+            },
+            "has no role \"missing\"",
+        ),
+        (
+            |options| options.programs.clear(),
+            "give its path with --program shell=PATH",
+        ),
+        (
+            |options| {
+                options
+                    .programs
+                    .insert("shell".to_owned(), PathBuf::from("/nonexistent/shell"));
+            },
+            "external program shell, /nonexistent/shell",
+        ),
+        (
+            |options| options.mode = Mode::Recorded,
+            "explicit CPU placement for every role (server, client has none)",
+        ),
+    ];
+    for (change, message) in cases {
+        let mut options = roles_options(Mode::Screening);
+        change(&mut options);
+        let error = Plan::new(options).unwrap_err().to_string();
+        assert!(error.contains(message), "{message}: {error}");
+    }
+    let mut single = options_single();
+    single.role_cpus.insert("server".to_owned(), vec![1]);
+    assert!(
+        Plan::new(single)
+            .unwrap_err()
+            .to_string()
+            .contains("has no roles")
+    );
+    // An external program that is a directory cannot be hashed.
+    assert!(
+        ExternalProgram::identify("shell", Path::new("/"))
+            .unwrap_err()
+            .to_string()
+            .contains("external program shell")
+    );
+}
+
+#[test]
+fn changed_external_programs_fail_verification() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("program");
+    std::fs::write(&path, "before").unwrap();
+    let program = ExternalProgram::identify("tool", &path).unwrap();
+    assert_eq!(program.path, path.canonicalize().unwrap());
+    std::fs::write(&path, "after, longer").unwrap();
+    let error = program.verify().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("external program tool changed during the campaign"),
+        "{error}"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(
+        program
+            .verify()
+            .unwrap_err()
+            .to_string()
+            .contains("external program tool:")
+    );
+}

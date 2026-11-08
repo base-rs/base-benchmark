@@ -8,6 +8,7 @@ use crate::artifact::{
 };
 use crate::config::{Scenario, Suite, Variant};
 use crate::plan::{Mode, Plan, PlanOptions};
+use crate::role::{ReadyLine, Role, RoleKind, RoleProgram, Stop};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -107,6 +108,7 @@ pub fn suite(script: &Path, variants: &[&str]) -> Suite {
                 .collect(),
             baseline: None,
             features: Vec::new(),
+            roles: Vec::new(),
         }],
     }
 }
@@ -190,4 +192,69 @@ pub fn vendored_tree(directory: &Path) -> PathBuf {
     )
     .unwrap();
     tree
+}
+
+/// A service role named `name`, running `program`, ready on `pattern`, stopped with SIGTERM.
+pub fn service(name: &str, program: RoleProgram, arguments: &[&str], pattern: &str) -> Role {
+    Role {
+        name: name.to_owned(),
+        kind: RoleKind::Service,
+        program,
+        arguments: arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect(),
+        smoke_arguments: Vec::new(),
+        measure_arguments: Vec::new(),
+        ready: Some(ReadyLine {
+            pattern: pattern.to_owned(),
+            timeout_ms: 20_000,
+        }),
+        stop: Some(Stop::Signal {
+            signal: "SIGTERM".to_owned(),
+            grace_ms: 20_000,
+        }),
+    }
+}
+
+/// The external program `shell`, `/bin/sh`.
+pub fn shell() -> RoleProgram {
+    RoleProgram::External {
+        name: "shell".to_owned(),
+    }
+}
+
+/// A suite whose scenario `work` runs `service` as the subject in the service role `server`, ready on `ready {address}`, and the driver `client`, the external program `shell` running `driver` with the server's address and `smoke` or `measure`.
+pub fn roles_suite(service_script: &Path, driver: &Path, variants: &[&str]) -> Suite {
+    let mut suite = suite(service_script, variants);
+    suite.scenarios[0].roles = vec![
+        Role {
+            name: "client".to_owned(),
+            kind: RoleKind::Driver,
+            program: shell(),
+            arguments: vec![driver.display().to_string(), "{server.address}".to_owned()],
+            smoke_arguments: vec!["smoke".to_owned()],
+            measure_arguments: vec!["measure".to_owned()],
+            ready: None,
+            stop: None,
+        },
+        service("server", RoleProgram::Subject, &[], "ready {address}"),
+    ];
+    suite
+}
+
+/// A screening plan of one round of a suite with roles, running `/bin/sh` as the subject and as the external program `shell`.
+pub fn roles_plan(suite: Suite, lock: &Path) -> Plan {
+    let artifacts = manifest(vec![artifact(
+        "baseline",
+        ArtifactRole::Baseline,
+        Path::new(SHELL),
+    )]);
+    let mut options = PlanOptions::new(suite, "work", artifacts, Mode::Screening);
+    options.rounds = Some(1);
+    options.seed = Some(7);
+    options.lock = lock.to_owned();
+    options.timeout = Duration::from_secs(20);
+    options.programs = [("shell".to_owned(), PathBuf::from(SHELL))].into();
+    Plan::new(options).unwrap()
 }
