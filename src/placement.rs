@@ -9,9 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Which logical CPUs share a physical core: each CPU's SMT siblings, itself included, as the measuring host reports them.
+///
+/// Only what the host reports can be checked: a virtual machine that hides SMT from its guest reports every virtual CPU as a core of its own, even when two of them are siblings on the host underneath.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Topology {
     siblings: BTreeMap<usize, BTreeSet<usize>>,
+    /// The CPUs that exist and those that are online, when read from the host.
+    available: Option<(BTreeSet<usize>, BTreeSet<usize>)>,
 }
 
 impl Topology {
@@ -22,16 +26,23 @@ impl Topology {
                 .into_iter()
                 .map(|(cpu, siblings)| (cpu, siblings.into_iter().chain([cpu]).collect()))
                 .collect(),
+            available: None,
         }
     }
 
-    /// The siblings of `cpus` on this host, from `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`. CPUs whose siblings cannot be read are unknown.
+    /// The siblings of `cpus` on this host, from `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`, and which CPUs exist and are online, from `/sys/devices/system/cpu/present` and `online`. CPUs whose siblings cannot be read are unknown.
     pub fn read(cpus: &[usize]) -> Self {
         Self::read_from(Path::new("/"), cpus)
     }
 
     pub(crate) fn read_from(root: &Path, cpus: &[usize]) -> Self {
-        Self::new(
+        let list = |name: &str| -> Option<BTreeSet<usize>> {
+            let text =
+                std::fs::read_to_string(root.join("sys/devices/system/cpu").join(name)).ok()?;
+            parse_cpus(text.trim()).ok().map(BTreeSet::from_iter)
+        };
+        let available = list("present").zip(list("online"));
+        let topology = Self::new(
             cpus.iter()
                 .filter_map(|&cpu| {
                     let path = root.join(format!(
@@ -43,7 +54,28 @@ impl Topology {
                         .map(|siblings| (cpu, siblings))
                 })
                 .collect(),
-        )
+        );
+        Self {
+            available,
+            ..topology
+        }
+    }
+
+    /// Why each of `cpus` cannot run a process on this host, if the host reported which CPUs exist and are online: `CPU 9 does not exist`.
+    pub(crate) fn unavailable(&self, cpus: &[usize]) -> Vec<String> {
+        let Some((present, online)) = &self.available else {
+            return Vec::new();
+        };
+        let cpus: BTreeSet<usize> = cpus.iter().copied().collect();
+        cpus.into_iter()
+            .filter_map(
+                |cpu| match (present.contains(&cpu), online.contains(&cpu)) {
+                    (false, _) => Some(format!("CPU {cpu} does not exist")),
+                    (true, false) => Some(format!("CPU {cpu} is offline")),
+                    (true, true) => None,
+                },
+            )
+            .collect()
     }
 
     fn core(&self, cpu: usize) -> Option<&BTreeSet<usize>> {

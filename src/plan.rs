@@ -278,6 +278,13 @@ impl Plan {
             .topology
             .clone()
             .unwrap_or_else(|| Topology::read(&placed));
+        let unavailable = topology.unavailable(&placed);
+        if !unavailable.is_empty() {
+            return Err(invalid_input(format!(
+                "roles are placed on CPUs this host cannot run them on: {}",
+                unavailable.join(", ")
+            )));
+        }
         let (shared_cores, unknown_topology) = shared_cores(&roles, &topology);
         let variants: Vec<Option<&crate::config::Variant>> = if scenario.variants.is_empty() {
             vec![None]
@@ -483,7 +490,8 @@ impl Plan {
                 describe(&self.shared_cores)
             ));
         }
-        if !self.unknown_topology.is_empty() {
+        // Declared sharing allows sharing through siblings that are not reported, too.
+        if !self.shared_placement && !self.unknown_topology.is_empty() {
             missing.push(format!(
                 "the SMT siblings of CPUs {}, to rule out roles sharing a physical core",
                 cpu_list(&self.unknown_topology)

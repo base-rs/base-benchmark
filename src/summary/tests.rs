@@ -1054,8 +1054,8 @@ fn shared_placement_is_warned_about_unless_declared_and_then_labelled() {
             summary.warnings
         );
     }
+    // Declared sharing is not warned about, nor are CPUs whose siblings are unknown, through which it could only share more.
     plan.shared_placement = true;
-    plan.unknown_topology.clear();
     let summary = summarize(&plan, &entries);
     assert!(
         summary

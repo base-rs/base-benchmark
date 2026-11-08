@@ -173,6 +173,9 @@ pub fn run(
         error: None,
     };
     let journal = Journal::create(output, metadata)?;
+    for warning in crate::summary::placement_warnings(&journal.metadata.plan) {
+        let _ = writeln!(progress, "base-benchmark: warning: {warning}");
+    }
     match collect(&journal, cancellation, progress) {
         Ok(summary) => {
             journal.complete(&summary)?;

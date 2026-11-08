@@ -569,23 +569,31 @@ pub fn sign_test(improved: usize, regressed: usize) -> f64 {
     (2.0 * tail).min(1.0)
 }
 
+/// Roles' undeclared sharing of physical cores, which recorded campaigns refuse and other measured campaigns warn about, in their summaries and when they start, so that a campaign that fails still shows them.
+pub(crate) fn placement_warnings(plan: &Plan) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if plan.mode == Mode::Smoke || plan.shared_placement {
+        return warnings;
+    }
+    if !plan.shared_cores.is_empty() {
+        warnings.push(format!("roles share physical cores, which the scenario does not declare, so they contend for them: {}", crate::placement::describe(&plan.shared_cores)));
+    }
+    if !plan.unknown_topology.is_empty() {
+        warnings.push(format!(
+            "the SMT siblings of CPUs {} are unknown, so roles may share a physical core",
+            crate::plan::cpu_list(&plan.unknown_topology)
+        ));
+    }
+    warnings
+}
+
 /// Hazards that make a comparison weaker than its numbers suggest.
 fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary], warnings: &mut Warnings) {
     if plan.mode != Mode::Smoke && plan.roles.is_empty() && plan.cpus.is_empty() {
         warnings.add(Hazard::Control, "no CPU placement: workload processes may run on different cores or core types between rounds".to_owned(), None);
     }
-    if plan.mode != Mode::Smoke && !plan.shared_placement && !plan.shared_cores.is_empty() {
-        warnings.add(Hazard::Control, format!("roles share physical cores, which the scenario does not declare, so they contend for them: {}", crate::placement::describe(&plan.shared_cores)), None);
-    }
-    if plan.mode != Mode::Smoke && !plan.unknown_topology.is_empty() {
-        warnings.add(
-            Hazard::Control,
-            format!(
-                "the SMT siblings of CPUs {} are unknown, so roles may share a physical core",
-                crate::plan::cpu_list(&plan.unknown_topology)
-            ),
-            None,
-        );
+    for warning in placement_warnings(plan) {
+        warnings.add(Hazard::Control, warning, None);
     }
     let unplaced = plan.unplaced_roles();
     if plan.mode != Mode::Smoke && !unplaced.is_empty() {

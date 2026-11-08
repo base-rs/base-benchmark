@@ -442,6 +442,9 @@ fn roles_on_shared_physical_cores_must_be_declared_in_recorded_campaigns() {
         error.contains("the SMT siblings of CPUs 2, to rule out roles sharing a physical core"),
         "{error}"
     );
+    // A scenario that declares shared placement need not rule it out.
+    let plan = recorded(true, vec![2], Topology::new([(3, vec![])].into())).unwrap();
+    assert_eq!(plan.unknown_topology, [2]);
     // Screening campaigns are planned, and warned about in their summaries.
     let mut screening = roles_options(Mode::Screening);
     screening.role_cpus = [
@@ -454,5 +457,34 @@ fn roles_on_shared_physical_cores_must_be_declared_in_recorded_campaigns() {
     assert_eq!(
         (plan.shared_cores.len(), plan.unknown_topology.as_slice()),
         (1, &[1][..])
+    );
+}
+
+#[test]
+fn roles_must_be_placed_on_cpus_that_exist_and_are_online() {
+    let directory = tempfile::tempdir().unwrap();
+    let cpus = directory.path().join("sys/devices/system/cpu");
+    for cpu in 0..3 {
+        let topology = cpus.join(format!("cpu{cpu}/topology"));
+        std::fs::create_dir_all(&topology).unwrap();
+        std::fs::write(topology.join("thread_siblings_list"), format!("{cpu}\n")).unwrap();
+    }
+    std::fs::write(cpus.join("present"), "0-3\n").unwrap();
+    std::fs::write(cpus.join("online"), "0-2\n").unwrap();
+    let plan = |client: Vec<usize>| {
+        let mut options = roles_options(Mode::Screening);
+        options.role_cpus = [
+            ("server".to_owned(), vec![1]),
+            ("client".to_owned(), client),
+        ]
+        .into();
+        options.topology = Some(Topology::read_from(directory.path(), &[0, 1, 2, 3, 9]));
+        Plan::new(options)
+    };
+    plan(vec![2]).unwrap();
+    let error = plan(vec![3, 9, 2]).unwrap_err().to_string();
+    assert!(
+        error.contains("roles are placed on CPUs this host cannot run them on: CPU 3 is offline, CPU 9 does not exist"),
+        "{error}"
     );
 }

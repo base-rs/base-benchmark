@@ -86,7 +86,14 @@ fn topology_is_read_from_sysfs() {
     }
     let topology = Topology::read_from(directory.path(), &[0, 1, 2, 4]);
     assert_eq!(topology, Topology::new([(0, vec![4]), (4, vec![0])].into()));
-    // This host reports its own CPUs.
+    // Without the lists of present and online CPUs, nothing is known to be unavailable.
+    assert!(topology.unavailable(&[7]).is_empty());
+    // This host reports its own CPUs, and that CPU 0 is present and online.
     let host = Topology::read(&[0]);
     assert!(host.core(0).is_some_and(|core| core.contains(&0)));
+    assert!(host.unavailable(&[0]).is_empty());
+    assert_eq!(
+        host.unavailable(&[1 << 20]),
+        [format!("CPU {} does not exist", 1 << 20)]
+    );
 }
