@@ -77,7 +77,7 @@ Scenario arguments always come from the current workspace, so every tree must co
 - **The tree's workspace.** It must list the package as a member, by name or with a glob, and define whatever the package inherits with `workspace = true`. Inherited dependencies take the tree's versions and features, and the tree's `[patch]` applies.
 - **Provenance.** Each artifact records the overlaid package's path and Git state, read once per preparation, and recorded campaigns require it to be committed and unmodified. Reports name the overlaid package and the artifacts built with it, and list each artifact's lockfile changes, and `summary.json` records the same in `overlays`, so an overlaid comparison describes itself.
 
-Every task except `summarize` accepts `--manifest-path` for a standalone workspace, such as a benchmark suite excluded from the main workspace. Relative paths are resolved against the project root. The first SIGINT, SIGTERM, or SIGHUP stops preparation between builds, writing no manifest, or kills the running workload's process group and records the campaign as cancelled; a second signal exits immediately.
+Every task except `summarize` accepts `--manifest-path` for a standalone workspace, such as a benchmark suite excluded from the main workspace. Relative paths are resolved against the project root. The first SIGINT, SIGTERM, or SIGHUP stops preparation, writing no manifest and reporting it as cancelled: after the build in progress, or at once when the signal reaches Cargo too, as Ctrl-C does; or it kills the running workload's process group and records the campaign as cancelled; a second signal exits immediately.
 
 Recorded runs require:
 

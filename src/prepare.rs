@@ -130,7 +130,7 @@ pub struct Prepared {
 
 /// Build every tree with the same profile and lockfile policy, once for each feature set, then freeze each executable.
 ///
-/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at another path alone usually gives an identical executable, since Cargo identifies workspace members by their relative paths, so each replica's workspace crates are also built with a distinct `-C metadata` salt, which changes symbol hashes and therefore code layout. Comparing the baseline with its replicas shows how much a change of layout alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds and again before the manifest is written: a cancelled preparation fails with `Interrupted` and writes no manifest, even when the build that was running finishes.
+/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at another path alone usually gives an identical executable, since Cargo identifies workspace members by their relative paths, so each replica's workspace crates are also built with a distinct `-C metadata` salt, which changes symbol hashes and therefore code layout. Comparing the baseline with its replicas shows how much a change of layout alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds and again before the manifest is written: a cancelled preparation fails with `Interrupted` and writes no manifest, whether the build that was running finishes, as when only this process is signalled, or fails, as when a terminal's interrupt reaches Cargo too.
 pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Result<Prepared> {
     let (trees, copies) = validate(options)?;
     let output = std::path::absolute(&options.output)?;
@@ -436,12 +436,26 @@ struct Build<'a> {
 }
 
 impl Build<'_> {
+    /// Build and freeze the executable, unless preparation was cancelled. A failure once it is cancelled is the cancellation's: a terminal's interrupt reaches the whole process group, so Cargo, or another program this runs, such as the writer or `rustc -Vv`, dies of it too.
     fn run(
         self,
         options: &PrepareOptions,
-        mut source: SourceIdentity,
+        source: SourceIdentity,
         cancellation: &Cancellation,
     ) -> io::Result<Artifact> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        self.build(options, source).map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled()
+            } else {
+                error
+            }
+        })
+    }
+
+    fn build(self, options: &PrepareOptions, mut source: SourceIdentity) -> io::Result<Artifact> {
         let Build {
             label,
             role,
@@ -451,9 +465,6 @@ impl Build<'_> {
             executable: frozen,
             salt,
         } = self;
-        if cancellation.is_cancelled() {
-            return Err(cancelled());
-        }
         let suite = &options.suite;
         let mut command = vec![options.cargo.display().to_string(), "build".to_owned()];
         // An overlaid harness may need dependencies the tree's lockfile lacks.

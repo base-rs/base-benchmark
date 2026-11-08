@@ -51,8 +51,24 @@ impl Remote {
 
     /// Run `command` (`prepare`, `run`, or `smoke`) with its command-line `arguments` on the host. Progress goes to this process's standard error as it happens.
     ///
-    /// Cancelling `cancellation` stops the host's command, as a termination signal would stop it locally, and its output is still copied back. The host's command also stops when this process exits or the connection drops.
+    /// Cancelling `cancellation` stops the host's command, as a termination signal would stop it locally, and its output is still copied back. The host's command also stops when this process exits or the connection drops. A cancelled command fails with `Interrupted`, also when a program it runs fails meanwhile, as rsync, or Cargo finding the workspace, does when a terminal's interrupt reaches it too.
     pub fn execute(
+        &self,
+        command: &str,
+        arguments: Vec<String>,
+        cancellation: &Cancellation,
+    ) -> io::Result<Outcome> {
+        self.dispatch(command, arguments, cancellation)
+            .map_err(|error| {
+                if cancellation.is_cancelled() {
+                    cancelled()
+                } else {
+                    error
+                }
+            })
+    }
+
+    fn dispatch(
         &self,
         command: &str,
         arguments: Vec<String>,

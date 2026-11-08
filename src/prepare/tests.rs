@@ -654,11 +654,12 @@ enum Preparation {
     Finished(io::Result<Prepared>),
 }
 
-/// Prepare with `options`, cancelling while the build whose target directory matches the shell pattern `paused` runs, then letting that build finish, as Cargo does when only this process is signalled.
+/// Prepare with `options`, cancelling while the build whose target directory matches the shell pattern `paused` runs, then letting that build resume with the shell commands `resumed`: `:` to finish, as Cargo does when only this process is signalled.
 fn cancelled_during_build(
     directory: &Path,
     options: PrepareOptions,
     paused: &str,
+    resumed: &str,
 ) -> io::Result<Prepared> {
     let started = directory.join("started");
     let resume = directory.join("resume");
@@ -670,7 +671,7 @@ fn cancelled_during_build(
         &std::fs::read_to_string(&options.cargo).unwrap().replace(
             "\n:\n",
             &format!(
-                "\ncase \"$target\" in {paused}) echo started > '{}'; read resumed < '{}';; esac\n",
+                "\ncase \"$target\" in {paused}) echo started > '{}'; read resumed < '{}'; {resumed};; esac\n",
                 started.display(),
                 resume.display()
             ),
@@ -713,7 +714,7 @@ fn preparation_cancelled_during_a_build_fails_without_reading_metadata_online() 
         cargo_needing_the_network(directory.path(), "cargo", "{}"),
     );
     let output = options.output.clone();
-    let error = cancelled_during_build(directory.path(), options, "*").unwrap_err();
+    let error = cancelled_during_build(directory.path(), options, "*", ":").unwrap_err();
     // The build finished, but its path dependencies are unknown because preparation was cancelled, so it fails as preparation cancelled between builds does, without a second attempt or a warning.
     assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
     assert_eq!(error.to_string(), "preparation was cancelled");
@@ -733,9 +734,32 @@ fn preparation_cancelled_during_its_last_build_writes_no_manifest() {
     options.replicas = Some(1);
     let output = options.output.clone();
     // A layout replica, built last, reads no metadata, so every artifact is complete when preparation notices the cancellation.
-    let error = cancelled_during_build(directory.path(), options, "*-replica").unwrap_err();
+    let error = cancelled_during_build(directory.path(), options, "*-replica", ":").unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
     assert!(output.join("artifacts/base-replica/0/fixture").exists());
+    assert!(!artifact::manifest_path(&output).exists());
+}
+
+#[test]
+fn preparation_interrupted_with_its_build_fails_as_cancelled() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = options(
+        directory.path(),
+        vec![tree(directory.path(), "base")],
+        cargo(directory.path()),
+    );
+    let output = options.output.clone();
+    // A terminal's interrupt reaches Cargo too, which dies of it; KILL in case SIGINT was ignored when this process started.
+    let error = cancelled_during_build(
+        directory.path(),
+        options,
+        "*",
+        "kill -INT $$; kill -KILL $$",
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+    assert_eq!(error.to_string(), "preparation was cancelled");
+    assert!(!output.join("artifacts/base/0/fixture").exists());
     assert!(!artifact::manifest_path(&output).exists());
 }
 
