@@ -640,9 +640,27 @@ fn lockfile_changes_name_every_locked_version_that_moved_and_harness_drift() {
         .split("[[package]]\nname = \"signal\"")
         .next()
         .unwrap();
-    assert_eq!(
-        lockfile_changes(TREE_LOCK, removed, ""),
-        ["signal 0.4.5 -> removed"]
+    assert!(
+        lockfile_changes(TREE_LOCK, removed, "").is_empty(),
+        "a package no longer used changes nothing"
     );
     assert!(lockfile_changes("", TREE_LOCK, "").is_empty());
+}
+
+#[test]
+fn lockfiles_with_windows_line_endings_are_read_alike() {
+    let directory = tempfile::tempdir().unwrap();
+    let copy = directory.path().join("Cargo.lock");
+    let current = directory.path().join("current.lock");
+    std::fs::write(&copy, TREE_LOCK.replace('\n', "\r\n")).unwrap();
+    std::fs::write(&current, TREE_LOCK.replace('\n', "\r\n")).unwrap();
+    seed_lockfile(&copy, &current).unwrap();
+    // Nothing is added twice: every entry of the current lockfile is already locked.
+    assert_eq!(
+        std::fs::read_to_string(&copy)
+            .unwrap()
+            .matches("[[package]]")
+            .count(),
+        2
+    );
 }

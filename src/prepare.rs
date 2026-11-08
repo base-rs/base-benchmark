@@ -667,7 +667,12 @@ fn with_lockfile_changes(
     built: &Path,
     current: Option<&Path>,
 ) -> Vec<Artifact> {
-    let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
+    // Lockfiles checked out with Windows line endings parse the same.
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n")
+    };
     let changes = lockfile_changes(
         &read(&tree.join("Cargo.lock")),
         &read(&built.join("Cargo.lock")),
@@ -732,8 +737,10 @@ fn versions<'a>(packages: &[Locked<'a>]) -> BTreeMap<&'a str, BTreeSet<&'a str>>
 ///
 /// Packages the tree locks keep its versions, since a second, compatible version would leave Cargo unable to choose. An entry that depends, directly or through other added entries, on a package the tree locks at another version would contradict the tree's lockfile, so it is left for Cargo to resolve.
 fn seed_lockfile(copy: &Path, current: &Path) -> io::Result<()> {
-    let tree = std::fs::read_to_string(copy).unwrap_or_default();
-    let current = std::fs::read_to_string(current)?;
+    let tree = std::fs::read_to_string(copy)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let current = std::fs::read_to_string(current)?.replace("\r\n", "\n");
     let (locked, available) = (locked_packages(&tree), locked_packages(&current));
     let (tree_versions, current_versions) = (versions(&locked), versions(&available));
     // Names the seed cannot use: packages the tree locks differently, then whatever depends on them.
@@ -767,7 +774,7 @@ fn seed_lockfile(copy: &Path, current: &Path) -> io::Result<()> {
     std::fs::write(copy, seeded)
 }
 
-/// What a build changed, as readable lines: each package the `original` lockfile locks whose versions differ in `built`, as `name before -> after`, and each package `built` adds whose versions differ from the `current` workspace's, as `name versions, not the current workspace's versions`.
+/// What a build changed, as readable lines: each package the `original` lockfile locks that `built` uses at a version it did not lock, as `name before -> after`, and each package `built` adds whose versions differ from the `current` workspace's, as `name versions, not the current workspace's versions`. A package the build no longer uses, such as a dependency only an older workload had, changes nothing that is measured.
 pub(crate) fn lockfile_changes(original: &str, built: &str, current: &str) -> Vec<String> {
     let (original, built, current) = (
         versions(&locked_packages(original)),
@@ -775,13 +782,10 @@ pub(crate) fn lockfile_changes(original: &str, built: &str, current: &str) -> Ve
         versions(&locked_packages(current)),
     );
     let join = |versions: &BTreeSet<&str>| versions.iter().copied().collect::<Vec<_>>().join(", ");
-    let changed = original
-        .iter()
-        .filter(|(name, before)| built.get(*name) != Some(*before))
-        .map(|(name, before)| {
-            let after = built.get(name).map_or("removed".to_owned(), join);
-            format!("{name} {} -> {after}", join(before))
-        });
+    let changed = original.iter().filter_map(|(name, before)| {
+        let after = built.get(name).filter(|after| !after.is_subset(before))?;
+        Some(format!("{name} {} -> {}", join(before), join(after)))
+    });
     let drifted = built
         .iter()
         .filter(|(name, _)| !original.contains_key(*name))
