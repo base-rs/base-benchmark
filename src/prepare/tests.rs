@@ -664,3 +664,65 @@ fn lockfiles_with_windows_line_endings_are_read_alike() {
         2
     );
 }
+
+#[test]
+fn layout_salt_wrappers_add_the_salt_after_any_existing_wrapper() {
+    let directory = tempfile::tempdir().unwrap();
+    let run = |existing: Option<&str>, name: &str| {
+        let target = directory.path().join(name);
+        let mut cargo = Command::new("cargo");
+        salt_workspace(&mut cargo, &target, "it's", existing.map(str::to_owned)).unwrap();
+        let wrapper = cargo
+            .get_envs()
+            .find(|(name, _)| *name == "RUSTC_WORKSPACE_WRAPPER")
+            .and_then(|(_, value)| value)
+            .map(PathBuf::from)
+            .unwrap();
+        // Run through the shell rather than executed, so writing it cannot race with another thread's fork.
+        let output = Command::new(crate::test_support::SHELL)
+            .arg(&wrapper)
+            .args(["printf", "%s|"])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    // `printf %s|` stands in for rustc, so the output shows the arguments it received.
+    assert_eq!(run(None, "plain"), "-C|metadata=it's|");
+    assert_eq!(run(Some("/usr/bin/env"), "chained"), "-C|metadata=it's|");
+    let error = salt_workspace(
+        &mut Command::new("cargo"),
+        &directory
+            .path()
+            .join("plain/base-benchmark-layout-salt/inside"),
+        "salt",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot write the layout salt wrapper"),
+        "{error}"
+    );
+}
+
+#[test]
+fn replica_salting_failures_name_the_wrapper() {
+    let directory = tempfile::tempdir().unwrap();
+    // Building the baseline leaves a file where the replica's target directory would be.
+    let cargo = fake_cargo(
+        directory.path(),
+        "blocking-cargo",
+        "case \"$manifest\" in *replica*) ;; *) mkdir -p \"$output/targets\"; touch \"$output/targets/t-replica\";; esac",
+        "{}",
+    );
+    let mut options = options(directory.path(), vec![tree(directory.path(), "t")], cargo);
+    options.replicas = Some(1);
+    let error = prepared(&options).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot write the layout salt wrapper"),
+        "{error}"
+    );
+}

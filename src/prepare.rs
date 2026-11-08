@@ -42,7 +42,7 @@ impl FromStr for Tree {
 pub struct PrepareOptions {
     pub suite: Suite,
     pub trees: Vec<Tree>,
-    /// How many copies of the baseline to rebuild at other paths, each one sample of build layout. Defaults to one when comparing two or more trees, otherwise none.
+    /// How many copies of the baseline to rebuild at other paths, with salted crate metadata, each one sample of build layout. Defaults to one when comparing two or more trees, otherwise none.
     pub replicas: Option<usize>,
     /// A new directory that receives frozen executables and `artifacts.json`.
     pub output: PathBuf,
@@ -130,7 +130,7 @@ pub struct Prepared {
 
 /// Build every tree with the same profile and lockfile policy, once for each feature set, then freeze each executable.
 ///
-/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at a different path changes Cargo's package metadata hashes and therefore code layout; comparing the baseline with its replicas shows how much a change of that kind alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds.
+/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at another path alone usually gives an identical executable, since Cargo identifies workspace members by their relative paths, so each replica's workspace crates are also built with a distinct `-C metadata` salt, which changes symbol hashes and therefore code layout. Comparing the baseline with its replicas shows how much a change of layout alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds.
 pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Result<Prepared> {
     let (trees, copies) = validate(options)?;
     let output = std::path::absolute(&options.output)?;
@@ -379,6 +379,9 @@ fn build_feature_sets(
                     .join(label)
                     .join(index.to_string())
                     .join(&options.suite.binary),
+                // A replica rebuilt at another path is usually identical to its baseline, since Cargo hashes workspace members by their relative paths; salting their metadata changes symbol hashes and therefore code layout. The wrapper that adds it is a shell script.
+                salt: (role == ArtifactRole::LayoutReplica && cfg!(unix))
+                    .then(|| format!("base-benchmark-{label}")),
             };
             build.run(options, source.clone(), cancellation)
         })
@@ -397,6 +400,8 @@ struct Build<'a> {
     features: &'a [String],
     /// Where to freeze the executable.
     executable: PathBuf,
+    /// Salt for the workspace's crate metadata, for layout replicas.
+    salt: Option<String>,
 }
 
 impl Build<'_> {
@@ -413,6 +418,7 @@ impl Build<'_> {
             target,
             features,
             executable: frozen,
+            salt,
         } = self;
         if cancellation.is_cancelled() {
             return Err(io::Error::new(
@@ -451,12 +457,21 @@ impl Build<'_> {
                 format!(" with features {}", features.join(","))
             }
         );
-        let result = Command::new(&command[0])
+        let mut cargo = Command::new(&command[0]);
+        cargo
             .args(&command[1..])
             .current_dir(tree)
             .stdin(Stdio::null())
-            .stderr(Stdio::inherit())
-            .output();
+            .stderr(Stdio::inherit());
+        if let Some(salt) = &salt {
+            salt_workspace(
+                &mut cargo,
+                target,
+                salt,
+                std::env::var("RUSTC_WORKSPACE_WRAPPER").ok(),
+            )?;
+        }
+        let result = cargo.output();
         let output_text = result.map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -512,9 +527,59 @@ impl Build<'_> {
                     tree,
                     cargo_home(std::env::var_os("CARGO_HOME"), std::env::var_os("HOME")),
                 ),
+                layout_salt: salt,
             },
         })
     }
+}
+
+/// Build the workspace's own crates with `-C metadata=SALT` added, through a `RUSTC_WORKSPACE_WRAPPER` script in the target directory. A wrapper already in the environment still runs, before the salt is added; `RUSTFLAGS` and Cargo configuration are untouched.
+#[cfg(unix)]
+pub(crate) fn salt_workspace(
+    cargo: &mut Command,
+    target: &Path,
+    salt: &str,
+    existing: Option<String>,
+) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let chained = existing
+        .map(|wrapper| format!("{} ", quote(&wrapper)))
+        .unwrap_or_default();
+    let wrapper = target.join("base-benchmark-layout-salt");
+    std::fs::create_dir_all(target)
+        .and_then(|()| {
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nexec {chained}\"$@\" -C metadata={}\n",
+                    quote(salt)
+                ),
+            )
+        })
+        .and_then(|()| std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)))
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{}: cannot write the layout salt wrapper: {error}",
+                    wrapper.display()
+                ),
+            )
+        })?;
+    cargo.env("RUSTC_WORKSPACE_WRAPPER", wrapper);
+    Ok(())
+}
+
+// Replicas are salted only on Unix, so this is never called elsewhere.
+#[cfg(not(unix))]
+pub(crate) fn salt_workspace(
+    _cargo: &mut Command,
+    _target: &Path,
+    _salt: &str,
+    _existing: Option<String>,
+) -> io::Result<()> {
+    Ok(())
 }
 
 /// Find the executable Cargo reported for `binary`, wherever the configured target directory layout put it.

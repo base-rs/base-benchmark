@@ -75,6 +75,13 @@ fn prepares_trees_with_a_layout_replica_and_compares_them() {
     );
     let replica = &prepared.manifest.artifacts[2];
     assert_eq!(replica.source.replica_of.as_deref(), Some("base"));
+    // Rebuilding at another path alone gives the same executable; the salted replica differs.
+    assert_eq!(
+        replica.build.layout_salt.as_deref(),
+        Some("base-benchmark-base-replica")
+    );
+    assert_ne!(replica.sha256, prepared.manifest.artifacts[0].sha256);
+    assert!(prepared.manifest.artifacts[0].build.layout_salt.is_none());
     assert!(
         !replica.source.path.exists(),
         "the replica source copy is removed after building"
