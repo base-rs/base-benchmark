@@ -583,7 +583,7 @@ fn wrapper_path(value: &str, base: &Path) -> Option<std::ffi::OsString> {
 
 /// `build.rustc-wrapper` set by one Cargo configuration file, or by the files it includes: `None` when none sets it, otherwise the wrapper, or `Some(None)` for an empty value.
 ///
-/// As for Cargo, the file's own value wins over the files it includes, and a later include over an earlier one. Includes are relative to the including file; a missing optional include is skipped. `including` holds the files that include this one, to report a cycle.
+/// As for Cargo, the file's own value wins over the files it includes, and a later include over an earlier one. Includes are relative to the including file, end with `.toml`, and are normalized lexically; a missing optional include is skipped. `including` holds the files that include this one, to report a cycle.
 fn configured_wrapper(
     path: &Path,
     including: &mut Vec<PathBuf>,
@@ -632,7 +632,11 @@ fn configured_wrapper(
             },
             _ => return Err(invalid("an include must be a path or a table".to_owned())),
         };
-        let included = directory.join(included);
+        if !included.ends_with(".toml") {
+            return Err(invalid(format!("include {included:?} must end with .toml")));
+        }
+        // Normalized as Cargo normalizes it, so that `..` neither changes where relative paths in it lead nor hides a cycle.
+        let included = crate::remote::normalized(&directory.join(included));
         if optional && !included.exists() {
             continue;
         }

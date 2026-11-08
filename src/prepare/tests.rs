@@ -924,6 +924,17 @@ fn included_configuration_sets_wrappers_as_cargo_includes_it() {
     assert_eq!(wrapper().unwrap(), found("c"));
     write("config.toml", "include = [{ path = \"a.toml\" }]\n");
     assert_eq!(wrapper().unwrap(), found("a"));
+    // `..` in an include is normalized, so a relative wrapper in it is relative to the directory holding the included file's directory.
+    std::fs::write(
+        directory.path().join("home/wrap.toml"),
+        "build.rustc-wrapper = \"bin/w\"\n",
+    )
+    .unwrap();
+    write("config.toml", "include = [\"../wrap.toml\"]\n");
+    assert_eq!(
+        wrapper().unwrap(),
+        Some(directory.path().join("bin/w").into_os_string())
+    );
     // Malformed or missing includes, cycles, and a `build` that is not a table are errors, as for Cargo.
     for (text, message) in [
         ("include = [\"missing.toml\"]\n", "missing.toml"),
@@ -938,6 +949,8 @@ fn included_configuration_sets_wrappers_as_cargo_includes_it() {
             "an include needs a string path",
         ),
         ("include = [\"config.toml\"]\n", "includes itself"),
+        ("include = [\"../.cargo/config.toml\"]\n", "includes itself"),
+        ("include = [\"a.txt\"]\n", "must end with .toml"),
         ("build = 1\n", "build must be a table"),
         ("build = [\n", "line 1"),
     ] {
