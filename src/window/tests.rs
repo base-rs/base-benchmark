@@ -60,11 +60,13 @@ fn markers_are_lines_and_follow_the_window_order() {
         window.stop().unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
+    assert_eq!(format!("{window:?}"), "Window { state: Before, .. }");
     window.start().unwrap();
     assert_eq!(
         window.start().unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
+    assert_eq!(format!("{window:?}"), "Window { state: Open, .. }");
     window.stop().unwrap();
     assert_eq!(
         window.stop().unwrap_err().kind(),

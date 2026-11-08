@@ -6,7 +6,7 @@ use std::io::{self, BufRead, Write};
 
 /// The variable through which the runner tells a driver how to send its window markers. Its only value so far is [`CONTROL_STDIO`].
 pub const CONTROL_VARIABLE: &str = "BASE_BENCHMARK_CONTROL";
-/// Markers are lines on the driver's stdout, before its record, and acknowledgements are lines on its stdin.
+/// Markers are whole lines on the driver's stdout, before its record, and the acknowledgement is a line on its stdin, which the runner then closes.
 pub const CONTROL_STDIO: &str = "stdio";
 /// The line a driver writes when its measured window starts.
 pub const WINDOW_START: &str = "base-benchmark window start";
@@ -17,7 +17,7 @@ pub const WINDOW_STARTED: &str = "base-benchmark window started";
 
 /// The measured window of a driver: the period of its counted operations, which it marks for the runner.
 ///
-/// Under the runner, a multi-process scenario's driver marks when its counted operations start, after its connections are established and its warmup is done, and when they end, so that the runner can measure the services over exactly that window. Markers are messages, lines on stdout before the record, so they do not depend on the driver sharing a host with the runner. The runner acknowledges the start once it has snapshotted every service: [`Window::start`] does not wait for that, and [`Window::start_acknowledged`] does, so that the snapshot precedes the first counted operation. Stopping never waits.
+/// Under the runner, a multi-process scenario's driver marks when its counted operations start, after its connections are established and its warmup is done, and when they end, so that the runner can measure the services over exactly that window. Markers are messages, lines on stdout before the record, so they do not depend on the driver sharing a host with the runner. Each is a whole line, ending in a newline and flushed when it is sent, since the runner acts on markers as they arrive; a marker after output of the record, or one that ends the output without a newline, fails the sample. A driver that writes markers itself rather than through `Window` must do the same. The runner acknowledges the start once it has snapshotted every service, and then closes the driver's stdin, so the acknowledgement is the only line a driver reads there: [`Window::start`] does not wait for it, and [`Window::start_acknowledged`] does, so that the snapshot precedes the first counted operation. Stopping never waits.
 ///
 /// A driver that sends no markers, sends one twice, or stops before it starts fails its sample. Outside the runner, [`Window::from_environment`] returns `None`, and the driver runs as it would without one.
 ///
@@ -120,6 +120,15 @@ impl Window {
     fn send(&mut self, marker: &str) -> io::Result<()> {
         self.output.write_all(format!("{marker}\n").as_bytes())?;
         self.output.flush()
+    }
+}
+
+impl std::fmt::Debug for Window {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Window")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
     }
 }
 

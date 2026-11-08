@@ -276,6 +276,12 @@ fn roles_start_services_first_and_variants_change_only_the_subject() {
         ["/client.sh", "{server.address}", "smoke"]
     );
     assert!(plan.roles[0].arguments.is_empty());
+    // The plan records how the driver is told to mark its window.
+    assert!(plan.roles[0].environment.is_empty());
+    assert_eq!(
+        plan.roles[1].environment,
+        BTreeMap::from([("BASE_BENCHMARK_CONTROL".to_owned(), "stdio".to_owned())])
+    );
     let arguments: Vec<_> = plan
         .subjects
         .iter()

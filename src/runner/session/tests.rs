@@ -1019,6 +1019,14 @@ fn drivers_must_mark_one_window() {
             "echo 'base-benchmark window pause'; sleep 30".to_owned(),
             "sent an invalid window marker \"base-benchmark window pause\"",
         ),
+        (
+            format!("{record}; echo '{WINDOW_START}'; echo '{WINDOW_STOP}'"),
+            "sent the window marker \"base-benchmark window start\" after output of its record",
+        ),
+        (
+            format!("echo '{WINDOW_START}'; printf '%s' '{WINDOW_STOP}'"),
+            "ended its output with the window marker \"base-benchmark window stop\" without a newline",
+        ),
     ];
     for (index, (client, message)) in cases.into_iter().enumerate() {
         let directory = tempfile::tempdir().unwrap();
@@ -1054,27 +1062,42 @@ fn escaped_descendants_of_the_driver_fail_the_session() {
 fn the_drivers_stdout_carries_markers_then_its_record() {
     let (sender, events) = mpsc::channel();
     let text = format!(
-        "{WINDOW_START}\r\nrecord part\nbase-benchmark window pause\n{WINDOW_STOP}\n{{\"last\":true}}"
+        "{WINDOW_START}\r\n\nbase-benchmark window pause\n{WINDOW_STOP}\nrecord part\n{{\"last\":true}}"
     );
     let (record, truncated) = read_driver(text.as_bytes(), &sender);
     assert_eq!(
         (record.as_slice(), truncated),
-        (&b"record part\n{\"last\":true}"[..], false)
+        (&b"\nrecord part\n{\"last\":true}"[..], false)
     );
-    let markers: Vec<_> = events
-        .try_iter()
-        .map(|event| match event {
-            Event::Marker(marker) => Some(marker),
-            Event::Closed => None,
-            _ => panic!("only markers and the close are reported"),
-        })
-        .collect();
+    let reported = |events: &Receiver<Event>| -> Vec<_> {
+        events
+            .try_iter()
+            .map(|event| match event {
+                Event::Marker(marker) => Some(marker),
+                Event::Closed => None,
+                _ => panic!("only markers and the close are reported"),
+            })
+            .collect()
+    };
+    // Blank lines before a marker are not the record's output.
     assert_eq!(
-        markers,
+        reported(&events),
         [
             Some(Marker::Start),
             Some(Marker::Invalid("base-benchmark window pause".to_owned())),
             Some(Marker::Stop),
+            None
+        ]
+    );
+    // Markers are whole lines before the record.
+    let text = format!("{{}}\n{WINDOW_STOP}\r\n{WINDOW_START}");
+    let (record, _) = read_driver(text.as_bytes(), &sender);
+    assert_eq!(record, b"{}\n");
+    assert_eq!(
+        reported(&events),
+        [
+            Some(Marker::Late(WINDOW_STOP.to_owned())),
+            Some(Marker::Unterminated(WINDOW_START.to_owned())),
             None
         ]
     );
@@ -1130,4 +1153,23 @@ fn window_metrics_are_differences_or_unavailable() {
                 crate::record::Measurement::Unavailable { .. }
             )));
     }
+}
+
+#[test]
+fn the_drivers_stdin_closes_once_the_snapshotted_start_is_acknowledged() {
+    // The driver reads its stdin to the end after the acknowledgement, which it reaches only if the runner closes it.
+    let directory = tempfile::tempdir().unwrap();
+    let client = format!(
+        "echo '{WINDOW_START}'\nread -r acknowledgement\n[ \"$acknowledgement\" = '{WINDOW_STARTED}' ] || exit 9\ncat > /dev/null\necho '{WINDOW_STOP}'\necho '{}'\n",
+        record("same", 100)
+    );
+    let plan = session(directory.path(), &serving("a:1"), &client);
+    WINDOW_START_STEPS.with(|steps| steps.take());
+    let output = directory.path().join("campaign");
+    run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap();
+    // The services were snapshotted before the acknowledgement was written, so before the driver's first counted operation.
+    assert_eq!(
+        WINDOW_START_STEPS.with(|steps| steps.take()),
+        ["snapshot", "acknowledged"]
+    );
 }

@@ -571,6 +571,16 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary], warnings: &mut Wa
     if plan.mode != Mode::Smoke && !unplaced.is_empty() {
         warnings.add(Hazard::Control, format!("no CPU placement for role(s) {}: their processes may run on different cores or core types between rounds, and share cores with other roles", unplaced.join(", ")), None);
     }
+    // The runner reads a service's CPU-time clock, which covers its own threads but not the processes it starts.
+    let services: Vec<&str> = plan
+        .roles
+        .iter()
+        .filter(|role| role.kind == crate::role::RoleKind::Service)
+        .map(|role| role.name.as_str())
+        .collect();
+    if !services.is_empty() {
+        warnings.add(Hazard::Control, format!("window CPU time of service(s) {} counts only each service's own process, not processes it starts, such as the workers of a forking server", services.join(", ")), None);
+    }
     if plan.mode != Mode::Smoke && !plan.stack_padding {
         warnings.add(Hazard::Control, "stack padding disabled: every process of a subject starts with the same stack alignment, which can bias comparisons".to_owned(), None);
     }

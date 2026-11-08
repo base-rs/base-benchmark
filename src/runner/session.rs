@@ -10,7 +10,7 @@ use super::{Collection, RoleEntry, SampleEntry, cancelled};
 use crate::plan::{PlannedRole, Subject};
 use crate::record::{Metric, Phase, ProcessRecord, Source, Unit, invalid};
 use crate::role::{Pattern, RoleKind, RoleProgram, Stop, substitute};
-use crate::window::{CONTROL_STDIO, CONTROL_VARIABLE, WINDOW_START, WINDOW_STARTED, WINDOW_STOP};
+use crate::window::{WINDOW_START, WINDOW_STARTED, WINDOW_STOP};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::unix::process::ExitStatusExt;
@@ -45,6 +45,16 @@ enum Marker {
     Start,
     Stop,
     Invalid(String),
+    /// A marker after output of the record had begun.
+    Late(String),
+    /// A marker that ends the output without a newline.
+    Unterminated(String),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The steps this thread took at a window's start, in order: snapshotting the services and acknowledging the start, an order the driver cannot observe.
+    static WINDOW_START_STEPS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Where the driver's window is, with each service's CPU time at the start once it has begun.
@@ -281,12 +291,10 @@ impl<'a> Session<'a> {
             .map_err(|error| self.failure(index, &error))?;
         self.entries[index].command = command(&self.programs[index], &arguments);
         let mut environment = collection.environment(self.entries[index].stack_padding);
+        environment.extend(role.environment.clone());
         let stdin = match role.kind {
             RoleKind::Service => Stdio::null(),
-            RoleKind::Driver => {
-                environment.insert(CONTROL_VARIABLE.to_owned(), CONTROL_STDIO.to_owned());
-                Stdio::piped()
-            }
+            RoleKind::Driver => Stdio::piped(),
         };
         let launch = Launch {
             program: &self.programs[index],
@@ -444,9 +452,14 @@ impl<'a> Session<'a> {
         match (marker, &self.window) {
             (Marker::Start, Window::Before) => {
                 self.window = Window::Open(self.snapshot());
-                // A driver that does not wait for the acknowledgement may have closed its stdin.
-                let input = self.driver_input.as_mut().expect("the driver started");
+                #[cfg(test)]
+                WINDOW_START_STEPS.with(|steps| steps.borrow_mut().push("snapshot"));
+                // The acknowledgement is the only message to the driver, so its stdin closes once it is written. A driver that does not wait for it may have closed its stdin already.
+                let mut input = self.driver_input.take().expect("the driver started");
                 let _ = input.write_all(format!("{WINDOW_STARTED}\n").as_bytes());
+                #[cfg(test)]
+                WINDOW_START_STEPS.with(|steps| steps.borrow_mut().push("acknowledged"));
+                drop(input);
                 Ok(())
             }
             (Marker::Stop, Window::Open(starts)) => {
@@ -469,6 +482,14 @@ impl<'a> Session<'a> {
             (Marker::Invalid(line), _) => {
                 Err(self.failure(driver, &format!("sent an invalid window marker {line:?}")))
             }
+            (Marker::Late(line), _) => Err(self.failure(
+                driver,
+                &format!("sent the window marker {line:?} after output of its record; markers are lines before the record"),
+            )),
+            (Marker::Unterminated(line), _) => Err(self.failure(
+                driver,
+                &format!("ended its output with the window marker {line:?} without a newline; markers are whole lines"),
+            )),
         }
     }
 
@@ -792,7 +813,7 @@ fn window_metrics(
     }
 }
 
-/// Read the driver's stdout: report each line that begins `base-benchmark window` as a marker, keep the rest, at most [`STDOUT_LIMIT`] bytes, as its record, and report when it closes. Returns the record and whether it was truncated.
+/// Read the driver's stdout: report each line that begins `base-benchmark window` as a marker, keep the rest, at most [`STDOUT_LIMIT`] bytes, as its record, and report when it closes. Markers are whole lines before the record, so one after output of the record, or one that ends the output without a newline, is reported as misplaced. Returns the record and whether it was truncated.
 fn read_driver(mut reader: impl Read, events: &Sender<Event>) -> (Vec<u8>, bool) {
     let mut record = Vec::new();
     let mut truncated = false;
@@ -805,8 +826,11 @@ fn read_driver(mut reader: impl Read, events: &Sender<Event>) -> (Vec<u8>, bool)
             bounded(&mut line, &chunk[..=newline], &mut truncated);
             chunk = &chunk[newline + 1..];
             match marker(&line) {
-                Some(marker) => {
+                Some(marker) if record.iter().all(u8::is_ascii_whitespace) => {
                     let _ = events.send(Event::Marker(marker));
+                }
+                Some(_) => {
+                    let _ = events.send(Event::Marker(Marker::Late(text(&line))));
                 }
                 None => bounded(&mut record, &line, &mut truncated),
             }
@@ -814,7 +838,12 @@ fn read_driver(mut reader: impl Read, events: &Sender<Event>) -> (Vec<u8>, bool)
         }
         bounded(&mut line, chunk, &mut truncated);
         if count == 0 {
-            bounded(&mut record, &line, &mut truncated);
+            match marker(&line) {
+                Some(_) => {
+                    let _ = events.send(Event::Marker(Marker::Unterminated(text(&line))));
+                }
+                None => bounded(&mut record, &line, &mut truncated),
+            }
             let _ = events.send(Event::Closed);
             return (record, truncated);
         }
@@ -828,16 +857,20 @@ fn bounded(buffer: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
     buffer.extend_from_slice(&bytes[..bytes.len().min(room)]);
 }
 
-/// The marker a line of the driver's stdout is, if it begins like one.
-fn marker(line: &[u8]) -> Option<Marker> {
+/// A line of the driver's stdout without its line ending.
+fn text(line: &[u8]) -> String {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
-    match line {
-        _ if line == WINDOW_START.as_bytes() => Some(Marker::Start),
-        _ if line == WINDOW_STOP.as_bytes() => Some(Marker::Stop),
-        _ if line.starts_with(b"base-benchmark window") => {
-            Some(Marker::Invalid(String::from_utf8_lossy(line).into_owned()))
-        }
+    String::from_utf8_lossy(line).into_owned()
+}
+
+/// The marker a line of the driver's stdout is, if it begins like one.
+fn marker(line: &[u8]) -> Option<Marker> {
+    let line = text(line);
+    match line.as_str() {
+        WINDOW_START => Some(Marker::Start),
+        WINDOW_STOP => Some(Marker::Stop),
+        _ if line.starts_with("base-benchmark window") => Some(Marker::Invalid(line)),
         _ => None,
     }
 }
