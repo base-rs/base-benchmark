@@ -20,8 +20,11 @@ pub const RESOLUTION_FACTOR: f64 = 100.0;
 pub const GENERATOR: &str = concat!("base-benchmark ", env!("CARGO_PKG_VERSION"));
 
 /// Descriptive statistics regenerated from raw samples. It contains no acceptance verdict.
+///
+/// Summaries are produced by [`summarize`] or read from `summary.json`, not constructed by callers, so this, [`SubjectSummary`], [`PairSummary`], [`PairMetric`], and [`OverlaidArtifact`] are `#[non_exhaustive]`: adding a field to them does not break callers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Summary {
     pub schema: String,
     pub version: u32,
@@ -47,6 +50,7 @@ pub struct Summary {
 /// An artifact whose tree was built with another workload package in place of its own.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct OverlaidArtifact {
     pub label: String,
     /// The workload package that replaced the tree's own, with its Git state.
@@ -57,6 +61,7 @@ pub struct OverlaidArtifact {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SubjectSummary {
     pub label: String,
     pub processes: usize,
@@ -123,6 +128,7 @@ impl Distribution {
 /// Per-round comparisons of a candidate with its baseline in the same round.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PairSummary {
     pub baseline: String,
     pub candidate: String,
@@ -132,6 +138,7 @@ pub struct PairSummary {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PairMetric {
     pub name: String,
     pub unit: Unit,
@@ -699,7 +706,7 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary], warnings: &mut Wa
 }
 
 impl Summary {
-    /// A compact text report: evidence class, pair comparisons, subject medians, and warnings. Smoke reports omit pair comparisons.
+    /// A compact text report: evidence class, the overlaid workload package and each overlaid artifact's lockfile changes, pair comparisons, subject medians, and warnings. Smoke reports omit pair comparisons.
     pub fn report(&self) -> String {
         let mut text = String::new();
         let _ = writeln!(text, "{}", self.evidence);
