@@ -475,7 +475,7 @@ impl Build<'_> {
                 ],
                 &configuration,
             )
-            .and_then(|existing| salt_crates(&mut cargo, &salt_directory(), salt, existing))
+            .and_then(|existing| salt_crates(&mut cargo, target, salt, existing))
         });
         let output_text = salted
             .and_then(|()| {
@@ -536,11 +536,6 @@ impl Build<'_> {
     }
 }
 
-/// Where salting wrappers live: a fixed directory, so that a replica's build does not depend on the preparation's output directory.
-fn salt_directory() -> PathBuf {
-    std::env::temp_dir().join("base-benchmark-layout-salt")
-}
-
 /// The rustc wrapper a build would use, which the salting wrapper must run in turn: `RUSTC_WRAPPER`, then `CARGO_BUILD_RUSTC_WRAPPER`, where an empty value means none.
 ///
 /// A wrapper set in Cargo configuration would be replaced, and reading it would need Cargo's own configuration rules, so such a configuration is an error asking for the environment variable instead.
@@ -551,13 +546,17 @@ pub(crate) fn existing_wrapper(
     if let Some(value) = environment.into_iter().flatten().next() {
         return Ok(Some(value).filter(|value| !value.is_empty()));
     }
+    // A key `rustc-wrapper`, bare or quoted, in a table, dotted, or in an inline table, assigned with `=`.
     let sets_wrapper = |text: String| {
         text.lines().any(|line| {
-            let line = line.trim_start();
-            line.strip_prefix("build.")
-                .unwrap_or(line)
-                .strip_prefix("rustc-wrapper")
-                .is_some_and(|rest| rest.trim_start().starts_with('='))
+            line.match_indices("rustc-wrapper").any(|(index, key)| {
+                let before = line[..index].trim_end_matches('"').chars().last();
+                let after = line[index + key.len()..]
+                    .trim_start_matches('"')
+                    .trim_start();
+                before.is_none_or(|character| " \t{,.".contains(character))
+                    && after.starts_with('=')
+            })
         })
     };
     match configuration
@@ -574,7 +573,7 @@ pub(crate) fn existing_wrapper(
 
 /// Build every crate with `-C metadata=SALT` added, through a `RUSTC_WRAPPER` script that runs `existing`, the wrapper the build would otherwise use, in turn. `RUSTFLAGS` and Cargo configuration are untouched.
 ///
-/// The script lives in `directory` under a name from the salt and its contents, so that a replica's executable depends only on its salt and the wrapper it chains: Cargo includes the wrapper's path in what it hashes.
+/// The script lives in `directory`, the replica's own target directory inside the new preparation output, so no other user can replace it; its name comes from the salt and its contents. Cargo does not hash a `RUSTC_WRAPPER`'s path, so the executable depends only on the salt and the wrapper it chains.
 #[cfg(unix)]
 pub(crate) fn salt_crates(
     cargo: &mut Command,

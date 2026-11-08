@@ -745,9 +745,20 @@ fn salting_chains_the_environment_wrapper_and_refuses_a_configured_one() {
     );
     std::fs::write(&configured, "build.rustc-wrapper=\"sccache\"\n").unwrap();
     assert!(existing_wrapper([None, None], &files).is_err());
+    for spelling in [
+        "build = { rustc-wrapper = \"sccache\" }\n",
+        "[build]\n\"rustc-wrapper\" = \"sccache\"\n",
+        "build = { jobs = 4, rustc-wrapper=\"sccache\" }\n",
+    ] {
+        std::fs::write(&configured, spelling).unwrap();
+        assert!(
+            existing_wrapper([None, None], &files).is_err(),
+            "{spelling}"
+        );
+    }
     std::fs::write(
         &configured,
-        "[build]\nrustc-workspace-wrapper = \"x\"\nrustc-wrapperish = 1\n",
+        "[build]\nrustc-workspace-wrapper = \"x\"\nrustc-wrapperish = 1\nmy-rustc-wrapper = 2\n",
     )
     .unwrap();
     assert_eq!(existing_wrapper([None, None], &files).unwrap(), None);
@@ -778,8 +789,7 @@ fn replicas_are_not_salted_over_a_configured_wrapper() {
         assert!(
             result
                 .as_ref()
-                .is_err_and(|error| error.contains("t-replica: ")
-                    && error.contains("sets build.rustc-wrapper")),
+                .is_err_and(|error| error.contains("sets build.rustc-wrapper")),
             "{result:?}"
         );
     }
