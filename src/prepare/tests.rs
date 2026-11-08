@@ -648,45 +648,95 @@ fn cancelled_preparation_does_not_read_metadata_online() {
     assert_eq!(calls.lines().count(), 1, "only offline: {calls}");
 }
 
-#[test]
-fn preparation_cancelled_during_a_build_does_not_read_metadata_online() {
-    let directory = tempfile::tempdir().unwrap();
-    let started = directory.path().join("started");
-    let resume = directory.path().join("resume");
+/// What a preparation running in another thread did first.
+enum Preparation {
+    Paused,
+    Finished(io::Result<Prepared>),
+}
+
+/// Prepare with `options`, cancelling while the build whose target directory matches the shell pattern `paused` runs, then letting that build finish, as Cargo does when only this process is signalled.
+fn cancelled_during_build(
+    directory: &Path,
+    options: PrepareOptions,
+    paused: &str,
+) -> io::Result<Prepared> {
+    let started = directory.join("started");
+    let resume = directory.join("resume");
     for fifo in [&started, &resume] {
         assert!(Command::new("mkfifo").arg(fifo).status().unwrap().success());
     }
-    let cargo = cargo_needing_the_network(directory.path(), "cargo", "{}");
-    // The build says it has started, then waits until the test has cancelled preparation.
     write_executable(
-        &cargo,
-        &std::fs::read_to_string(&cargo).unwrap().replace(
+        &options.cargo,
+        &std::fs::read_to_string(&options.cargo).unwrap().replace(
             "\n:\n",
             &format!(
-                "\necho started > '{}'\nread resumed < '{}'\n",
+                "\ncase \"$target\" in {paused}) echo started > '{}'; read resumed < '{}';; esac\n",
                 started.display(),
                 resume.display()
             ),
         ),
     );
+    let cancellation = Cancellation::new();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let sender = sender.clone();
+        let cancellation = cancellation.clone();
+        move || {
+            let _ = sender.send(Preparation::Finished(prepare(&options, &cancellation)));
+        }
+    });
+    // Waiting for the build in its own thread, so that a preparation that fails before the build starts fails the test instead of leaving it waiting.
+    std::thread::spawn(move || {
+        std::fs::read_to_string(&started).unwrap();
+        let _ = sender.send(Preparation::Paused);
+    });
+    match receiver.recv().unwrap() {
+        Preparation::Paused => {}
+        Preparation::Finished(result) => {
+            panic!("preparation finished before the build: {result:?}")
+        }
+    }
+    cancellation.cancel();
+    std::fs::write(&resume, "resumed\n").unwrap();
+    match receiver.recv().unwrap() {
+        Preparation::Finished(result) => result,
+        Preparation::Paused => unreachable!("the build pauses once"),
+    }
+}
+
+#[test]
+fn preparation_cancelled_during_a_build_fails_without_reading_metadata_online() {
+    let directory = tempfile::tempdir().unwrap();
     let options = options(
         directory.path(),
         vec![tree(directory.path(), "base")],
-        cargo,
+        cargo_needing_the_network(directory.path(), "cargo", "{}"),
     );
-    let cancellation = Cancellation::new();
-    let preparation = std::thread::spawn({
-        let cancellation = cancellation.clone();
-        move || prepare(&options, &cancellation)
-    });
-    std::fs::read_to_string(&started).unwrap();
-    cancellation.cancel();
-    std::fs::write(&resume, "resumed\n").unwrap();
-    let artifacts = preparation.join().unwrap().unwrap().manifest.artifacts;
-    // The build finished, but its path dependencies are unknown, without a second attempt, or a warning, since no campaign will be recorded.
-    assert_eq!(artifacts[0].source.path_dependencies, None);
+    let output = options.output.clone();
+    let error = cancelled_during_build(directory.path(), options, "*").unwrap_err();
+    // The build finished, but its path dependencies are unknown because preparation was cancelled, so it fails as preparation cancelled between builds does, without a second attempt or a warning.
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+    assert_eq!(error.to_string(), "preparation was cancelled");
     let calls = std::fs::read_to_string(directory.path().join("cargo.calls")).unwrap();
     assert_eq!(calls.lines().count(), 1, "only offline: {calls}");
+    assert!(!artifact::manifest_path(&output).exists());
+}
+
+#[test]
+fn preparation_cancelled_during_its_last_build_writes_no_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut options = options(
+        directory.path(),
+        vec![tree(directory.path(), "base")],
+        cargo(directory.path()),
+    );
+    options.replicas = Some(1);
+    let output = options.output.clone();
+    // A layout replica, built last, reads no metadata, so every artifact is complete when preparation notices the cancellation.
+    let error = cancelled_during_build(directory.path(), options, "*-replica").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+    assert!(output.join("artifacts/base-replica/0/fixture").exists());
+    assert!(!artifact::manifest_path(&output).exists());
 }
 
 #[test]

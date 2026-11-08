@@ -130,7 +130,7 @@ pub struct Prepared {
 
 /// Build every tree with the same profile and lockfile policy, once for each feature set, then freeze each executable.
 ///
-/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at another path alone usually gives an identical executable, since Cargo identifies workspace members by their relative paths, so each replica's workspace crates are also built with a distinct `-C metadata` salt, which changes symbol hashes and therefore code layout. Comparing the baseline with its replicas shows how much a change of layout alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds.
+/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at another path alone usually gives an identical executable, since Cargo identifies workspace members by their relative paths, so each replica's workspace crates are also built with a distinct `-C metadata` salt, which changes symbol hashes and therefore code layout. Comparing the baseline with its replicas shows how much a change of layout alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds and again before the manifest is written: a cancelled preparation fails with `Interrupted` and writes no manifest, even when the build that was running finishes.
 pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Result<Prepared> {
     let (trees, copies) = validate(options)?;
     let output = std::path::absolute(&options.output)?;
@@ -266,6 +266,10 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         artifacts,
         ..ArtifactManifest::default()
     };
+    // A build that Cargo finished after cancellation, such as when only this process was signalled, leaves preparation as cancelled as one stopped between builds.
+    if cancellation.is_cancelled() {
+        return Err(cancelled());
+    }
     let manifest_path = artifact::manifest_path(&output);
     manifest.write(&manifest_path)?;
     Ok(Prepared {
@@ -394,22 +398,28 @@ fn build_feature_sets(
         let platform = artifacts
             .first()
             .and_then(|artifact| host(&artifact.build.toolchain));
-        let dependencies = path_dependencies(&options.cargo, tree, platform, cancellation)
-            .map_err(|error| {
-                // Recorded mode refuses unknown path dependencies, so say why now rather than when a campaign is refused. A cancelled preparation records no campaign.
-                if !cancellation.is_cancelled() {
-                    eprintln!(
-                        "base-benchmark: warning: {label}: cannot read the Cargo metadata of {}, so its path dependencies are unknown and recorded campaigns will refuse it: {error}",
-                        tree.display()
-                    );
-                }
-            })
-            .ok();
+        let dependencies = match path_dependencies(&options.cargo, tree, platform, cancellation) {
+            Ok(dependencies) => Some(dependencies),
+            // Metadata that was not read because preparation was cancelled says nothing about the tree, so preparation fails as cancelled rather than recording the path dependencies as unknown.
+            Err(_) if cancellation.is_cancelled() => return Err(cancelled()),
+            Err(error) => {
+                // Recorded mode refuses unknown path dependencies, so say why now rather than when a campaign is refused.
+                eprintln!(
+                    "base-benchmark: warning: {label}: cannot read the Cargo metadata of {}, so its path dependencies are unknown and recorded campaigns will refuse it: {error}",
+                    tree.display()
+                );
+                None
+            }
+        };
         for artifact in &mut artifacts {
             artifact.source.path_dependencies = dependencies.clone();
         }
     }
     Ok(artifacts)
+}
+
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "preparation was cancelled")
 }
 
 /// One build of a tree with one feature set.
@@ -442,10 +452,7 @@ impl Build<'_> {
             salt,
         } = self;
         if cancellation.is_cancelled() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "preparation was cancelled",
-            ));
+            return Err(cancelled());
         }
         let suite = &options.suite;
         let mut command = vec![options.cargo.display().to_string(), "build".to_owned()];
