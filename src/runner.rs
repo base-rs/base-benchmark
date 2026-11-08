@@ -12,6 +12,7 @@ pub use host::{CpuIdentity, HostIdentity};
 #[cfg(not(target_os = "linux"))]
 pub(crate) use process::check_collection;
 pub use process::{Cancellation, SignalGuard};
+pub(crate) use process::{Launch, execute};
 
 use crate::artifact::write_json;
 use crate::plan::{Plan, STACK_PADDING_LIMIT, STACK_PADDING_VARIABLE, Shuffle, Subject};
@@ -19,7 +20,6 @@ use crate::record::{Metric, ProcessRecord, invalid};
 use crate::role::RoleKind;
 use crate::summary::{Summary, summarize};
 use lock::HostLock;
-use process::Launch;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -291,15 +291,29 @@ fn collect(
 /// Link every frozen executable into `bin/` under equal-length names, falling back to a copy.
 ///
 /// The executable path is copied onto each process's initial stack, so artifacts with labels of different lengths would otherwise start with differently aligned stacks.
+///
+/// Helpers are staged after the artifacts, under the keys `helper/N`, N being their index in the manifest, with names of the same length.
 fn stage(plan: &Plan, output: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
     let directory = output.join("bin");
-    let width = plan.artifacts.artifacts.len().to_string().len();
+    let manifest = &plan.artifacts;
+    let width = (manifest.artifacts.len() + manifest.helpers.len())
+        .to_string()
+        .len();
+    let staged = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.label.clone(), artifact))
+        .chain(
+            manifest
+                .helpers
+                .iter()
+                .enumerate()
+                .map(|(index, helper)| (helper_key(index), &helper.artifact)),
+        );
     std::fs::create_dir(&directory).and_then(|()| {
-        plan.artifacts
-            .artifacts
-            .iter()
+        staged
             .enumerate()
-            .map(|(index, artifact)| {
+            .map(|(index, (key, artifact))| {
                 let path = directory.join(format!("{index:0width$}"));
                 std::fs::hard_link(&artifact.executable, &path)
                     .or_else(|_| crate::artifact::copy_identified(&artifact.executable, &path))
@@ -313,10 +327,15 @@ fn stage(plan: &Plan, output: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
                             ),
                         )
                     })?;
-                Ok((artifact.label.clone(), path))
+                Ok((key, path))
             })
             .collect()
     })
+}
+
+/// The key of the helper at `index` among the staged executables. Labels cannot contain `/`, so it is distinct from every artifact's.
+pub(crate) fn helper_key(index: usize) -> String {
+    format!("helper/{index}")
 }
 
 /// The fixed context of one campaign's samples.

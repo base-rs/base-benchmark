@@ -251,6 +251,7 @@ fn preparation_failures_name_the_tree() {
         output: directory.path().join("custom"),
         feature_sets: Vec::new(),
         overlay: None,
+        helpers: Vec::new(),
         cargo: custom.cargo.clone(),
         rustc: custom.rustc.clone(),
     };
@@ -267,6 +268,20 @@ fn preparation_failures_name_the_tree() {
     features.feature_sets = vec![vec!["missing".to_owned()]];
     features.output = directory.path().join("features");
     assert!(base_benchmark::prepare(&features, &Cancellation::new()).is_err());
+
+    // A helper that cannot be built fails preparation, naming it.
+    let mut helpers = options.clone();
+    helpers.helpers = vec![base_benchmark::Helper {
+        package: "fixture".to_owned(),
+        binary: "missing".to_owned(),
+        features: Vec::new(),
+    }];
+    helpers.output = directory.path().join("helpers");
+    let error = base_benchmark::prepare(&helpers, &Cancellation::new()).unwrap_err();
+    assert!(
+        error.to_string().contains("missing: cargo build failed"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -905,4 +920,115 @@ fn scenarios_with_roles_run_the_subject_as_a_service_under_a_driver() {
         // The fast variant's ready line carries its argument, which the pattern's single capture takes too.
         assert_eq!(entry.subject.ends_with("fast"), address.ends_with(" fast"));
     }
+}
+
+#[test]
+fn helper_roles_are_built_once_from_the_baseline_tree_and_run_for_every_subject() {
+    let directory = tempfile::tempdir().unwrap();
+    // Two scenarios run the same helper, which is built once.
+    let hello = |name: &str| {
+        format!(
+            "\n[[package.metadata.base-benchmark.scenario]]\nname = \"{name}\"\narguments = [\"serve\"]\n\n[[package.metadata.base-benchmark.scenario.role]]\nname = \"server\"\nkind = \"service\"\nsubject = true\nready = \"listening on {{address}}\"\n\n[[package.metadata.base-benchmark.scenario.role]]\nname = \"client\"\nkind = \"driver\"\nbinary = \"driver\"\narguments = [\"{{server.address}}\"]\n"
+        )
+    };
+    let scenario = format!(
+        "\n[[bin]]\nname = \"driver\"\npath = \"src/driver.rs\"\n\n[package.metadata.base-benchmark]\nbinary = \"fixture\"\n{}{}",
+        hello("hello"),
+        hello("again")
+    );
+    let driver = format!(
+        "fn main() {{\n    println!(\"{}\");\n    println!(\"{}\");\n    println!(\"{{}}\", r#\"{RECORD}\"#);\n}}\n",
+        base_benchmark::WINDOW_START,
+        base_benchmark::WINDOW_STOP
+    );
+    let trees: Vec<Tree> = ["base", "change"]
+        .into_iter()
+        .map(|label| {
+            let path = directory.path().join(label);
+            support::workspace(&path, &scenario);
+            std::fs::write(path.join("src/driver.rs"), &driver).unwrap();
+            Tree {
+                label: label.to_owned(),
+                path,
+            }
+        })
+        .collect();
+    let workspace = Workspace::new(trees[0].path.join("Cargo.toml"));
+    let prepared = workspace
+        .prepare(
+            PrepareRequest {
+                trees: trees.clone(),
+                output: Some(directory.path().join("prepared")),
+                ..PrepareRequest::default()
+            },
+            &Cancellation::new(),
+        )
+        .unwrap();
+    let manifest = &prepared.manifest;
+    assert_eq!(manifest.artifacts.len(), 3, "base, change, and a replica");
+    assert_eq!(manifest.helpers.len(), 1, "built once");
+    let helper = &manifest.helpers[0];
+    assert_eq!(
+        (helper.package.as_str(), helper.binary.as_str()),
+        ("fixture", "driver")
+    );
+    assert_eq!(helper.artifact.role, ArtifactRole::Helper);
+    assert_eq!(
+        helper.artifact.source.path,
+        trees[0].path.canonicalize().unwrap()
+    );
+    assert!(
+        helper.artifact.build.layout_salt.is_none(),
+        "helpers are not salted"
+    );
+    assert!(helper.artifact.build.command.contains(&"driver".to_owned()));
+    assert!(
+        helper.artifact.executable.starts_with(
+            directory
+                .path()
+                .join("prepared/helpers/0")
+                .canonicalize()
+                .unwrap()
+        )
+    );
+    assert_eq!(
+        ArtifactManifest::read(&prepared.manifest_path).unwrap(),
+        *manifest
+    );
+
+    let campaign = workspace
+        .run(
+            RunRequest {
+                scenario: "hello".to_owned(),
+                output: Some(directory.path().join("campaign")),
+                ..request(&prepared.manifest_path, &directory.path().join("lock"))
+            },
+            &Cancellation::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    let entries = base_benchmark::read_entries(&campaign.output.join("samples.jsonl")).unwrap();
+    assert_eq!(entries.len(), 6);
+    for entry in &entries {
+        let client = &entry.roles[1];
+        // Every subject runs the same helper, staged after the artifacts under a name of the same length.
+        assert_eq!(client.executable_sha256, helper.artifact.sha256);
+        assert!(
+            client.command[0].ends_with("/bin/3"),
+            "{:?}",
+            client.command
+        );
+    }
+
+    // An executable built outside preparation has no helpers, so scenarios that need one are skipped.
+    let campaigns = workspace
+        .smoke_executable(
+            None,
+            &manifest.artifacts[0].executable,
+            &[],
+            &directory.path().join("smoke"),
+            Some(directory.path().join("lock")),
+        )
+        .unwrap();
+    assert_eq!(campaigns.len(), 1);
 }

@@ -59,6 +59,7 @@ fn options(directory: &Path, trees: Vec<Tree>, cargo: PathBuf) -> PrepareOptions
         output: directory.join("prepared"),
         feature_sets: Vec::new(),
         overlay: None,
+        helpers: Vec::new(),
         cargo,
         rustc: PathBuf::from("/bin/echo"),
     }

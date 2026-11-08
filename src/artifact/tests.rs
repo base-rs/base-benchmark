@@ -401,4 +401,13 @@ fn version_one_manifests_parse_but_must_be_prepared_again() {
         error.contains("version 1; prepare the trees again"),
         "{error}"
     );
+    // Version 2 manifests have no helpers, and still run; versions from the future do not.
+    value["version"] = serde_json::json!(2);
+    value.as_object_mut().unwrap().remove("features");
+    value["artifacts"][0]["features"] = serde_json::json!(["extra"]);
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(ArtifactManifest::read(&path).unwrap().helpers.is_empty());
+    value["version"] = serde_json::json!(MANIFEST_VERSION + 1);
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(ArtifactManifest::read(&path).is_err());
 }
