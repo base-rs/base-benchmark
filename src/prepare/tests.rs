@@ -749,6 +749,7 @@ fn salting_chains_the_environment_wrapper_and_refuses_a_configured_one() {
         "build = { rustc-wrapper = \"sccache\" }\n",
         "[build]\n\"rustc-wrapper\" = \"sccache\"\n",
         "build = { jobs = 4, rustc-wrapper=\"sccache\" }\n",
+        "[build]\nrustc-wrapper = \"/opt/#tools/sccache\" # a comment\n",
     ] {
         std::fs::write(&configured, spelling).unwrap();
         assert!(
@@ -758,7 +759,7 @@ fn salting_chains_the_environment_wrapper_and_refuses_a_configured_one() {
     }
     std::fs::write(
         &configured,
-        "[build]\nrustc-workspace-wrapper = \"x\"\nrustc-wrapperish = 1\nmy-rustc-wrapper = 2\n",
+        "[build]\nrustc-workspace-wrapper = \"x\"\nrustc-wrapperish = 1\nmy-rustc-wrapper = 2\n# rustc-wrapper = \"sccache\"\njobs = 4 # rustc-wrapper = \"sccache\" would be faster\n",
     )
     .unwrap();
     assert_eq!(existing_wrapper([None, None], &files).unwrap(), None);

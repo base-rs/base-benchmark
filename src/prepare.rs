@@ -546,9 +546,9 @@ pub(crate) fn existing_wrapper(
     if let Some(value) = environment.into_iter().flatten().next() {
         return Ok(Some(value).filter(|value| !value.is_empty()));
     }
-    // A key `rustc-wrapper`, bare or quoted, in a table, dotted, or in an inline table, assigned with `=`.
+    // A key `rustc-wrapper`, bare or quoted, in a table, dotted, or in an inline table, assigned with `=`, outside comments.
     let sets_wrapper = |text: String| {
-        text.lines().any(|line| {
+        text.lines().map(uncommented).any(|line| {
             line.match_indices("rustc-wrapper").any(|(index, key)| {
                 let before = line[..index].trim_end_matches('"').chars().last();
                 let after = line[index + key.len()..]
@@ -569,6 +569,20 @@ pub(crate) fn existing_wrapper(
         ))),
         None => Ok(None),
     }
+}
+
+/// A TOML line without its comment: anything after a `#` outside a string.
+fn uncommented(line: &str) -> &str {
+    let mut quote = None;
+    for (index, character) in line.char_indices() {
+        match (quote, character) {
+            (None, '#') => return &line[..index],
+            (None, '"' | '\'') => quote = Some(character),
+            (Some(open), close) if open == close => quote = None,
+            _ => {}
+        }
+    }
+    line
 }
 
 /// Build every crate with `-C metadata=SALT` added, through a `RUSTC_WRAPPER` script that runs `existing`, the wrapper the build would otherwise use, in turn. `RUSTFLAGS` and Cargo configuration are untouched.
