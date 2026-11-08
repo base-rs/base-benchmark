@@ -1,5 +1,12 @@
 # Releases
 
+## Unreleased
+
+- Read Cargo metadata for path dependencies again with network access when reading it offline fails, still locked. Building only the workload package does not download packages that only other workspace members need, so on a host with a fresh Cargo cache every artifact recorded its path dependencies as unknown, which was noticed only when a recorded campaign refused them. Preparation now warns when metadata still cannot be read, naming the tree and giving Cargo's error.
+- Don't copy a remote command's output back when the command failed before creating it on the host. rsync's errors about the missing directory followed, and buried, the host's own error. Outputs that exist, such as those of failed or cancelled campaigns, still come back.
+- Name every metric with the same hazard in one comparison or subject in a single warning, and order warnings by hazard: build layout first, such as a variant comparison whose sign reverses in the layout replica, then metric definitions, campaign controls, and last, metrics that changed in both directions. A screening run of two backends across two builds and a replica gave 48 warnings, 34 of them one line per metric that moved both ways; it now gives 8. The warnings' wording changes; the statistics, and which hazards are reported, do not.
+- State overlaid builds in reports: the overlaid package, its revision and state, the artifacts built with it, and each artifact's lockfile changes. `Summary` gains `overlays` (`OverlaidArtifact`) with the same. It is omitted from `summary.json` when nothing was overlaid, so other summaries are unchanged and remain version 2; 0.2.1 reads `Summary` with unknown fields denied, so it rejects summaries of overlaid campaigns.
+
 ## v0.2.1
 
 - Chain a rustc wrapper set in Cargo configuration, such as a global sccache in `~/.cargo/config.toml`, when salting layout replicas, instead of refusing to prepare them. The wrapper is found as Cargo finds it: the environment, then `build.rustc-wrapper` in the configuration nearest the tree, then `$CARGO_HOME`'s, including files they `include`, with relative paths resolved as Cargo resolves them. An empty `$CARGO_HOME` counts as unset, and a relative one is relative to the tree, as for Cargo. Invalid configuration files are reported with their parse location.

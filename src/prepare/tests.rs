@@ -515,6 +515,88 @@ fn unreadable_metadata_leaves_path_dependencies_unknown() {
     );
 }
 
+/// A fake `cargo` whose `metadata` fails offline, as on a host whose Cargo cache lacks packages of other workspace members, and records each `metadata` invocation in `calls`.
+fn cargo_needing_the_network(directory: &Path, name: &str, metadata: &str) -> PathBuf {
+    let cargo = fake_cargo(directory, name, ":", metadata);
+    let calls = directory.join(format!("{name}.calls"));
+    std::fs::write(
+        &cargo,
+        std::fs::read_to_string(&cargo).unwrap().replace(
+            "metadata) echo",
+            &format!(
+                "metadata) echo \"$*\" >> '{}'; case \"$*\" in *--offline*) echo 'error: failed to download, offline' >&2; exit 101;; esac; echo",
+                calls.display()
+            ),
+        ),
+    )
+    .unwrap();
+    cargo
+}
+
+#[test]
+fn metadata_that_needs_the_network_is_read_online() {
+    let directory = tempfile::tempdir().unwrap();
+    let dependency = directory.path().join("dependency");
+    std::fs::create_dir(&dependency).unwrap();
+    let base = tree(directory.path(), "base");
+    let metadata = json!({ "packages": [
+        { "name": "dependency", "source": null, "manifest_path": dependency.join("Cargo.toml") },
+    ] });
+    let cargo = cargo_needing_the_network(directory.path(), "cargo", &metadata.to_string());
+    let artifact = prepared(&options(directory.path(), vec![base], cargo))
+        .unwrap()
+        .manifest
+        .artifacts
+        .remove(0);
+    let names: Vec<_> = artifact
+        .source
+        .path_dependencies
+        .unwrap()
+        .into_iter()
+        .map(|dependency| dependency.name)
+        .collect();
+    assert_eq!(names, ["dependency"]);
+    // Offline first, then online, and both locked.
+    let calls = std::fs::read_to_string(directory.path().join("cargo.calls")).unwrap();
+    let calls: Vec<_> = calls.lines().collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[0].contains("--offline"), "{calls:?}");
+    assert!(!calls[1].contains("--offline"), "{calls:?}");
+    assert!(
+        calls.iter().all(|call| call.contains("--locked")),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn unreadable_metadata_reports_cargos_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = tree(directory.path(), "base");
+    // Failing online too, the error is Cargo's, so a warning can say why.
+    let cargo = cargo_needing_the_network(directory.path(), "cargo", "{}");
+    std::fs::write(
+        &cargo,
+        std::fs::read_to_string(&cargo)
+            .unwrap()
+            .replace("*--offline*)", "*)"),
+    )
+    .unwrap();
+    let error = path_dependencies(&cargo, &base.path, None).unwrap_err();
+    assert!(error.contains("error: failed to download"), "{error}");
+    assert!(error.contains("101"), "{error}");
+    // Preparation continues, recording them as unknown.
+    let artifacts = prepared(&options(directory.path(), vec![base.clone()], cargo))
+        .unwrap()
+        .manifest
+        .artifacts;
+    assert_eq!(artifacts[0].source.path_dependencies, None);
+    let error = path_dependencies(Path::new("/nonexistent/cargo"), &base.path, None).unwrap_err();
+    assert!(error.contains("cannot run /nonexistent/cargo"), "{error}");
+    let invalid = fake_cargo(directory.path(), "invalid", ":", "not json");
+    let error = path_dependencies(&invalid, &base.path, None).unwrap_err();
+    assert!(error.contains("invalid JSON"), "{error}");
+}
+
 #[test]
 fn hosts_and_cargo_homes_are_resolved() {
     assert_eq!(

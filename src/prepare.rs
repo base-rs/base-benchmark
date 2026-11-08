@@ -520,7 +520,15 @@ impl Build<'_> {
         };
         let toolchain = version(&options.rustc)?;
         if role != ArtifactRole::LayoutReplica {
-            source.path_dependencies = path_dependencies(&options.cargo, tree, host(&toolchain));
+            source.path_dependencies = path_dependencies(&options.cargo, tree, host(&toolchain))
+                .map_err(|error| {
+                    // Recorded mode refuses unknown path dependencies, so say why now rather than when a campaign is refused.
+                    eprintln!(
+                        "base-benchmark: warning: {label}: cannot read the Cargo metadata of {}, so its path dependencies are unknown and recorded campaigns will refuse it: {error}",
+                        tree.display()
+                    );
+                })
+                .ok();
         }
         Ok(Artifact {
             label: label.to_owned(),
@@ -768,30 +776,27 @@ pub(crate) fn configuration_files(
         .collect()
 }
 
-/// Path dependencies outside `tree`, each with its Git state, or `None` when Cargo metadata cannot be read.
+/// Path dependencies outside `tree`, each with its Git state, or Cargo's error when its metadata cannot be read.
 ///
-/// Metadata is filtered to the host platform when it is known, so it needs no packages beyond those a host build can use.
+/// Metadata is filtered to the host platform when it is known, so it needs no packages beyond those a host build can use. It is read offline first, and, if that fails, again with network access, still locked: building one package downloads only what that package needs, so on a host with a fresh Cargo cache the workspace's other members can need packages that are not downloaded.
 fn path_dependencies(
     cargo: &Path,
     tree: &Path,
     host: Option<&str>,
-) -> Option<Vec<DependencyIdentity>> {
-    let mut command = Command::new(cargo);
-    command
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--locked",
-            "--offline",
-            "--manifest-path",
-        ])
-        .arg(tree.join("Cargo.toml"));
-    if let Some(host) = host {
-        command.args(["--filter-platform", host]);
-    }
-    let metadata =
-        capture(&mut command).and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+) -> Result<Vec<DependencyIdentity>, String> {
+    let metadata = |offline: bool| {
+        let mut command = Command::new(cargo);
+        command.args(["metadata", "--format-version", "1", "--locked"]);
+        if offline {
+            command.arg("--offline");
+        }
+        command.arg("--manifest-path").arg(tree.join("Cargo.toml"));
+        if let Some(host) = host {
+            command.args(["--filter-platform", host]);
+        }
+        cargo_metadata(&mut command)
+    };
+    let metadata = metadata(true).or_else(|_| metadata(false))?;
     let dependencies = external_path_packages(&metadata, tree)
         .into_iter()
         .map(|(name, path)| DependencyIdentity {
@@ -801,7 +806,26 @@ fn path_dependencies(
             path,
         })
         .collect();
-    Some(dependencies)
+    Ok(dependencies)
+}
+
+/// Run `cargo metadata` and parse its output, or describe why that failed, with Cargo's own error.
+fn cargo_metadata(command: &mut Command) -> Result<Value, String> {
+    let output = command.stdin(Stdio::null()).output().map_err(|error| {
+        format!(
+            "cannot run {}: {error}",
+            Path::new(command.get_program()).display()
+        )
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("cargo metadata printed invalid JSON: {error}"))
 }
 
 /// The host target triple from `rustc -Vv`.

@@ -213,6 +213,21 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
             )
             .is_err()
     );
+    // An rsync that fails is reported, with what it was copying.
+    let failing_rsync = Remote {
+        rsync: PathBuf::from("false"),
+        ..remote.clone()
+    };
+    let error = failing_rsync
+        .execute_now(
+            "prepare",
+            arguments(&["--manifest-path", &manifest_argument]),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().starts_with("rsync ") && error.to_string().contains("failed with"),
+        "{error}"
+    );
     let outside = Remote {
         local_cargo: directory.path().join("missing-cargo"),
         ..remote.clone()
@@ -234,21 +249,31 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
             "{name}"
         );
     }
-    // A command that fails on the host before writing its output has nothing to bring back.
+    // A command that fails on the host before writing its output has nothing to bring back, so no download is attempted. A download is an rsync whose destination is local.
+    let downloads = directory.path().join("downloads");
+    let recording_rsync = script(
+        &directory.path().join("recording-rsync"),
+        &format!(
+            "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in bench:*) ;; *) echo \"$last\" >> {};; esac\nexec rsync \"$@\"\n",
+            downloads.display()
+        ),
+    );
+    let recorded = Remote {
+        rsync: recording_rsync.clone(),
+        ..explicit.clone()
+    };
     std::fs::write(directory.path().join("invalid.json"), "{}").unwrap();
-    let error = explicit
-        .execute_now(
-            "run",
-            arguments(&[
-                "work",
-                "--manifest-path",
-                &manifest_argument,
-                "--artifacts",
-                &directory.path().join("invalid.json").display().to_string(),
-                "--mode",
-                "smoke",
-            ]),
-        )
+    let invalid_run = arguments(&[
+        "work",
+        "--manifest-path",
+        &manifest_argument,
+        "--artifacts",
+        &directory.path().join("invalid.json").display().to_string(),
+        "--mode",
+        "smoke",
+    ]);
+    let error = recorded
+        .execute_now("run", invalid_run.clone())
         .unwrap_err();
     assert!(
         error
@@ -256,6 +281,46 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
             .contains("base-benchmark run on bench failed"),
         "{error}"
     );
+    assert!(
+        !downloads.exists(),
+        "{:?}",
+        std::fs::read_to_string(&downloads)
+    );
+    // On the command line, the host's error is what remains on standard error.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_base-benchmark"))
+        .args(["run", "--host", "bench", "--remote-directory"])
+        .arg(&host)
+        .args(["--remote-program", env!("CARGO_BIN_EXE_base-benchmark")])
+        .args(&invalid_run)
+        .env("BASE_BENCHMARK_SSH", directory.path().join("ssh"))
+        .env("BASE_BENCHMARK_RSYNC", &recording_rsync)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("invalid.json"), "{stderr}");
+    assert!(!stderr.contains("rsync"), "{stderr}");
+    assert!(!downloads.exists());
+    // A failed command whose output exists still brings it back.
+    let failed_smoke = directory.path().join("failed-smoke");
+    recorded
+        .execute_now(
+            "smoke",
+            arguments(&[
+                "--manifest-path",
+                &manifest_argument,
+                "--output",
+                &failed_smoke.display().to_string(),
+                "--lock",
+                &directory.path().join("lock").display().to_string(),
+            ]),
+        )
+        .unwrap_err();
+    assert_eq!(
+        std::fs::read_to_string(&downloads).unwrap().trim(),
+        format!("{}/", failed_smoke.display())
+    );
+    assert!(failed_smoke.join("broken").is_dir());
     // The default smoke output comes back too.
     let plain = directory
         .path()

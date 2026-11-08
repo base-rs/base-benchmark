@@ -3,7 +3,7 @@
 
 //! Running `prepare`, `run`, and `smoke` on another host, such as a dedicated measuring machine, over SSH.
 //!
-//! Every local path a command names is mirrored on the host at `DIRECTORY/mirror/ABSOLUTE-PATH`, so artifacts and campaigns prepared there refer to each other as they would locally. Paths are made canonical locally first, so a mirrored path never leaves the mirror. Before the command, the workspace, each tree, and the trees' path dependencies outside them are copied there with `rsync`, without their `target` directories but with their Git state, including the repositories of linked worktrees. Afterwards the command's output directory is copied back, also when the command failed or was cancelled, so such campaigns can be inspected. Downloaded artifact manifests and campaigns name the host's paths: run prepared artifacts on the same host, and summarize campaigns anywhere.
+//! Every local path a command names is mirrored on the host at `DIRECTORY/mirror/ABSOLUTE-PATH`, so artifacts and campaigns prepared there refer to each other as they would locally. Paths are made canonical locally first, so a mirrored path never leaves the mirror. Before the command, the workspace, each tree, and the trees' path dependencies outside them are copied there with `rsync`, without their `target` directories but with their Git state, including the repositories of linked worktrees. Afterwards the command's output directory is copied back, also when the command failed or was cancelled, so such campaigns can be inspected; a command that failed before creating it has nothing to copy, and its own error is reported alone. Downloaded artifact manifests and campaigns name the host's paths: run prepared artifacts on the same host, and summarize campaigns anywhere.
 
 use crate::config::{invalid_input, program};
 use crate::prepare::external_path_packages;
@@ -208,8 +208,12 @@ impl Remote {
             &stoppable(&setup, &command),
             Some(cancellation),
         );
-        // Copy the output back even after a failure, which a failed or cancelled campaign records.
-        let downloaded = self.download(job.output);
+        // Copy the output back even after a failure, which a failed or cancelled campaign records, unless the command failed before creating it: then rsync's complaints about the missing directory would follow, and bury, the host's own error.
+        let downloaded = if result.is_err() && self.absent(job.output) {
+            Ok(())
+        } else {
+            self.download(job.output)
+        };
         if cancellation.is_cancelled() {
             return Err(cancelled());
         }
@@ -282,6 +286,16 @@ impl Remote {
             format!("{}/", path.display()),
             format!("{}:{}/", self.host, self.mirror(path)),
         ])
+    }
+
+    /// Whether the host certainly has no mirror of `output`. If the host cannot say, as when the connection has dropped, the output may exist.
+    fn absent(&self, output: &Path) -> bool {
+        self.shell(
+            "checking for the output",
+            &format!("[ -e {} ] || printf absent", quote(&self.mirror(output))),
+            None,
+        )
+        .is_ok_and(|stdout| stdout == "absent")
     }
 
     fn download(&self, output: &Path) -> io::Result<()> {

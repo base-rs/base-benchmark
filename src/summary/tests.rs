@@ -2,7 +2,7 @@
 // Copyright, 2026, by Samuel Williams.
 
 use super::*;
-use crate::artifact::ArtifactRole;
+use crate::artifact::{ArtifactRole, DependencyIdentity};
 use crate::record::{ProcessRecord, Sample};
 use crate::test_support::plan;
 use std::path::Path;
@@ -164,7 +164,7 @@ fn build_changes_are_compared_with_the_layout_replica() {
     assert_eq!(
         summary.warnings,
         [
-            "baseline -> candidate: wall_time median change -1.00% is within the layout replicas' range of ±2.00%"
+            "baseline -> candidate: median change within the layout replicas' range: wall_time -1.00% (range ±2.00%)"
         ]
     );
     assert_eq!(summary.subjects[1].processes, 2);
@@ -195,7 +195,7 @@ fn variant_conclusions_are_checked_against_the_replica() {
         entry("current-replica/engine", 1, vec![wall(1100)], Vec::new()),
     ];
     let summary = summarize(&plan, &entries);
-    assert!(summary.warnings.iter().any(|warning| warning.contains("current/reference -> current/engine: wall_time median change -20.00% has the opposite sign in the layout replica (+10.00%)")), "{:?}", summary.warnings);
+    assert!(summary.warnings.iter().any(|warning| warning == "current/reference -> current/engine: median change with the opposite sign in the layout replica current-replica, so the conclusion depends on build layout: wall_time -20.00% (replica +10.00%)"), "{:?}", summary.warnings);
 }
 
 #[test]
@@ -250,21 +250,16 @@ fn quantized_counters_and_mixed_directions_are_flagged() {
         (0, 1, None),
         "a difference below one event is a tie"
     );
-    for expected in [
-        "no CPU placement",
-        "stack padding disabled",
-        "wall_time changed in both directions (better 1/2, worse 1/2)",
-        "no layout replica: variant comparisons",
-    ] {
-        assert!(
-            summary
-                .warnings
-                .iter()
-                .any(|warning| warning.contains(expected)),
-            "{expected}: {:?}",
-            summary.warnings
-        );
-    }
+    // Layout first, then campaign controls, then each pair's metrics that moved both ways, on one line.
+    assert_eq!(
+        summary.warnings,
+        [
+            "no layout replica: variant comparisons inside one executable can depend on its build layout; prepare with --replicas 1 to check",
+            "no CPU placement: workload processes may run on different cores or core types between rounds",
+            "stack padding disabled: every process of a subject starts with the same stack alignment, which can bias comparisons",
+            "baseline/slow -> baseline/fast: changed in both directions, so inconclusive: user_cpu_time (better 1/2, worse 1/2), wall_time (better 1/2, worse 1/2)",
+        ]
+    );
     let report = summary.report();
     assert!(report.contains("1 round(s) below resolution"), "{report}");
     assert!(
@@ -315,10 +310,10 @@ fn incompatible_and_missing_metrics_are_disclosed() {
         (Statistic::Mean, -0.5)
     );
     for expected in [
-        "candidate: metric wall_time has conflicting definitions within a process and is not summarized",
-        "baseline -> candidate: mixed is defined differently by baseline and candidate in 1 round(s), which are not compared",
-        "baseline -> candidate: latency is missing from the candidate in 1 round(s)",
-        "baseline -> candidate: mean has no resolved layout-replica change to compare with",
+        "candidate: conflicting definitions within a process, so not summarized: wall_time",
+        "baseline -> candidate: defined differently by baseline and candidate, so those rounds are not compared: mixed (1 round(s))",
+        "baseline -> candidate: missing from the candidate: latency (1 round(s))",
+        "baseline -> candidate: no resolved layout-replica change to compare with: mean",
     ] {
         assert!(
             summary.warnings.contains(&expected.to_owned()),
@@ -389,7 +384,7 @@ fn missing_controls_rounds_and_values_are_visible() {
         summary
             .warnings
             .iter()
-            .any(|warning| warning.contains("latency changes definition between processes"))
+            .any(|warning| warning == "baseline: definitions change between processes, so differing processes are excluded: latency")
     );
     let build = pair(&summary, PairKind::Build);
     let wall_time = metric(build, "wall_time");
@@ -466,7 +461,7 @@ fn several_replicas_widen_the_control_range() {
     assert_eq!(
         summary.warnings,
         [
-            "baseline -> candidate: wall_time median change -3.00% is within the layout replicas' range of ±4.00%"
+            "baseline -> candidate: median change within the layout replicas' range: wall_time -3.00% (range ±4.00%)"
         ]
     );
 }
@@ -508,7 +503,7 @@ fn unresolved_replica_comparisons_are_disclosed() {
         entry("current-replica/engine", 1, vec![wall(5)], Vec::new()),
     ];
     let summary = summarize(&plan, &entries);
-    assert!(summary.warnings.contains(&"current/reference -> current/engine: wall_time has no resolved comparison in the layout replica current-replica".to_owned()), "{:?}", summary.warnings);
+    assert!(summary.warnings.contains(&"current/reference -> current/engine: no resolved comparison in the layout replica current-replica: wall_time".to_owned()), "{:?}", summary.warnings);
 }
 
 #[test]
@@ -708,7 +703,7 @@ fn quantiles_are_compared_only_at_the_same_quantile() {
     assert_eq!(metric(build, "tail").rounds, 0);
     assert!(
         summary.warnings.contains(
-            &"baseline -> candidate: tail is defined differently by baseline and candidate in 1 round(s), which are not compared".to_owned()
+            &"baseline -> candidate: defined differently by baseline and candidate, so those rounds are not compared: tail (1 round(s))".to_owned()
         ),
         "{:?}",
         summary.warnings
@@ -780,9 +775,10 @@ fn quantiles_from_records_normalize_negative_zero_and_conflict_within_a_process(
             .contains("minimum                          1.000 p0 [")
     );
     assert!(
-        summary
-            .warnings
-            .contains(&"baseline: metric tail has conflicting definitions within a process and is not summarized".to_owned()),
+        summary.warnings.contains(
+            &"baseline: conflicting definitions within a process, so not summarized: tail"
+                .to_owned()
+        ),
         "{:?}",
         summary.warnings
     );
@@ -811,4 +807,143 @@ fn replicas_identical_to_their_baseline_are_flagged() {
         "{:?}",
         summary.warnings
     );
+}
+
+#[test]
+fn warnings_name_every_metric_of_a_hazard_on_one_line_with_layout_first() {
+    let mut plan = pinned(
+        &[
+            ("current", ArtifactRole::Baseline),
+            ("current-replica", ArtifactRole::LayoutReplica),
+        ],
+        &["reference", "engine"],
+    );
+    plan.artifacts.artifacts[1].source.replica_of = Some("current".to_owned());
+    let cpu = |value| Metric::total("cpu_time", Unit::Nanoseconds, value).lower_is_better();
+    let mut entries = Vec::new();
+    for (round, wall_time, cpu_time) in [(1, 700, 700), (2, 1100, 1050)] {
+        entries.extend([
+            entry(
+                "current/reference",
+                round,
+                vec![wall(1000), cpu(1000)],
+                Vec::new(),
+            ),
+            entry(
+                "current/engine",
+                round,
+                vec![wall(wall_time), cpu(cpu_time)],
+                Vec::new(),
+            ),
+            entry(
+                "current-replica/reference",
+                round,
+                vec![wall(1000), cpu(1000)],
+                Vec::new(),
+            ),
+            entry(
+                "current-replica/engine",
+                round,
+                vec![wall(1100), cpu(1100)],
+                Vec::new(),
+            ),
+        ]);
+    }
+    let summary = summarize(&plan, &entries);
+    // Found after the metrics that moved both ways, the reversal in the replica still comes first.
+    assert_eq!(
+        summary.warnings,
+        [
+            "current/reference -> current/engine: median change with the opposite sign in the layout replica current-replica, so the conclusion depends on build layout: cpu_time -12.50% (replica +10.00%), wall_time -10.00% (replica +10.00%)",
+            "current/reference -> current/engine: changed in both directions, so inconclusive: cpu_time (better 1/2, worse 1/2), wall_time (better 1/2, worse 1/2)",
+        ]
+    );
+    let report = summary.report();
+    let first = report.find("warning: ").unwrap();
+    assert!(
+        report[first..].starts_with(
+            "warning: current/reference -> current/engine: median change with the opposite sign"
+        ),
+        "{report}"
+    );
+}
+
+#[test]
+fn overlaid_artifacts_and_their_lockfile_changes_are_described() {
+    let package = DependencyIdentity {
+        name: "fixture-benchmark".to_owned(),
+        path: "/workspace/benchmark".into(),
+        revision: Some("0123456789abcdef0123".to_owned()),
+        dirty: Some(false),
+    };
+    let mut plan = build_plan();
+    let plain = summarize(&plan, &[]);
+    assert!(plain.overlays.is_empty());
+    let serialized = serde_json::to_value(&plain).unwrap();
+    assert!(serialized.get("overlays").is_none(), "{serialized}");
+    assert_eq!(
+        serde_json::from_value::<Summary>(serialized).unwrap(),
+        plain
+    );
+    assert!(!plain.report().contains("overlaid"));
+
+    for artifact in &mut plan.artifacts.artifacts {
+        artifact.source.overlay = Some(package.clone());
+    }
+    plan.artifacts.artifacts[0].source.lockfile_changes = vec![
+        "serde 1.0.1 -> 1.0.2".to_owned(),
+        "itoa 1.0.0 -> 1.0.1".to_owned(),
+    ];
+    plan.artifacts.artifacts[1].source.overlay = Some(DependencyIdentity {
+        revision: None,
+        dirty: None,
+        ..package.clone()
+    });
+    let summary = summarize(&plan, &[]);
+    assert_eq!(
+        summary.overlays[0],
+        OverlaidArtifact {
+            label: "baseline".to_owned(),
+            package: package.clone(),
+            lockfile_changes: vec![
+                "serde 1.0.1 -> 1.0.2".to_owned(),
+                "itoa 1.0.0 -> 1.0.1".to_owned()
+            ],
+        }
+    );
+    assert_eq!(summary.overlays.len(), 3);
+    let serialized = serde_json::to_value(&summary).unwrap();
+    assert_eq!(
+        serialized["overlays"][0]["lockfile_changes"][0],
+        "serde 1.0.1 -> 1.0.2"
+    );
+    assert_eq!(
+        serde_json::from_value::<Summary>(serialized).unwrap(),
+        summary
+    );
+    let report = summary.report();
+    for expected in [
+        "overlaid workload fixture-benchmark (0123456789ab) onto baseline, baseline-replica\n",
+        "overlaid workload fixture-benchmark (unknown revision, state unknown) onto candidate\n",
+        "lockfile changes in baseline: serde 1.0.1 -> 1.0.2, itoa 1.0.0 -> 1.0.1\n",
+    ] {
+        assert!(report.contains(expected), "{expected}: {report}");
+    }
+    assert!(!report.contains("kept every locked version"), "{report}");
+
+    // Uncommitted changes are stated, and so is a lockfile every build kept.
+    for artifact in &mut plan.artifacts.artifacts {
+        artifact.source.overlay = Some(DependencyIdentity {
+            dirty: Some(true),
+            ..package.clone()
+        });
+        artifact.source.lockfile_changes.clear();
+    }
+    let report = summarize(&plan, &[]).report();
+    for expected in [
+        "overlaid workload fixture-benchmark (0123456789ab, modified) onto baseline, candidate, baseline-replica\n",
+        "overlaid builds kept every locked version\n",
+    ] {
+        assert!(report.contains(expected), "{expected}: {report}");
+    }
 }
