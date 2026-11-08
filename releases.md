@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+- Chain a rustc wrapper set in Cargo configuration, such as a global sccache in `~/.cargo/config.toml`, when salting layout replicas, instead of refusing to prepare them. The wrapper is found as Cargo finds it: the environment, then `build.rustc-wrapper` in the configuration nearest the tree, then `$CARGO_HOME`'s, with configured paths resolved as Cargo resolves them.
+
 ## v0.2.0
 
 - Add `--host HOST` to `prepare`, `run`, and `smoke` (`remote::Remote`) to run them on a measuring host over SSH. Local paths, made canonical, are mirrored on the host with `rsync`, including the repositories of linked worktrees, the release of this version is installed there when it is missing, and outputs are copied back, also after a failure. Interrupting the local command stops the host's. `--remote-directory` and `--remote-program` choose where and what runs. Add `version`, which prints the command's version.

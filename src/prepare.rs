@@ -536,9 +536,9 @@ impl Build<'_> {
     }
 }
 
-/// The rustc wrapper a build would use, which the salting wrapper must run in turn: `RUSTC_WRAPPER`, then `CARGO_BUILD_RUSTC_WRAPPER`, where an empty value means none.
+/// The rustc wrapper a build of a tree would use, which the salting wrapper must run in turn, by Cargo's precedence: `RUSTC_WRAPPER`, then `CARGO_BUILD_RUSTC_WRAPPER`, then `build.rustc-wrapper` in the first of `configuration`, the tree's Cargo configuration files from the nearest to `$CARGO_HOME`'s, that sets it. An empty value means none.
 ///
-/// A wrapper set in Cargo configuration would be replaced, and reading it would need Cargo's own configuration rules, so such a configuration is an error asking for the environment variable instead.
+/// A configured path containing `/` is relative to the directory that holds the `.cargo` directory, as Cargo resolves it; a bare program name is found on `PATH` when it runs.
 pub(crate) fn existing_wrapper(
     environment: [Option<std::ffi::OsString>; 2],
     configuration: &[ConfigurationFile],
@@ -546,43 +546,45 @@ pub(crate) fn existing_wrapper(
     if let Some(value) = environment.into_iter().flatten().next() {
         return Ok(Some(value).filter(|value| !value.is_empty()));
     }
-    // A key `rustc-wrapper`, bare or quoted, in a table, dotted, or in an inline table, assigned with `=`, outside comments.
-    let sets_wrapper = |text: String| {
-        text.lines().map(uncommented).any(|line| {
-            line.match_indices("rustc-wrapper").any(|(index, key)| {
-                let before = line[..index].trim_end_matches('"').chars().last();
-                let after = line[index + key.len()..]
-                    .trim_start_matches('"')
-                    .trim_start();
-                before.is_none_or(|character| " \t{,.".contains(character))
-                    && after.starts_with('=')
-            })
-        })
-    };
-    match configuration
-        .iter()
-        .find(|file| sets_wrapper(std::fs::read_to_string(&file.path).unwrap_or_default()))
-    {
-        Some(file) => Err(invalid_input(format!(
-            "{}: sets build.rustc-wrapper, which salting layout replicas would replace; set RUSTC_WRAPPER in the environment instead, which the salting wrapper runs",
-            file.path.display()
-        ))),
-        None => Ok(None),
-    }
-}
-
-/// A TOML line without its comment: anything after a `#` outside a string.
-fn uncommented(line: &str) -> &str {
-    let mut quote = None;
-    for (index, character) in line.char_indices() {
-        match (quote, character) {
-            (None, '#') => return &line[..index],
-            (None, '"' | '\'') => quote = Some(character),
-            (Some(open), close) if open == close => quote = None,
-            _ => {}
+    for file in configuration {
+        // Cargo reads only `config` from a directory that also has `config.toml`.
+        let shadowed = file.path.file_name() == Some("config.toml".as_ref())
+            && configuration
+                .iter()
+                .any(|other| other.path == file.path.with_file_name("config"));
+        if shadowed {
+            continue;
+        }
+        if let Some(wrapper) = configured_wrapper(&file.path)? {
+            return Ok(wrapper);
         }
     }
-    line
+    Ok(None)
+}
+
+/// `build.rustc-wrapper` in one Cargo configuration file: `None` when the file does not set it, otherwise the wrapper, or `Some(None)` for an empty value.
+fn configured_wrapper(path: &Path) -> io::Result<Option<Option<std::ffi::OsString>>> {
+    let invalid = |reason: String| invalid_input(format!("{}: {reason}", path.display()));
+    let table: toml::Table = std::fs::read_to_string(path)
+        .map_err(|error| invalid(error.to_string()))?
+        .parse()
+        .map_err(|error: toml::de::Error| invalid(error.message().to_owned()))?;
+    let Some(value) = table
+        .get("build")
+        .and_then(|build| build.get("rustc-wrapper"))
+    else {
+        return Ok(None);
+    };
+    let wrapper = value
+        .as_str()
+        .ok_or_else(|| invalid("build.rustc-wrapper must be a string".to_owned()))?;
+    // The file is `DIRECTORY/.cargo/config.toml`, or `$CARGO_HOME/config.toml`; paths are relative to DIRECTORY, or to `$CARGO_HOME`'s parent.
+    let base = path.ancestors().nth(2).unwrap_or(Path::new("/"));
+    Ok(Some(match wrapper {
+        "" => None,
+        wrapper if wrapper.contains('/') => Some(base.join(wrapper).into_os_string()),
+        wrapper => Some(wrapper.into()),
+    }))
 }
 
 /// Build every crate with `-C metadata=SALT` added, through a `RUSTC_WRAPPER` script that runs `existing`, the wrapper the build would otherwise use, in turn. `RUSTFLAGS` and Cargo configuration are untouched.
