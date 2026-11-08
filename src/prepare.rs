@@ -532,8 +532,10 @@ impl Build<'_> {
             })?;
         let sha256 =
             std::fs::create_dir_all(frozen.parent().expect("an executable has a directory"))
-                .and_then(|()| std::fs::copy(&built, &frozen))
-                .and_then(|_| sha256_identified(&frozen))
+                .and_then(|()| {
+                    artifact::write_executable(&frozen, artifact::Contents::Copy(&built))
+                })
+                .and_then(|()| sha256_identified(&frozen))
                 .map_err(|error| {
                     io::Error::new(
                         error.kind(),
@@ -685,7 +687,6 @@ pub(crate) fn salt_crates(
 ) -> io::Result<()> {
     use sha2::{Digest, Sha256};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
     let quote = |value: &[u8]| {
         let mut quoted = b"'".to_vec();
         for &byte in value {
@@ -709,9 +710,9 @@ pub(crate) fn salt_crates(
     let wrapper = directory.join(format!("{salt}-{}", &digest[..16]));
     // Write a sibling and rename it into place, so a concurrent preparation never runs a partly written script.
     let partial = directory.join(format!(".{salt}-{}-{}", &digest[..16], std::process::id()));
+    // Cargo runs it as soon as it is written, so it is written by a child process, never held open for writing here.
     std::fs::create_dir_all(directory)
-        .and_then(|()| std::fs::write(&partial, &script))
-        .and_then(|()| std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| artifact::write_executable(&partial, artifact::Contents::Script(&script)))
         .and_then(|()| std::fs::rename(&partial, &wrapper))
         .map_err(|error| {
             io::Error::new(

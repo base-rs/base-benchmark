@@ -184,15 +184,10 @@ fn cancellation_is_recorded_separately_from_failure() {
 
 /// A fake `perf`: `perf stat --no-big-num -x, -e EVENTS -o FILE -- PROGRAM ARGS...` writes `counters` to FILE, then runs the workload.
 fn fake_perf(directory: &Path, counters: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = directory.join(format!("perf-{}", counters.len()));
-    std::fs::write(
-        &path,
-        format!("#!/bin/sh\noutput=$7\nshift 8\n{counters}\nexec \"$@\"\n"),
+    crate::test_support::write_executable(
+        &directory.join(format!("perf-{}", counters.len())),
+        &format!("#!/bin/sh\noutput=$7\nshift 8\n{counters}\nexec \"$@\"\n"),
     )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
 }
 
 #[test]
