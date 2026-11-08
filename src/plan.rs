@@ -351,6 +351,16 @@ impl Plan {
                 artifact.label
             ));
         }
+        for artifact in artifacts
+            .iter()
+            .filter(|artifact| !artifact.source.lockfile_changes.is_empty())
+        {
+            missing.push(format!(
+                "an overlaid build of {} that keeps the versions its tree locks ({})",
+                artifact.label,
+                artifact.source.lockfile_changes.join("; ")
+            ));
+        }
         let trees = artifacts
             .iter()
             .filter(|artifact| artifact.role != ArtifactRole::LayoutReplica)

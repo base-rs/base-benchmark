@@ -610,6 +610,10 @@ fn overlays_build_every_tree_with_the_current_workload_package() {
     let current = directory.path().join("current");
     // The old tree's workload reports 2000 ns; the current one reports 1000 ns and adds a dependency the old lockfile lacks.
     support::member_workspace(&old, 2000, false);
+    // The old tree also locks a package nothing uses, which an unlocked build drops: a change to what it locks.
+    let mut lockfile = std::fs::read_to_string(old.join("Cargo.lock")).unwrap();
+    lockfile.push_str("\n[[package]]\nname = \"stale\"\nversion = \"0.1.0\"\n");
+    std::fs::write(old.join("Cargo.lock"), lockfile).unwrap();
     let workspace = Workspace::new(support::member_workspace(&current, 1000, true));
     support::commit(&current);
     let old_lockfile = std::fs::read(old.join("Cargo.lock")).unwrap();
@@ -678,6 +682,17 @@ fn overlays_build_every_tree_with_the_current_workload_package() {
     assert!(harness.revision.is_some());
     assert!(!old_artifact.build.command.contains(&"--locked".to_owned()));
     assert!(old_artifact.source.lockfile_sha256.is_some());
+    assert_eq!(
+        old_artifact.source.lockfile_changes,
+        ["stale 0.1.0 -> removed"]
+    );
+    assert!(
+        overlaid.manifest.artifacts[1]
+            .source
+            .lockfile_changes
+            .is_empty(),
+        "the current tree's harness dependencies come from its own lockfile"
+    );
     assert_eq!(
         overlaid.manifest.artifacts[2].source.overlay.as_ref(),
         Some(harness),

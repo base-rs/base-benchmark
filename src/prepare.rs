@@ -56,13 +56,17 @@ pub struct PrepareOptions {
 
 /// A workload package copied into every tree before building, so that revisions from before the workload existed, or with an older version of it, run the same harness.
 ///
-/// Trees are never modified: each is copied to a sibling directory, so relative path dependencies still resolve, the package directory is replaced, and the copy is built without `--locked`, since the harness may add dependencies the tree's lockfile lacks. Cargo keeps the tree's locked versions where they satisfy the harness, and each artifact records the lockfile it was built with. The tree's workspace must list the package as a member.
+/// Trees are never modified: each is copied to a sibling directory, so relative path dependencies still resolve, the package directory is replaced, and the copy is built without `--locked`, since the harness may need dependencies the tree's lockfile lacks. The copy's lockfile is first seeded with the current workspace's entries that the tree does not lock, so that the harness's new dependencies resolve to the current versions in every tree, without new choices from the registry. Where the harness needs a newer version of a package the tree locks, Cargo upgrades it for the whole tree; each artifact records such changes, and recorded campaigns refuse them.
+///
+/// The tree's workspace must list the package as a member, by name or by a glob, and must define what the package inherits with `workspace = true`. Inherited dependencies take the tree's versions and features, and the tree's `[patch]` applies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Overlay {
     /// The package directory, relative to the workspace root.
     pub relative: PathBuf,
     /// The package directory to copy in.
     pub source: PathBuf,
+    /// The current workspace's lockfile, whose entries seed each copy's.
+    pub lockfile: Option<PathBuf>,
 }
 
 impl Overlay {
@@ -84,7 +88,12 @@ impl Overlay {
                 ))
             })?
             .to_owned();
-        Ok(Self { relative, source })
+        let lockfile = Some(suite.workspace_root.join("Cargo.lock")).filter(|path| path.is_file());
+        Ok(Self {
+            relative,
+            source,
+            lockfile,
+        })
     }
 
     fn identity(&self, package: &str) -> DependencyIdentity {
@@ -104,6 +113,11 @@ impl Overlay {
         let _ = std::fs::remove_dir_all(&package);
         std::fs::create_dir_all(&package)
             .and_then(|()| copy_contents(&self.source, &package, output))
+            .and_then(|()| {
+                self.lockfile.as_ref().map_or(Ok(()), |current| {
+                    seed_lockfile(&copy.join("Cargo.lock"), current)
+                })
+            })
     }
 }
 
@@ -170,6 +184,11 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         .overlay
         .as_ref()
         .map(|overlay| overlay.identity(&options.suite.package));
+    // Builds with an overlay are compared with the current workspace's lockfile, which seeded theirs.
+    let current_lockfile = options
+        .overlay
+        .as_ref()
+        .and_then(|harness| harness.lockfile.as_deref());
     let mut artifacts = Vec::new();
     for (index, (label, path)) in trees.iter().enumerate() {
         let role = if index == 0 {
@@ -189,7 +208,7 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         if directory != path.as_path() {
             overlay_copy(path, directory, options, &output)?;
         }
-        artifacts.extend(build_feature_sets(
+        let built = build_feature_sets(
             options,
             &feature_sets,
             &output,
@@ -198,7 +217,13 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
             directory,
             &source,
             cancellation,
-        )?);
+        )?;
+        artifacts.extend(with_lockfile_changes(
+            built,
+            path,
+            directory,
+            current_lockfile,
+        ));
     }
     // The baseline's source identity is the same for each of its feature sets.
     let baseline = artifacts[0].source.clone();
@@ -212,8 +237,9 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
             replica_of: Some(trees[0].0.clone()),
             path_dependencies: baseline.path_dependencies.clone(),
             overlay: baseline.overlay.clone(),
+            lockfile_changes: Vec::new(),
         };
-        artifacts.extend(build_feature_sets(
+        let built = build_feature_sets(
             options,
             &feature_sets,
             &output,
@@ -222,7 +248,13 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
             &copy.0,
             &source,
             cancellation,
-        )?);
+        )?;
+        artifacts.extend(with_lockfile_changes(
+            built,
+            &baseline.path,
+            &copy.0,
+            current_lockfile,
+        ));
     }
 
     let manifest = ArtifactManifest {
@@ -294,7 +326,7 @@ fn validate(options: &PrepareOptions) -> io::Result<Validated> {
     Ok((trees, copies))
 }
 
-/// An exclusively created replica source directory, removed when dropped, including after a failed build.
+/// An exclusively created copy of a tree, for a layout replica or an overlay, removed when dropped, including after a failed build.
 struct TemporaryCopy(PathBuf);
 
 impl TemporaryCopy {
@@ -303,7 +335,7 @@ impl TemporaryCopy {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "{}: {error}; a layout replica copy must be a new directory",
+                    "{}: {error}; a copy of a tree must be a new directory",
                     path.display()
                 ),
             )
@@ -624,7 +656,144 @@ fn source_identity(path: &Path) -> SourceIdentity {
         replica_of: None,
         path_dependencies: None,
         overlay: None,
+        lockfile_changes: Vec::new(),
     }
+}
+
+/// Record in each artifact what its build changed: versions `tree`'s lockfile locks that the lockfile of `built`, the directory that was built, changed, and, with an overlay, packages the tree did not lock that resolved differently from the current workspace. Locked builds change nothing.
+fn with_lockfile_changes(
+    mut artifacts: Vec<Artifact>,
+    tree: &Path,
+    built: &Path,
+    current: Option<&Path>,
+) -> Vec<Artifact> {
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
+    let changes = lockfile_changes(
+        &read(&tree.join("Cargo.lock")),
+        &read(&built.join("Cargo.lock")),
+        &current.map(read).unwrap_or_default(),
+    );
+    for artifact in &mut artifacts {
+        artifact.source.lockfile_changes = changes.clone();
+    }
+    artifacts
+}
+
+/// A lockfile's `[[package]]` entries: each name and version, the names it depends on, and its text.
+struct Locked<'a> {
+    name: &'a str,
+    version: &'a str,
+    dependencies: Vec<&'a str>,
+    text: &'a str,
+}
+
+fn locked_packages(text: &str) -> Vec<Locked<'_>> {
+    text.split("[[package]]\n")
+        .skip(1)
+        .map(|entry| {
+            let value = |key: &str| {
+                entry
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key)?.strip_prefix(" = "))
+                    .unwrap_or_default()
+                    .trim_matches('"')
+            };
+            // Dependencies are listed one per line, as a quoted name optionally followed by a version and source.
+            let dependencies = entry
+                .split_once("dependencies = [\n")
+                .map(|(_, list)| list.split_once(']').map_or(list, |(list, _)| list))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.trim().trim_matches(['"', ',']).split(' ').next())
+                .filter(|name| !name.is_empty())
+                .collect();
+            Locked {
+                name: value("name"),
+                version: value("version"),
+                dependencies,
+                text: entry,
+            }
+        })
+        .collect()
+}
+
+fn versions<'a>(packages: &[Locked<'a>]) -> BTreeMap<&'a str, BTreeSet<&'a str>> {
+    let mut versions = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for package in packages {
+        versions
+            .entry(package.name)
+            .or_default()
+            .insert(package.version);
+    }
+    versions
+}
+
+/// Add to the lockfile at `copy` the entries of `current` for packages it does not lock at all, so that Cargo resolves them as the current workspace does.
+///
+/// Packages the tree locks keep its versions, since a second, compatible version would leave Cargo unable to choose. An entry that depends, directly or through other added entries, on a package the tree locks at another version would contradict the tree's lockfile, so it is left for Cargo to resolve.
+fn seed_lockfile(copy: &Path, current: &Path) -> io::Result<()> {
+    let tree = std::fs::read_to_string(copy).unwrap_or_default();
+    let current = std::fs::read_to_string(current)?;
+    let (locked, available) = (locked_packages(&tree), locked_packages(&current));
+    let (tree_versions, current_versions) = (versions(&locked), versions(&available));
+    // Names the seed cannot use: packages the tree locks differently, then whatever depends on them.
+    let mut excluded: BTreeSet<&str> = tree_versions
+        .iter()
+        .filter(|(name, versions)| {
+            current_versions
+                .get(*name)
+                .is_some_and(|current| current != *versions)
+        })
+        .map(|(name, _)| *name)
+        .collect();
+    let mut seeds: Vec<&Locked> = available
+        .iter()
+        .filter(|package| !tree_versions.contains_key(package.name))
+        .collect();
+    while let Some(index) = seeds.iter().position(|package| {
+        package
+            .dependencies
+            .iter()
+            .any(|dependency| excluded.contains(dependency))
+    }) {
+        excluded.insert(seeds.remove(index).name);
+    }
+    let mut seeded = tree.trim_end().to_owned();
+    for package in seeds {
+        seeded.push_str("\n\n[[package]]\n");
+        seeded.push_str(package.text.trim_end());
+    }
+    seeded.push('\n');
+    std::fs::write(copy, seeded)
+}
+
+/// What a build changed, as readable lines: each package the `original` lockfile locks whose versions differ in `built`, as `name before -> after`, and each package `built` adds whose versions differ from the `current` workspace's, as `name versions, not the current workspace's versions`.
+pub(crate) fn lockfile_changes(original: &str, built: &str, current: &str) -> Vec<String> {
+    let (original, built, current) = (
+        versions(&locked_packages(original)),
+        versions(&locked_packages(built)),
+        versions(&locked_packages(current)),
+    );
+    let join = |versions: &BTreeSet<&str>| versions.iter().copied().collect::<Vec<_>>().join(", ");
+    let changed = original
+        .iter()
+        .filter(|(name, before)| built.get(*name) != Some(*before))
+        .map(|(name, before)| {
+            let after = built.get(name).map_or("removed".to_owned(), join);
+            format!("{name} {} -> {after}", join(before))
+        });
+    let drifted = built
+        .iter()
+        .filter(|(name, _)| !original.contains_key(*name))
+        .filter_map(|(name, versions)| {
+            let wanted = current.get(name).filter(|wanted| *wanted != versions)?;
+            Some(format!(
+                "{name} {}, not the current workspace's {}",
+                join(versions),
+                join(wanted)
+            ))
+        });
+    changed.chain(drifted).collect()
 }
 
 /// Copy `tree` into the reserved directory `copy`, then overlay the workload package, if any, onto the copy.

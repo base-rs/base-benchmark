@@ -72,6 +72,7 @@ impl ArtifactManifest {
                     replica_of: None,
                     path_dependencies: None,
                     overlay: None,
+                    lockfile_changes: Vec::new(),
                 },
                 build: BuildIdentity {
                     command: Vec::new(),
@@ -263,7 +264,7 @@ pub enum ArtifactRole {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceIdentity {
-    /// The directory that was built.
+    /// The tree that was built: the labelled tree, also when it was built from an overlaid copy, or a layout replica's copy.
     pub path: PathBuf,
     /// `git rev-parse HEAD`, when available.
     pub revision: Option<String>,
@@ -274,8 +275,11 @@ pub struct SourceIdentity {
     /// Path dependencies outside the tree. `Cargo.lock` does not pin them, so each is identified by its own Git state. `None` when Cargo metadata could not be read, so they are unknown and the source is not frozen. A replica repeats its baseline's.
     pub path_dependencies: Option<Vec<DependencyIdentity>>,
     /// The workload package built in place of the tree's own, from the workspace that prepared it, when preparation overlaid it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<DependencyIdentity>,
+    /// Versions the tree's lockfile locks that its overlaid build used differently, such as `signal-hook 0.4.5 -> 0.4.6` when the workload needs a newer release. Empty when the tree was built as locked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lockfile_changes: Vec<String>,
 }
 
 impl SourceIdentity {
