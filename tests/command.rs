@@ -246,3 +246,52 @@ fn closed_stdout_fails_report_commands() {
     );
     assert!(std::io::Write::flush(&mut Rejecting).is_ok());
 }
+
+#[test]
+fn remote_options_hand_the_command_to_another_host() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = text(&support::workspace(&directory.path().join("project"), ""));
+    // A malformed tree is reported before any host is contacted.
+    let (code, _, errors) = command(&[
+        "prepare",
+        "--host",
+        "bench",
+        "--remote-directory",
+        "/srv/benchmarks",
+        "--remote-program",
+        "/opt/base-benchmark",
+        "--manifest-path",
+        &manifest,
+        "--tree",
+        "current",
+    ]);
+    assert_eq!(code, ExitCode::FAILURE);
+    assert!(errors.contains("expected LABEL=PATH"), "{errors}");
+    for repeated in ["host", "remote-directory", "remote-program"] {
+        let flag = format!("--{repeated}");
+        let mut values = vec!["run", "--host", "bench"];
+        if repeated != "host" {
+            values.extend([flag.as_str(), "1"]);
+        }
+        values.extend([flag.as_str(), "1"]);
+        let (code, _, errors) = command(&values);
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(errors.contains("more than once"), "{repeated}: {errors}");
+    }
+    let (code, _, errors) = command(&[
+        "smoke",
+        "--host",
+        "bench",
+        "--manifest-path",
+        "",
+        "--remote-program",
+        "x",
+    ]);
+    assert_eq!(code, ExitCode::FAILURE, "{errors}");
+    let (code, out, _) = command(&["version"]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        out,
+        format!("base-benchmark {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}

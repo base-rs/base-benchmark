@@ -91,6 +91,23 @@ All unmet prerequisites are reported together.
 
 Progress and the human report go to stderr; Bake's result is a compact JSON object with the campaign directory, `summary.json` path, evidence class, and warnings.
 
+### Measuring on another host
+
+A dedicated, otherwise idle machine gives steadier results than a development one. `prepare`, `run`, and `smoke` accept `--host HOST`, an SSH destination, to run there:
+
+```sh
+base-benchmark prepare --host bench.local --tree main=../main --tree candidate=.
+base-benchmark run periodic --host bench.local --artifacts target/base-benchmark/prepared-TIME/artifacts.json --cpus 2-5
+base-benchmark summarize target/base-benchmark/periodic-screening-TIME
+```
+
+- **Mirrored paths.** Every local path a command names is mirrored on the host at `DIRECTORY/mirror/ABSOLUTE-PATH`, where `--remote-directory DIRECTORY` defaults to `.cache/base-benchmark` in the remote user's home. Paths are made canonical locally, and existing ones must exist, so a mirror never leaves the directory. Before the command, the workspace, each `--tree`, and the trees' path dependencies outside them are copied there with `rsync`, without their top-level `target` directories but with their Git state, deleting files that no longer exist locally. A tree that is a linked worktree, as `git worktree add` makes, has its repository mirrored too, and its mirror names the mirrored repository. Mirrors are keyed by local paths alone, so machines or users that share a host account need their own `--remote-directory`.
+- **Outputs come back.** Commands get an explicit `--output`, the same default directory a local run would use. Afterwards that directory is copied back, also when the command failed or was cancelled, so such campaigns can be inspected locally. A mirrored output whose local copy is gone is cleared first, so the command sees a new directory. Downloaded artifact manifests and campaigns name the host's paths: run prepared artifacts on the same host, and summarize campaigns anywhere.
+- **Interruption.** SIGINT, SIGTERM, or SIGHUP locally, or a dropped connection, stops the host's command as a termination signal would stop it locally, and the cancelled campaign is still copied back when the connection allows.
+- **The command on the host.** By default the host runs the crates.io release of this version, installed with `cargo install --locked` under `DIRECTORY/tool` when it is missing; an unreleased build needs `--remote-program PATH`, a path on the host, such as a build of the same revision there. Remote scripts run with `sh` from standard input, whatever the remote user's login shell.
+- **Other arguments** pass unchanged and are checked by the host's command. `--lock` names a file on the host; a relative one is relative to the remote user's home.
+- **Requirements.** `ssh`, and `rsync` 3.2.3 or later, on both machines, and a POSIX shell and Cargo on the host. `BASE_BENCHMARK_SSH` and `BASE_BENCHMARK_RSYNC` name other local programs. The host lock, CPU placement, and the idle-host declaration all apply to the host. Preparation does not take the host lock, so prepare before measuring rather than during another campaign.
+
 ## How samples are launched
 
 Code and stack layout can change a program's speed as much as a real optimization. Each sample therefore starts under controlled conditions:
