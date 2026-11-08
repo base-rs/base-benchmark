@@ -301,8 +301,8 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
     assert!(stderr.contains("invalid.json"), "{stderr}");
     assert!(!stderr.contains("rsync"), "{stderr}");
     assert!(!downloads.exists());
-    // A failed command whose output exists still brings it back.
-    let failed_smoke = directory.path().join("failed-smoke");
+    // A failed command whose output exists still brings it back, also when its path has spaces, which the host's check for it quotes.
+    let failed_smoke = directory.path().join("failed smoke");
     recorded
         .execute_now(
             "smoke",
