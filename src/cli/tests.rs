@@ -73,8 +73,8 @@ fn every_option_reports_repetition_and_parse_errors() {
     let commands: [(&str, &[&str], &[&str]); 4] = [
         (
             "prepare",
-            &["manifest-path", "package", "replicas", "output"],
-            &["replicas"],
+            &["manifest-path", "package", "replicas", "output", "overlay"],
+            &["replicas", "overlay"],
         ),
         (
             "smoke",

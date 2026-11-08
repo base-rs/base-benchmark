@@ -342,9 +342,23 @@ impl Plan {
             } else {
                 ""
             };
+            let overlay = match artifact.source.overlay {
+                Some(_) => ", and overlaid workload",
+                None => "",
+            };
             missing.push(format!(
-                "committed, unmodified source and path dependencies for {}{reason}",
+                "committed, unmodified source and path dependencies{overlay} for {}{reason}",
                 artifact.label
+            ));
+        }
+        for artifact in artifacts
+            .iter()
+            .filter(|artifact| !artifact.source.lockfile_changes.is_empty())
+        {
+            missing.push(format!(
+                "an overlaid build of {} that keeps the versions its tree locks ({})",
+                artifact.label,
+                artifact.source.lockfile_changes.join("; ")
             ));
         }
         let trees = artifacts

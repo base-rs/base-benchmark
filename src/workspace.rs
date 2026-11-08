@@ -4,7 +4,7 @@
 use crate::artifact::ArtifactManifest;
 use crate::config::{self, Scenario, Suite};
 use crate::plan::{Mode, Plan, PlanOptions, default_lock_path};
-use crate::prepare::{PrepareOptions, Prepared, Tree, prepare};
+use crate::prepare::{Overlay, PrepareOptions, Prepared, Tree, prepare};
 use crate::runner::{self, Campaign, Cancellation};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -33,6 +33,8 @@ pub struct PrepareRequest {
     pub output: Option<PathBuf>,
     /// Build the feature sets these scenarios need; without scenarios, every scenario's.
     pub scenarios: Vec<String>,
+    /// Build every tree with this workspace's workload package in place of the tree's own; see [`Overlay`].
+    pub overlay: bool,
 }
 
 /// A request to collect one scenario from prepared artifacts. Unset options take the core's defaults.
@@ -120,6 +122,7 @@ impl Workspace {
         let output = request
             .output
             .unwrap_or_else(|| default_output(&suite.workspace_root, "prepared"));
+        let overlay = request.overlay.then(|| Overlay::of(&suite)).transpose()?;
         prepare(
             &PrepareOptions {
                 suite,
@@ -127,6 +130,7 @@ impl Workspace {
                 replicas: request.replicas,
                 output,
                 feature_sets,
+                overlay,
                 cargo: self.cargo.clone(),
                 rustc: self.rustc.clone(),
             },

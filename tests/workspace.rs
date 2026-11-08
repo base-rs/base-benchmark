@@ -240,6 +240,7 @@ fn preparation_failures_name_the_tree() {
         replicas: Some(1),
         output: directory.path().join("custom"),
         feature_sets: Vec::new(),
+        overlay: None,
         cargo: custom.cargo.clone(),
         rustc: custom.rustc.clone(),
     };
@@ -598,6 +599,147 @@ fn smoking_an_executable_that_can_run_no_scenario_fails() {
         error
             .to_string()
             .contains("no scenario of fixture can run with features []"),
+        "{error}"
+    );
+}
+
+#[test]
+fn overlays_build_every_tree_with_the_current_workload_package() {
+    let directory = tempfile::tempdir().unwrap();
+    let old = directory.path().join("old");
+    let current = directory.path().join("current");
+    // The old tree's workload reports 2000 ns; the current one reports 1000 ns and adds a dependency the old lockfile lacks.
+    support::member_workspace(&old, 2000, false);
+    // The old tree also locks a package nothing uses, which an unlocked build drops: no change to what is measured.
+    let mut lockfile = std::fs::read_to_string(old.join("Cargo.lock")).unwrap();
+    lockfile.push_str("\n[[package]]\nname = \"stale\"\nversion = \"0.1.0\"\n");
+    std::fs::write(old.join("Cargo.lock"), lockfile).unwrap();
+    let workspace = Workspace::new(support::member_workspace(&current, 1000, true));
+    support::commit(&current);
+    let old_lockfile = std::fs::read(old.join("Cargo.lock")).unwrap();
+    let trees = vec![
+        Tree {
+            label: "old".to_owned(),
+            path: old.clone(),
+        },
+        Tree {
+            label: "new".to_owned(),
+            path: current.clone(),
+        },
+    ];
+    let wall = |manifest: &Path, output: &str| {
+        let campaign = workspace
+            .run(
+                RunRequest {
+                    output: Some(directory.path().join(output)),
+                    ..request(manifest, &directory.path().join("lock"))
+                },
+                &Cancellation::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        campaign
+            .summary
+            .subjects
+            .iter()
+            .map(|subject| {
+                let wall = subject
+                    .metrics
+                    .iter()
+                    .find(|metric| metric.name == "wall_time");
+                (
+                    subject.label.clone(),
+                    wall.unwrap().distribution.unwrap().median,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let overlaid = workspace
+        .prepare(
+            PrepareRequest {
+                trees: trees.clone(),
+                output: Some(directory.path().join("overlaid")),
+                overlay: true,
+                ..PrepareRequest::default()
+            },
+            &Cancellation::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        wall(&overlaid.manifest_path, "overlaid-campaign"),
+        [
+            ("old".to_owned(), 100.0),
+            ("new".to_owned(), 100.0),
+            ("old-replica".to_owned(), 100.0)
+        ]
+    );
+    let old_artifact = &overlaid.manifest.artifacts[0];
+    assert_eq!(old_artifact.source.path, old.canonicalize().unwrap());
+    let harness = old_artifact.source.overlay.as_ref().unwrap();
+    assert_eq!(harness.path, current.join("bench").canonicalize().unwrap());
+    assert_eq!(harness.dirty, Some(false));
+    assert!(harness.revision.is_some());
+    assert!(!old_artifact.build.command.contains(&"--locked".to_owned()));
+    assert!(old_artifact.source.lockfile_sha256.is_some());
+    assert!(old_artifact.source.lockfile_changes.is_empty());
+    assert!(
+        overlaid.manifest.artifacts[1]
+            .source
+            .lockfile_changes
+            .is_empty(),
+        "the current tree's harness dependencies come from its own lockfile"
+    );
+    assert_eq!(
+        overlaid.manifest.artifacts[2].source.overlay.as_ref(),
+        Some(harness),
+        "replicas repeat their baseline's overlay"
+    );
+    // The trees themselves are never modified.
+    assert_eq!(std::fs::read(old.join("Cargo.lock")).unwrap(), old_lockfile);
+    assert!(!old.join("bench/helper").exists());
+    let leftovers = std::fs::read_dir(directory.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+        .count();
+    assert_eq!(leftovers, 0, "overlaid copies are removed");
+
+    // Without an overlay each tree runs its own workload.
+    let own = workspace
+        .prepare(
+            PrepareRequest {
+                trees,
+                output: Some(directory.path().join("own")),
+                ..PrepareRequest::default()
+            },
+            &Cancellation::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        wall(&own.manifest_path, "own-campaign")[0],
+        ("old".to_owned(), 200.0)
+    );
+    assert!(own.manifest.artifacts[0].source.overlay.is_none());
+}
+
+#[test]
+fn overlays_need_a_workload_below_the_workspace_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = workspace(&directory.path().join("project"));
+    let error = workspace
+        .prepare(
+            PrepareRequest {
+                overlay: true,
+                ..PrepareRequest::default()
+            },
+            &Cancellation::new(),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be overlaid onto other trees"),
         "{error}"
     );
 }

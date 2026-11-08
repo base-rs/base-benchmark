@@ -65,9 +65,17 @@ Add the Bake tasks to the private `bake/` package with `cargo add --manifest-pat
 | --- | --- |
 | `benchmark:list` | Show discovered suites, scenarios, variants, and each scenario's resolved baseline. Nothing is built. |
 | `benchmark:smoke` | Build the current tree and run every scenario once with smoke arguments. Not performance evidence; no comparisons are computed. |
-| `benchmark:prepare --tree LABEL=PATH ...` | Build trees, baseline first, into frozen artifacts plus `--replicas N` layout replicas of the baseline (one by default for two or more trees, otherwise none), once for each feature set of the scenarios, or of those named with `--scenario`. Writes `artifacts.json`. |
+| `benchmark:prepare --tree LABEL=PATH ...` | Build trees, baseline first, into frozen artifacts plus `--replicas N` layout replicas of the baseline (one by default for two or more trees, otherwise none), once for each feature set of the scenarios, or of those named with `--scenario`. `--overlay true` builds every tree with this workspace's workload package. Writes `artifacts.json`. |
 | `benchmark:run SCENARIO --artifacts FILE` | Collect `--rounds` seeded random rounds under the host lock. `--mode` is `screening` (default) or `recorded`. `--cpus` pins workloads; `--perf-event` adds whole-process counters; `--stack-padding false` disables stack padding. |
 | `benchmark:summarize DIR` | Regenerate `summary.json` from a complete campaign's raw samples. |
+
+### Comparing revisions with the current workload
+
+Scenario arguments always come from the current workspace, so every tree must contain a workload that accepts them. To compare revisions from before the workload existed, or with an older version of it, prepare with `--overlay true`. Each tree is then copied to a sibling directory, so relative path dependencies still resolve, its workload package directory is replaced with this workspace's, and the copy is built. The trees themselves are never modified.
+
+- **Lockfiles.** The copy is built without `--locked`, since the workload may need dependencies the tree's lockfile lacks. Its lockfile is first seeded with the current workspace's entries for packages the tree does not lock, so that the workload's new dependencies resolve to the current versions in every tree. Where the workload needs a newer version of a package the tree locks, Cargo upgrades it for the whole tree, including the library being measured. Each artifact lists such changes, and any added package that resolved differently from the current workspace, in `lockfile_changes`, and recorded campaigns refuse them: the tree is then not built as it was locked.
+- **The tree's workspace.** It must list the package as a member, by name or with a glob, and define whatever the package inherits with `workspace = true`. Inherited dependencies take the tree's versions and features, and the tree's `[patch]` applies.
+- **Provenance.** Each artifact records the overlaid package's path and Git state, read once per preparation, and recorded campaigns require it to be committed and unmodified.
 
 Every task except `summarize` accepts `--manifest-path` for a standalone workspace, such as a benchmark suite excluded from the main workspace. Relative paths are resolved against the project root. The first SIGINT, SIGTERM, or SIGHUP stops preparation between builds or kills the running workload's process group and records the campaign as cancelled; a second signal exits immediately.
 
