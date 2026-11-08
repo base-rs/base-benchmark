@@ -441,6 +441,22 @@ fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary]) -> Vec<String> {
     if plan.mode != Mode::Smoke && !plan.stack_padding {
         warnings.push("stack padding disabled: every process of a subject starts with the same stack alignment, which can bias comparisons".to_owned());
     }
+    // A replica identical to its baseline measures the same executable again, not build layout.
+    let artifacts = &plan.artifacts.artifacts;
+    for replica in artifacts
+        .iter()
+        .filter(|artifact| artifact.role == ArtifactRole::LayoutReplica)
+    {
+        let original = artifacts
+            .iter()
+            .find(|artifact| Some(&artifact.label) == replica.source.replica_of.as_ref());
+        if original.is_some_and(|original| original.sha256 == replica.sha256) {
+            warnings.push(format!(
+                "layout replica {} is byte-identical to its baseline, so it samples run-to-run variation only, not build layout",
+                replica.label
+            ));
+        }
+    }
     let timed = |metric: &&PairMetric| {
         metric.direction != Direction::Neutral && metric.unit == Unit::Nanoseconds
     };

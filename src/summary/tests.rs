@@ -43,6 +43,12 @@ fn wall(value: u64) -> Metric {
 fn pinned(roles: &[(&str, ArtifactRole)], variants: &[&str]) -> Plan {
     let mut plan = plan(Path::new("/work.sh"), variants, roles, Path::new("/lock"));
     plan.cpus = vec![0];
+    // Every fixture artifact runs the same shell, so give replicas their own hash, as a salted build has.
+    for artifact in &mut plan.artifacts.artifacts {
+        if artifact.role == ArtifactRole::LayoutReplica {
+            artifact.sha256 = format!("{} salted", artifact.sha256);
+        }
+    }
     plan
 }
 
@@ -777,6 +783,31 @@ fn quantiles_from_records_normalize_negative_zero_and_conflict_within_a_process(
         summary
             .warnings
             .contains(&"baseline: metric tail has conflicting definitions within a process and is not summarized".to_owned()),
+        "{:?}",
+        summary.warnings
+    );
+}
+
+#[test]
+fn replicas_identical_to_their_baseline_are_flagged() {
+    let plan = plan(
+        Path::new("/work.sh"),
+        &[],
+        &[
+            ("baseline", ArtifactRole::Baseline),
+            ("baseline-replica", ArtifactRole::LayoutReplica),
+        ],
+        Path::new("/lock"),
+    );
+    let entries = vec![
+        entry("baseline", 1, vec![wall(100)], Vec::new()),
+        entry("baseline-replica", 1, vec![wall(100)], Vec::new()),
+    ];
+    let summary = summarize(&plan, &entries);
+    assert!(
+        summary.warnings.contains(
+            &"layout replica baseline-replica is byte-identical to its baseline, so it samples run-to-run variation only, not build layout".to_owned()
+        ),
         "{:?}",
         summary.warnings
     );
