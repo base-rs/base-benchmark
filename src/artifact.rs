@@ -479,6 +479,12 @@ pub(crate) enum Contents<'a> {
 /// A process forked by another thread while a file is open for writing shares that descriptor, close-on-exec or not, until it execs or exits, and running the file meanwhile fails with `ETXTBSY`. The runner retries that when it starts a program itself, but a program that execs the file in turn, such as `perf` running a staged executable or Cargo running the layout salt wrapper, does not, and a caller's child that never execs holds it until it exits. The child that writes, `cat` run by `/bin/sh`, starts no other process meanwhile.
 #[cfg(unix)]
 pub(crate) fn write_executable(path: &Path, contents: Contents) -> io::Result<()> {
+    write_through(Path::new("/bin/sh"), path, contents)
+}
+
+/// Write `path` with `writer`, a POSIX shell, running `exec cat > PATH`.
+#[cfg(unix)]
+fn write_through(writer: &Path, path: &Path, contents: Contents) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
@@ -494,13 +500,20 @@ pub(crate) fn write_executable(path: &Path, contents: Contents) -> io::Result<()
         )),
     };
     let (output, written, permissions) = source.and_then(|(input, script, permissions)| {
-        Command::new("/bin/sh")
+        Command::new(writer)
             .args(["-c", "exec cat > \"$0\""])
             .arg(path)
             .stdin(input)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
+            // Named, so that a missing shell is not taken for a missing source.
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot run the writer, {}: {error}", writer.display()),
+                )
+            })
             .and_then(|mut writer| {
                 let written = writer.stdin.take().map_or(Ok(()), |mut stdin| {
                     stdin.write_all(script.unwrap_or_default())
@@ -512,10 +525,14 @@ pub(crate) fn write_executable(path: &Path, contents: Contents) -> io::Result<()
     })?;
     // A writer that fails before reading its input closes the pipe, so its own error explains a failed write.
     if !output.status.success() {
+        // A writer stopped by a signal usually says nothing.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let explanation = Some(stderr.trim())
+            .filter(|stderr| !stderr.is_empty())
+            .map_or(String::new(), |stderr| format!(": {stderr}"));
         return Err(io::Error::other(format!(
-            "writing failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            "writing failed with {}{explanation}",
+            output.status
         )));
     }
     written.and_then(|()| std::fs::set_permissions(path, permissions))

@@ -192,6 +192,29 @@ fn executables_are_written_with_their_permissions() {
         );
         assert!(error.to_string().contains("absent/file"), "{error}");
     }
+    // A missing writer is named, so that it is not taken for a missing source.
+    let error =
+        write_through(Path::new("/nonexistent/sh"), &copy, Contents::Copy(&source)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(
+        error
+            .to_string()
+            .starts_with("cannot run the writer, /nonexistent/sh: "),
+        "{error}"
+    );
+    // A writer stopped by a signal, which says nothing, gives its status alone.
+    let killed = crate::test_support::write_executable(
+        &directory.path().join("killed-sh"),
+        "#!/bin/sh\nkill -KILL $$\n",
+    );
+    for contents in [Contents::Copy(&source), Contents::Script(b"#!/bin/sh\n")] {
+        let error = write_through(&killed, &copy, contents).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "writing failed with signal: 9 (SIGKILL)",
+            "{error}"
+        );
+    }
 }
 
 #[test]
