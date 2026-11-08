@@ -476,7 +476,22 @@ impl Collection<'_> {
             .record
             .as_ref()
             .expect("a successful session has the driver's record");
-        expected.check(subject, record)
+        expected.check(subject, record)?;
+        // Plans list the driver last.
+        let driver = self.plan.roles.last().expect("sessions have a driver");
+        let Some(metric) = &driver.invalid_responses else {
+            return Ok(());
+        };
+        let count = crate::role::invalid_responses(record, metric)
+            .map_err(|error| invalid(format!("role {} (driver) {error}", driver.name)))?;
+        // In screening the sample is kept, and its comparisons are reported as invalid; recorded evidence must not choose which rounds count.
+        if count > 0 && self.plan.mode == crate::plan::Mode::Recorded {
+            return Err(invalid(format!(
+                "role {} (driver) received {count} invalid response(s), so the comparison is invalid, and recorded campaigns fail on any",
+                driver.name
+            )));
+        }
+        Ok(())
     }
 
     // Campaigns check first that collection is supported, so this is not reached.

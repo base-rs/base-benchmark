@@ -1332,3 +1332,127 @@ fn a_version_that_cannot_be_recorded_fails_the_campaign() {
             .is_empty()
     );
 }
+
+/// A record whose `responses_invalid` total is `count`.
+fn counted(count: u64) -> String {
+    record("same", 100).replace(
+        "\"metrics\":[",
+        &format!("\"metrics\":[{{\"name\":\"responses_invalid\",\"unit\":\"count\",\"phase\":\"measured\",\"source\":\"workload\",\"direction\":\"lower_is_better\",\"measurement\":{{\"kind\":\"total\",\"value\":{count}}}}},"),
+    )
+}
+
+/// A campaign of two variants whose driver counts invalid responses only from the server of the `fast` variant, which its ready line names.
+fn invalid_plan(directory: &Path, fast: &str) -> Plan {
+    let server = script(
+        directory,
+        "server.sh",
+        "echo \"ready $1\"\nsleep 30 & wait\n",
+    );
+    let client = script(
+        directory,
+        "client.sh",
+        &format!(
+            "echo '{WINDOW_START}'; echo '{WINDOW_STOP}'\nif [ \"$1\" = fast ]; then echo '{fast}'; else echo '{}'; fi\n",
+            counted(0)
+        ),
+    );
+    let mut suite = roles_suite(&server, &client, &["slow", "fast"]);
+    suite.scenarios[0].roles[0].invalid_responses = Some("responses_invalid".to_owned());
+    roles_plan(suite, &directory.join("lock"))
+}
+
+#[test]
+fn invalid_responses_make_comparisons_invalid_in_screening() {
+    let directory = tempfile::tempdir().unwrap();
+    let plan = invalid_plan(directory.path(), &counted(3));
+    let output = directory.path().join("campaign");
+    let campaign = run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap();
+    let pair = &campaign.summary.pairs[0];
+    assert_eq!(
+        (pair.invalid.as_deref(), pair.metrics.len()),
+        (Some("baseline/fast received invalid responses"), 0)
+    );
+    assert!(
+        campaign.warnings[0].starts_with("baseline/fast: 3 invalid response(s) in 1 round(s)"),
+        "{:?}",
+        campaign.warnings
+    );
+    assert!(
+        campaign
+            .report
+            .contains("  invalid: baseline/fast received invalid responses\n")
+    );
+    // The samples' numbers are kept and presented.
+    let fast = &campaign.summary.subjects[1];
+    assert!(
+        fast.metrics
+            .iter()
+            .any(|metric| metric.name == "responses_invalid")
+    );
+    assert!(
+        campaign
+            .summary
+            .aggregation
+            .contains("per successful operation")
+    );
+
+    // Without invalid responses, the comparison is made.
+    let directory = tempfile::tempdir().unwrap();
+    let plan = invalid_plan(directory.path(), &counted(0));
+    let campaign = run(
+        plan,
+        &directory.path().join("campaign"),
+        &Cancellation::new(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert!(
+        campaign.summary.pairs[0].invalid.is_none()
+            && !campaign.summary.pairs[0].metrics.is_empty()
+    );
+
+    // The driver's records are checked as any workload's: one workload and signature across the campaign.
+    let directory = tempfile::tempdir().unwrap();
+    let plan = invalid_plan(
+        directory.path(),
+        &counted(0).replace("\"same\"", "\"other\""),
+    );
+    let (error, _) = failed(plan, directory.path());
+    assert!(error.contains("did not do equivalent work"), "{error}");
+
+    // A driver whose record lacks the declared total has failed.
+    let directory = tempfile::tempdir().unwrap();
+    let plan = invalid_plan(directory.path(), &record("same", 100));
+    let (error, _) = failed(plan, directory.path());
+    assert!(
+        error.contains("role client (driver) reports no responses_invalid"),
+        "{error}"
+    );
+}
+
+#[test]
+fn invalid_responses_fail_recorded_campaigns() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut plan = invalid_plan(directory.path(), &counted(1));
+    let allowed = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+    let cpu = (0..nix::sched::CpuSet::count())
+        .find(|cpu| allowed.is_set(*cpu).unwrap())
+        .unwrap();
+    plan.mode = crate::plan::Mode::Recorded;
+    plan.rounds = 10;
+    plan.decision_rule = Some("rule".to_owned());
+    plan.idle_host = true;
+    plan.shared_placement = true;
+    for role in &mut plan.roles {
+        role.cpus = vec![cpu];
+    }
+    let (error, entries) = failed(plan, directory.path());
+    assert!(
+        error.contains(
+            "role client (driver) received 1 invalid response(s), so the comparison is invalid"
+        ),
+        "{error}"
+    );
+    // The failed sample keeps the record that counted them.
+    assert!(entries.last().unwrap().record.is_some());
+}

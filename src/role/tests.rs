@@ -340,6 +340,7 @@ fn role(
             timeout_ms: 1,
         }),
         stop: None,
+        invalid_responses: None,
     }
 }
 
@@ -473,5 +474,57 @@ fn roles_are_checked_together() {
     ] {
         let error = validate_roles(&roles, &[], &context).unwrap_err();
         assert!(error.to_string().contains(message), "{message}: {error}");
+    }
+}
+
+#[test]
+fn invalid_responses_are_a_declared_total_of_the_drivers_record() {
+    use crate::record::{Metric, ProcessRecord, Sample, Unit};
+    let record = |metrics: Vec<Vec<Metric>>| {
+        metrics.into_iter().fold(
+            ProcessRecord::new("w", serde_json::json!({})),
+            |record, metrics| {
+                record.with_sample(metrics.into_iter().fold(Sample::new(1), Sample::with))
+            },
+        )
+    };
+    let total = |value| Metric::total("invalid", Unit::Count, value);
+    assert_eq!(
+        invalid_responses(&record(vec![vec![total(2)], vec![total(3)]]), "invalid"),
+        Ok(5)
+    );
+    assert!(
+        invalid_responses(&record(vec![vec![total(2)], vec![]]), "invalid")
+            .unwrap_err()
+            .contains("reports no invalid")
+    );
+    assert!(
+        invalid_responses(
+            &record(vec![vec![Metric::mean("invalid", Unit::Count, 1.0)]]),
+            "invalid"
+        )
+        .unwrap_err()
+        .contains("as other than a total")
+    );
+    let driver = configuration(serde_json::json!({
+        "name": "client", "kind": "driver", "external": "load", "invalid-responses": "responses_invalid",
+    }))
+    .unwrap();
+    assert_eq!(
+        driver.invalid_responses.as_deref(),
+        Some("responses_invalid")
+    );
+    for (value, message) in [
+        (
+            serde_json::json!({ "name": "a", "kind": "service", "subject": true, "ready": "x", "invalid-responses": "x" }),
+            "only the driver's record",
+        ),
+        (
+            serde_json::json!({ "name": "a", "kind": "driver", "subject": true, "invalid-responses": " " }),
+            "names no metric",
+        ),
+    ] {
+        let error = configuration(value).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
     }
 }

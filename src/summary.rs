@@ -140,6 +140,9 @@ pub struct PairSummary {
     pub baseline: String,
     pub candidate: String,
     pub kind: PairKind,
+    /// Why the comparison is invalid, when either subject received invalid responses. Its metrics are then not compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid: Option<String>,
     pub metrics: Vec<PairMetric>,
 }
 
@@ -319,6 +322,26 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
             .push((entry.round, process_values(entry)));
     }
     let mut warnings = Warnings::default();
+    // Invalid responses the driver counted, by subject: their total and the rounds with any.
+    let declared = plan
+        .roles
+        .last()
+        .and_then(|driver| driver.invalid_responses.as_deref());
+    let mut invalid: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
+    for entry in entries.iter().filter(|entry| entry.error.is_none()) {
+        let count = declared
+            .zip(entry.record.as_ref())
+            .and_then(|(metric, record)| crate::role::invalid_responses(record, metric).ok())
+            .unwrap_or_default();
+        if count > 0 {
+            let slot = invalid.entry(entry.subject.as_str()).or_default();
+            slot.0 += count;
+            slot.1 += 1;
+        }
+    }
+    for (subject, (count, rounds)) in &invalid {
+        warnings.add(Hazard::Invalid, format!("{subject}: {count} invalid response(s) in {rounds} round(s), so comparisons involving it are invalid"), None);
+    }
 
     let subjects = plan
         .subjects
@@ -377,6 +400,10 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
     let pairs: Vec<PairSummary> = compared
         .iter()
         .map(|pair| {
+            let invalid: Vec<&str> = [pair.baseline.as_str(), pair.candidate.as_str()].into_iter().filter(|subject| invalid.contains_key(subject)).collect();
+            if !invalid.is_empty() {
+                return PairSummary { baseline: pair.baseline.clone(), candidate: pair.candidate.clone(), kind: pair.kind, invalid: Some(format!("{} received invalid responses", invalid.join(" and "))), metrics: Vec::new() };
+            }
             let rounds = |label: &str| -> BTreeMap<u32, &ProcessValues> { by_subject.get(label).into_iter().flatten().map(|(round, values)| (*round, values)).collect() };
             let baseline = rounds(&pair.baseline);
             let candidate = rounds(&pair.candidate);
@@ -417,7 +444,7 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
                     warnings.add(Hazard::Definition, format!("{} -> {}: missing from the candidate", pair.baseline, pair.candidate), Some(format!("{name} ({} round(s))", comparison.missing)));
                 }
             }
-            PairSummary { baseline: pair.baseline.clone(), candidate: pair.candidate.clone(), kind: pair.kind, metrics: comparisons.into_values().map(Comparison::into_metric).collect() }
+            PairSummary { baseline: pair.baseline.clone(), candidate: pair.candidate.clone(), kind: pair.kind, invalid: None, metrics: comparisons.into_values().map(Comparison::into_metric).collect() }
         })
         .collect();
 
@@ -448,21 +475,34 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
         rounds: plan.rounds,
         seed: plan.seed,
         decision_rule: plan.decision_rule.clone(),
-        aggregation: "each process contributes the median of its samples; subject distributions are across processes; pair differences, changes, and better or worse counts are per round, with differences below the measurement quantum counted as ties; there is no same-binary repeat subject, so run-to-run variation appears only as each subject's spread".to_owned(),
+        aggregation: format!(
+            "each process contributes the median of its samples; subject distributions are across processes; pair differences, changes, and better or worse counts are per round, with differences below the measurement quantum counted as ties; there is no same-binary repeat subject, so run-to-run variation appears only as each subject's spread{}",
+            if plan.roles.is_empty() {
+                ""
+            } else {
+                "; a sample's operations are its driver's successful operations, so every per-operation value, the driver's own included, is per successful operation, and request errors are counted per success"
+            }
+        ),
         subjects,
         pairs,
         warnings: warnings.into_lines(),
         overlays,
-        placement: plan.shared_placement.then(|| match plan.shared_cores.as_slice() {
-            [] => "deliberately shared".to_owned(),
-            shared => format!("deliberately shared: {}", crate::placement::describe(shared)),
-        }),
+        placement: plan
+            .shared_placement
+            .then(|| match plan.shared_cores.as_slice() {
+                [] => "deliberately shared".to_owned(),
+                shared => format!(
+                    "deliberately shared: {}",
+                    crate::placement::describe(shared)
+                ),
+            }),
     }
 }
 
 /// What a warning is about, in the order warnings are reported: build layout first, since it most often reverses a conclusion, and metrics that merely moved both ways last.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Hazard {
+    Invalid,
     IdenticalReplica,
     OppositeInReplica,
     UnresolvedInReplica,
@@ -860,6 +900,9 @@ impl Summary {
                     "\n{:?} {} -> {}",
                     pair.kind, pair.baseline, pair.candidate
                 );
+                if let Some(reason) = &pair.invalid {
+                    let _ = writeln!(text, "  invalid: {reason}");
+                }
                 for metric in pair
                     .metrics
                     .iter()
