@@ -31,6 +31,7 @@ pub fn artifact(label: &str, role: ArtifactRole, executable: &Path) -> Artifact 
     Artifact {
         label: label.to_owned(),
         role,
+        features: Some(Vec::new()),
         executable: executable.to_owned(),
         sha256: sha256_file(executable).unwrap(),
         source: SourceIdentity {
@@ -58,8 +59,8 @@ pub fn manifest(artifacts: Vec<Artifact>) -> ArtifactManifest {
         package: "fixture".to_owned(),
         binary: "fixture".to_owned(),
         profile: "release".to_owned(),
-        features: Vec::new(),
         artifacts,
+        ..ArtifactManifest::default()
     }
 }
 
@@ -85,6 +86,7 @@ pub fn suite(script: &Path, variants: &[&str]) -> Suite {
                 })
                 .collect(),
             baseline: None,
+            features: Vec::new(),
         }],
     }
 }

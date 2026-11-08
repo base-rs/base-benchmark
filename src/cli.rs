@@ -6,7 +6,7 @@ use crate::config::invalid_input;
 use crate::plan::parse_cpus;
 use crate::prepare::Tree;
 use crate::runner::{Cancellation, summarize_directory};
-use crate::workspace::{RunRequest, Workspace};
+use crate::workspace::{PrepareRequest, RunRequest, Workspace};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -18,6 +18,7 @@ usage: base-benchmark COMMAND [--name value]...
 
   list       [--manifest-path PATH]
   prepare    [--manifest-path PATH] [--package NAME] [--tree LABEL=PATH]... [--replicas N] [--output DIR]
+             [--scenario NAME]...
   smoke      [--manifest-path PATH] [--package NAME] [--output DIR] [--lock PATH]
   run        SCENARIO --artifacts FILE [--mode smoke|screening|recorded] [--package NAME]
              [--manifest-path PATH] [--rounds N] [--seed N] [--cpus 0,2] [--perf-event EVENT]...
@@ -60,14 +61,16 @@ fn execute(arguments: Vec<String>, out: &mut dyn Write, errors: &mut dyn Write) 
                 .iter()
                 .map(|tree| tree.parse())
                 .collect::<io::Result<Vec<Tree>>>()?;
-            let replicas = options.parsed("replicas")?;
-            let output = options.take("output")?.map(PathBuf::from);
+            let request = PrepareRequest {
+                package,
+                trees,
+                replicas: options.parsed("replicas")?,
+                output: options.take("output")?.map(PathBuf::from),
+                scenarios: options.take_all("scenario"),
+            };
             options.finish(0)?;
             let _signals = cancellation.on_termination_signals();
-            print_json(
-                out,
-                &workspace.prepare(package.as_deref(), trees, replicas, output, &cancellation)?,
-            )
+            print_json(out, &workspace.prepare(request, &cancellation)?)
         }
         "smoke" => {
             let workspace = Workspace::new(options.path("manifest-path")?);

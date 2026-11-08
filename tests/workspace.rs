@@ -6,8 +6,8 @@
 mod support;
 
 use base_benchmark::{
-    ArtifactManifest, ArtifactRole, CampaignStatus, Cancellation, Mode, PairKind, RunRequest, Tree,
-    Workspace, read_metadata,
+    ArtifactManifest, ArtifactRole, CampaignStatus, Cancellation, Mode, PairKind, PrepareRequest,
+    RunRequest, Tree, Workspace, read_metadata,
 };
 use std::path::Path;
 
@@ -51,10 +51,11 @@ fn prepares_trees_with_a_layout_replica_and_compares_them() {
     ];
     let prepared = workspace
         .prepare(
-            None,
-            trees,
-            None,
-            Some(directory.path().join("prepared")),
+            PrepareRequest {
+                trees,
+                output: Some(directory.path().join("prepared")),
+                ..PrepareRequest::default()
+            },
             &Cancellation::new(),
         )
         .unwrap();
@@ -162,10 +163,10 @@ fn smoke_runs_an_unprepared_executable() {
     let workspace = workspace(&project);
     let prepared = workspace
         .prepare(
-            None,
-            Vec::new(),
-            None,
-            Some(directory.path().join("prepared")),
+            PrepareRequest {
+                output: Some(directory.path().join("prepared")),
+                ..PrepareRequest::default()
+            },
             &Cancellation::new(),
         )
         .unwrap();
@@ -174,6 +175,7 @@ fn smoke_runs_an_unprepared_executable() {
         .smoke_executable(
             None,
             executable,
+            &[],
             &directory.path().join("smoke"),
             Some(directory.path().join("lock")),
         )
@@ -184,6 +186,7 @@ fn smoke_runs_an_unprepared_executable() {
             .smoke_executable(
                 None,
                 &directory.path().join("missing"),
+                &[],
                 &directory.path().join("missing-smoke"),
                 None
             )
@@ -194,6 +197,7 @@ fn smoke_runs_an_unprepared_executable() {
             .smoke_executable(
                 Some("missing"),
                 executable,
+                &[],
                 &directory.path().join("other"),
                 None
             )
@@ -209,10 +213,10 @@ fn preparation_failures_name_the_tree() {
     std::fs::write(project.join("src/main.rs"), "fn main() { not rust }").unwrap();
     let error = workspace
         .prepare(
-            None,
-            Vec::new(),
-            None,
-            Some(directory.path().join("broken")),
+            PrepareRequest {
+                output: Some(directory.path().join("broken")),
+                ..PrepareRequest::default()
+            },
             &Cancellation::new(),
         )
         .unwrap_err();
@@ -235,6 +239,7 @@ fn preparation_failures_name_the_tree() {
         }],
         replicas: Some(1),
         output: directory.path().join("custom"),
+        feature_sets: Vec::new(),
         cargo: custom.cargo.clone(),
         rustc: custom.rustc.clone(),
     };
@@ -248,7 +253,7 @@ fn preparation_failures_name_the_tree() {
     assert_eq!(prepared.manifest.artifacts.len(), 2);
 
     let mut features = options.clone();
-    features.suite.features = vec!["missing".to_owned()];
+    features.feature_sets = vec![vec!["missing".to_owned()]];
     features.output = directory.path().join("features");
     assert!(base_benchmark::prepare(&features, &Cancellation::new()).is_err());
 }
@@ -269,8 +274,13 @@ fn runs_reject_unknown_scenarios_and_artifacts() {
     let none = Workspace::new(directory.path().join("missing/Cargo.toml"));
     assert!(none.suite(None).is_err());
     assert!(
-        none.prepare(None, Vec::new(), None, None, &Cancellation::new())
-            .is_err()
+        none.prepare(
+            PrepareRequest {
+                ..PrepareRequest::default()
+            },
+            &Cancellation::new()
+        )
+        .is_err()
     );
     assert!(
         none.smoke(None, None, None, &Cancellation::new(), &mut Vec::new())
@@ -327,7 +337,12 @@ fn default_outputs_are_new_directories_under_the_target_directory() {
     let project = directory.path().join("project");
     let workspace = workspace(&project);
     let prepared = workspace
-        .prepare(None, Vec::new(), None, None, &Cancellation::new())
+        .prepare(
+            PrepareRequest {
+                ..PrepareRequest::default()
+            },
+            &Cancellation::new(),
+        )
         .unwrap();
     assert!(
         prepared
@@ -391,10 +406,10 @@ fn measure_arguments_are_used_outside_smoke_runs() {
     ));
     let prepared = workspace
         .prepare(
-            None,
-            Vec::new(),
-            None,
-            Some(directory.path().join("prepared")),
+            PrepareRequest {
+                output: Some(directory.path().join("prepared")),
+                ..PrepareRequest::default()
+            },
             &Cancellation::new(),
         )
         .unwrap();
@@ -422,5 +437,167 @@ fn measure_arguments_are_used_outside_smoke_runs() {
             .unwrap_err()
             .to_string()
             .contains("exit code Some(3)")
+    );
+}
+
+#[test]
+fn scenarios_run_the_builds_made_with_their_features() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    // `needs-extra` fails unless the workload was built with the `extra` feature.
+    let workspace = Workspace::new(support::workspace(
+        &project,
+        "\n[[package.metadata.base-benchmark.scenario]]\nname = \"featured\"\narguments = [\"needs-extra\"]\nfeatures = [\"extra\"]\n",
+    ));
+    let lock = directory.path().join("lock");
+    let prepared = workspace
+        .prepare(
+            PrepareRequest {
+                replicas: Some(1),
+                output: Some(directory.path().join("prepared")),
+                ..PrepareRequest::default()
+            },
+            &Cancellation::new(),
+        )
+        .unwrap();
+    let builds: Vec<_> = prepared
+        .manifest
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.label.as_str(), artifact.features.clone().unwrap()))
+        .collect();
+    assert_eq!(
+        builds,
+        [
+            ("current", Vec::new()),
+            ("current", vec!["extra".to_owned()]),
+            ("current-replica", Vec::new()),
+            ("current-replica", vec!["extra".to_owned()]),
+        ]
+    );
+    assert!(
+        prepared.manifest.artifacts[1]
+            .build
+            .command
+            .ends_with(&["--features".to_owned(), "extra".to_owned()])
+    );
+    assert!(
+        !directory
+            .path()
+            .join("prepared/targets")
+            .read_dir()
+            .unwrap()
+            .any(|_| true),
+        "each tree's shared target directory is removed"
+    );
+    for scenario in ["work", "featured"] {
+        let request = RunRequest {
+            scenario: scenario.to_owned(),
+            output: Some(directory.path().join(scenario)),
+            ..request(&prepared.manifest_path, &lock)
+        };
+        let campaign = workspace
+            .run(request, &Cancellation::new(), &mut Vec::new())
+            .unwrap();
+        assert!(
+            campaign
+                .summary
+                .pairs
+                .iter()
+                .any(|pair| pair.kind == PairKind::Replica)
+        );
+    }
+
+    // Preparing only `work` builds only its features, so `featured` cannot run.
+    let plain = workspace
+        .prepare(
+            PrepareRequest {
+                output: Some(directory.path().join("plain")),
+                scenarios: vec!["work".to_owned()],
+                ..PrepareRequest::default()
+            },
+            &Cancellation::new(),
+        )
+        .unwrap();
+    assert_eq!(plain.manifest.artifacts.len(), 1);
+    let error = workspace
+        .run(
+            RunRequest {
+                scenario: "featured".to_owned(),
+                ..request(&plain.manifest_path, &lock)
+            },
+            &Cancellation::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("no artifact was built with features [\"extra\"]"),
+        "{error}"
+    );
+    assert!(
+        workspace
+            .prepare(
+                PrepareRequest {
+                    scenarios: vec!["missing".to_owned()],
+                    ..PrepareRequest::default()
+                },
+                &Cancellation::new(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no scenario")
+    );
+
+    // An unprepared executable runs only the scenarios whose features it was built with.
+    let plain_executable = &plain.manifest.artifacts[0].executable;
+    let campaigns = workspace
+        .smoke_executable(
+            None,
+            plain_executable,
+            &[],
+            &directory.path().join("smoke-plain"),
+            Some(lock.clone()),
+        )
+        .unwrap();
+    assert_eq!(campaigns.len(), 1);
+    let extra_executable = &prepared.manifest.artifacts[1].executable;
+    let campaigns = workspace
+        .smoke_executable(
+            None,
+            extra_executable,
+            &["extra"],
+            &directory.path().join("smoke-extra"),
+            Some(lock),
+        )
+        .unwrap();
+    assert_eq!(campaigns.len(), 2);
+}
+
+#[test]
+fn smoking_an_executable_that_can_run_no_scenario_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    let workspace = Workspace::new(support::workspace(
+        &project,
+        "\n[package.metadata.base-benchmark]\nfeatures = [\"extra\"]\n",
+    ));
+    let executable = directory.path().join("tool");
+    std::fs::write(&executable, "").unwrap();
+    let error = workspace
+        .smoke_executable(
+            None,
+            &executable,
+            &[],
+            &directory.path().join("smoke"),
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("no scenario of fixture can run with features []"),
+        "{error}"
     );
 }

@@ -22,6 +22,7 @@ pub struct Suite {
     pub binary: String,
     /// The Cargo profile used to prepare artifacts.
     pub profile: String,
+    /// The features of scenarios that name none, sorted and without duplicates.
     pub features: Vec<String>,
     pub scenarios: Vec<Scenario>,
 }
@@ -64,6 +65,9 @@ pub struct Scenario {
     /// The variant other variants are compared with, resolved to the first when not configured.
     #[serde(default)]
     pub baseline: Option<String>,
+    /// The Cargo features its artifacts are built with: its own, or the package's, sorted and without duplicates. Scenarios with different features run different builds of each tree.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 impl Scenario {
@@ -109,7 +113,7 @@ pub struct Variant {
     pub arguments: Vec<String>,
 }
 
-/// `[package.metadata.base-benchmark]`. Package-level `arguments` are prepended to every scenario's; `smoke-arguments`, `measure-arguments`, `variants`, and `baseline` are defaults a scenario can replace.
+/// `[package.metadata.base-benchmark]`. Package-level `arguments` are prepended to every scenario's; `smoke-arguments`, `measure-arguments`, `variants`, `baseline`, and `features` are defaults a scenario can replace.
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct PackageConfiguration {
@@ -141,6 +145,7 @@ struct ScenarioConfiguration {
     measure_arguments: Option<Vec<String>>,
     variants: Option<Vec<Variant>>,
     baseline: Option<String>,
+    features: Option<Vec<String>>,
 }
 
 impl PackageConfiguration {
@@ -172,9 +177,26 @@ impl PackageConfiguration {
                     Some(_) => scenario.baseline.clone(),
                     None => scenario.baseline.clone().or_else(|| self.baseline.clone()),
                 },
+                features: canonical_features(
+                    scenario.features.as_deref().unwrap_or(&self.features),
+                ),
             })
             .collect()
     }
+}
+
+/// Features sorted and without duplicates, so that equal sets compare equal. Entries are split on commas and whitespace, as Cargo's `--features` splits them.
+pub fn canonical_features(features: &[String]) -> Vec<String> {
+    features
+        .iter()
+        .flat_map(|entry| {
+            entry.split(|character: char| character == ',' || character.is_whitespace())
+        })
+        .filter(|feature| !feature.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn release() -> String {
@@ -269,7 +291,7 @@ pub(crate) fn parse_metadata(metadata: &Value) -> io::Result<Vec<Suite>> {
             workspace_root: workspace_root.clone(),
             binary,
             profile: configuration.profile,
-            features: configuration.features,
+            features: canonical_features(&configuration.features),
             scenarios,
         });
     }

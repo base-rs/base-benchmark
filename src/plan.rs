@@ -12,7 +12,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 pub const PLAN_SCHEMA: &str = "base-benchmark/plan";
-pub const PLAN_VERSION: u32 = 1;
+/// Version 2 embeds a version 2 artifact manifest, with features per artifact.
+pub const PLAN_VERSION: u32 = 2;
 
 /// How results may be used. The mode is recorded with every campaign.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,8 +195,10 @@ pub enum PairKind {
 
 impl Plan {
     /// Expand subjects and pairs, then check the mode's prerequisites.
-    pub fn new(options: PlanOptions) -> io::Result<Self> {
+    pub fn new(mut options: PlanOptions) -> io::Result<Self> {
         let scenario = options.suite.scenario(&options.scenario)?.clone();
+        // A scenario runs the builds made with its features.
+        options.artifacts = options.artifacts.for_features(&scenario.features)?;
         if options.artifacts.package != options.suite.package
             || options.artifacts.binary != options.suite.binary
         {

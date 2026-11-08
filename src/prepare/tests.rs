@@ -59,6 +59,7 @@ fn options(directory: &Path, trees: Vec<Tree>, cargo: PathBuf) -> PrepareOptions
         trees,
         replicas: None,
         output: directory.join("prepared"),
+        feature_sets: Vec::new(),
         cargo,
         rustc: PathBuf::from("/bin/echo"),
     }
@@ -348,7 +349,7 @@ fn build_and_freeze_failures_identify_the_tree() {
         ("exit 1", "a: cargo build failed"),
         ("exit 0", "a: cargo reported no executable"),
         (
-            "mkdir -p \"$output/artifacts/a/fixture\"",
+            "mkdir -p \"$output/artifacts/a/0/fixture\"",
             "a: cannot freeze",
         ),
         ("mkdir \"$output/artifacts.json\"", "artifacts.json"),
@@ -529,4 +530,30 @@ fn hosts_and_cargo_homes_are_resolved() {
         Some(PathBuf::from("/home/.cargo"))
     );
     assert_eq!(cargo_home(None, None), None);
+}
+
+#[test]
+fn feature_sets_are_canonical_and_built_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut options = options(
+        directory.path(),
+        vec![tree(directory.path(), "t")],
+        cargo(directory.path()),
+    );
+    options.feature_sets = vec![
+        vec!["b".to_owned(), "a".to_owned()],
+        vec!["a, b".to_owned()],
+    ];
+    let prepared = prepared(&options).unwrap();
+    assert_eq!(prepared.manifest.artifacts.len(), 1);
+    assert_eq!(
+        prepared.manifest.artifacts[0].features.as_deref(),
+        Some(&["a".to_owned(), "b".to_owned()][..])
+    );
+    assert!(
+        prepared.manifest.artifacts[0]
+            .build
+            .command
+            .ends_with(&["--features".to_owned(), "a,b".to_owned()])
+    );
 }

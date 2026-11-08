@@ -53,7 +53,9 @@ name = "list"
 arguments = ["--workload", "list", "--items", "32"]
 ```
 
-Keys are `binary` (needed only with several binary targets), `profile` (default `release`), `features`, `arguments` (prepended to every scenario's), `smoke-arguments`, `measure-arguments`, `variants`, and `baseline` (default: the first variant). A scenario can replace `smoke-arguments`, `measure-arguments`, `variants`, and `baseline`. Unknown keys are errors. Each subject runs `arguments`, then its variant's arguments, then the smoke arguments in smoke mode or the measure arguments otherwise, so the two never collide.
+Keys are `binary` (needed only with several binary targets), `profile` (default `release`), `features`, `arguments` (prepended to every scenario's), `smoke-arguments`, `measure-arguments`, `variants`, and `baseline` (default: the first variant). A scenario can replace `smoke-arguments`, `measure-arguments`, `variants`, `baseline`, and `features`. Unknown keys are errors.
+
+A scenario that needs other features, such as a diagnostic build that counts allocations or reports internal statistics, sets its own `features`. Preparation builds each tree once for every distinct feature set of the scenarios it prepares, and a run uses only the builds with exactly its scenario's features. Timed scenarios keep the package's features, so a diagnostic feature never reaches their builds. `--scenario NAME`, repeatable, prepares only the feature sets those scenarios need; a run of a scenario whose features were not prepared fails and says so. Each subject runs `arguments`, then its variant's arguments, then the smoke arguments in smoke mode or the measure arguments otherwise, so the two never collide.
 
 ## Run it
 
@@ -63,7 +65,7 @@ Add the Bake tasks to the private `bake/` package with `cargo add --manifest-pat
 | --- | --- |
 | `benchmark:list` | Show discovered suites, scenarios, variants, and each scenario's resolved baseline. Nothing is built. |
 | `benchmark:smoke` | Build the current tree and run every scenario once with smoke arguments. Not performance evidence; no comparisons are computed. |
-| `benchmark:prepare --tree LABEL=PATH ...` | Build trees, baseline first, into frozen artifacts plus `--replicas N` layout replicas of the baseline (one by default for two or more trees, otherwise none). Writes `artifacts.json`. |
+| `benchmark:prepare --tree LABEL=PATH ...` | Build trees, baseline first, into frozen artifacts plus `--replicas N` layout replicas of the baseline (one by default for two or more trees, otherwise none), once for each feature set of the scenarios, or of those named with `--scenario`. Writes `artifacts.json`. |
 | `benchmark:run SCENARIO --artifacts FILE` | Collect `--rounds` seeded random rounds under the host lock. `--mode` is `screening` (default) or `recorded`. `--cpus` pins workloads; `--perf-event` adds whole-process counters; `--stack-padding false` disables stack padding. |
 | `benchmark:summarize DIR` | Regenerate `summary.json` from a complete campaign's raw samples. |
 

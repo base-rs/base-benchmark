@@ -232,3 +232,21 @@ fn package_defaults_apply_to_scenarios_that_do_not_replace_them() {
         "reference"
     );
 }
+
+#[test]
+fn scenarios_inherit_or_replace_the_package_features_in_canonical_order() {
+    let configuration = json!({
+        "features": ["b", "a,b", " a "],
+        "scenario": [
+            { "name": "inherits" },
+            { "name": "replaces", "features": ["diagnostics", "allocations"] },
+            { "name": "none", "features": [] },
+        ],
+    });
+    let suite = &parse_metadata(&metadata(configuration, &["workload"])).unwrap()[0];
+    assert_eq!(suite.features, ["a", "b"]);
+    let features = |name: &str| suite.scenario(name).unwrap().features.clone();
+    assert_eq!(features("inherits"), ["a", "b"]);
+    assert_eq!(features("replaces"), ["allocations", "diagnostics"]);
+    assert!(features("none").is_empty());
+}
