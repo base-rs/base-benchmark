@@ -400,3 +400,30 @@ fn changed_external_programs_fail_verification() {
             .contains("external program tool:")
     );
 }
+
+#[test]
+fn recorded_campaigns_refuse_roles_that_share_a_cpu() {
+    let recorded = |server: &[usize], client: &[usize]| {
+        let mut options = roles_options(Mode::Recorded);
+        options
+            .role_cpus
+            .insert("server".to_owned(), server.to_vec());
+        options
+            .role_cpus
+            .insert("client".to_owned(), client.to_vec());
+        Plan::new(options).unwrap_err().to_string()
+    };
+    let error = recorded(&[1, 2, 3], &[0, 2, 3]);
+    assert!(
+        error.contains("roles on separate CPUs (server and client share CPU 2, 3)"),
+        "{error}"
+    );
+    // Other prerequisites are unmet too; separate CPUs meet this one.
+    assert!(!recorded(&[1, 2], &[3]).contains("separate CPUs"));
+    // Screening allows it.
+    let mut options = roles_options(Mode::Screening);
+    options.role_cpus.insert("server".to_owned(), vec![0]);
+    options.role_cpus.insert("client".to_owned(), vec![0]);
+    let plan = Plan::new(options).unwrap();
+    assert_eq!(plan.shared_cpus(), ["server and client share CPU 0"]);
+}

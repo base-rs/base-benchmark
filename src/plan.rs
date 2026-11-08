@@ -366,6 +366,30 @@ impl Plan {
             .collect()
     }
 
+    /// Each pair of roles whose CPU sets include the same CPU, with those CPUs. Whether roles share physical cores through SMT siblings is not checked yet, so recorded campaigns refuse at least this sharing.
+    pub(crate) fn shared_cpus(&self) -> Vec<String> {
+        let mut shared = Vec::new();
+        for (index, first) in self.roles.iter().enumerate() {
+            for second in &self.roles[index + 1..] {
+                let common: Vec<String> = first
+                    .cpus
+                    .iter()
+                    .filter(|cpu| second.cpus.contains(cpu))
+                    .map(usize::to_string)
+                    .collect();
+                if !common.is_empty() {
+                    shared.push(format!(
+                        "{} and {} share CPU {}",
+                        first.name,
+                        second.name,
+                        common.join(", ")
+                    ));
+                }
+            }
+        }
+        shared
+    }
+
     /// Every CPU a workload process may be pinned to: the single-process placement, or every role's.
     pub fn placed_cpus(&self) -> Vec<usize> {
         let mut cpus: Vec<usize> = self
@@ -448,6 +472,10 @@ impl Plan {
             .any(|artifact| artifact.build.settings() != artifacts[0].build.settings())
         {
             missing.push("the same toolchain, Cargo version, build environment, and Cargo configuration for every artifact".to_owned());
+        }
+        let shared = self.shared_cpus();
+        if !shared.is_empty() {
+            missing.push(format!("roles on separate CPUs ({})", shared.join("; ")));
         }
         if missing.is_empty() {
             Ok(())
