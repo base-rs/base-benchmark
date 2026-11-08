@@ -320,6 +320,8 @@ struct Collection<'a> {
     staged: &'a BTreeMap<String, PathBuf>,
     cancellation: &'a Cancellation,
     /// The measuring host's name, which every role runs on.
+    // Only Linux runs sessions.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     host: Option<&'a str>,
 }
 

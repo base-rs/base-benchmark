@@ -306,6 +306,8 @@ fn references<'a>(argument: &'a str, roles: &BTreeSet<&str>) -> Vec<(&'a str, &'
 }
 
 /// Replace every `{ROLE.NAME}` whose value `captured` holds.
+// Only Linux runs sessions.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn substitute(
     argument: &str,
     captured: &BTreeMap<String, BTreeMap<String, String>>,
@@ -408,6 +410,7 @@ impl Pattern {
     }
 
     /// The values captured from `line`, if the whole line matches.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn matches(&self, line: &str) -> Option<BTreeMap<String, String>> {
         let mut captures = BTreeMap::new();
         line.strip_prefix(self.prefix.as_str())
@@ -417,6 +420,7 @@ impl Pattern {
 }
 
 /// Match captures, each followed by its literal text, against the whole of `text`, trying the longest value of each capture first.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn match_captures(
     captures: &[(String, String)],
     text: &str,
