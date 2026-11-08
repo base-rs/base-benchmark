@@ -127,6 +127,9 @@ fn cancellation_stops_running_and_new_processes() {
     let execution = run("sleep 30", Duration::from_secs(20), &cancellation);
     stop.join().unwrap();
     assert!(execution.cancelled && !execution.succeeded());
+    // `sleep 30` outlasts the deadline, so only cancellation's kill stops it before the watchdog does.
+    assert!(!execution.timed_out);
+    assert_eq!(execution.signal, Some(9));
     let execution = run("sleep 30", Duration::from_secs(20), &cancellation);
     assert!(execution.cancelled);
     assert_eq!(execution.signal, Some(9));

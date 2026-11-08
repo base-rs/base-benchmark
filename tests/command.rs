@@ -128,11 +128,14 @@ fn every_command_uses_the_shared_workspace_operations() {
     assert!(out.contains("smoke: correctness"));
 }
 
-/// Start the binary waiting for a lock this test holds, so signals arrive while the campaign is guarded.
+/// Start the binary and wait until its campaign is in progress, and so guarded against signals. The `slow` scenario's workload creates `started` in `directory` once it runs.
 fn waiting_campaign(directory: &Path, scenario: &str) -> (Child, std::path::PathBuf) {
     let manifest = support::workspace(
         &directory.join("project"),
-        "\n[[package.metadata.base-benchmark.scenario]]\nname = \"slow\"\narguments = [\"slow\"]\n",
+        &format!(
+            "\n[[package.metadata.base-benchmark.scenario]]\nname = \"slow\"\narguments = [\"slow\", {:?}]\n",
+            text(&directory.join("started"))
+        ),
     );
     let prepared = directory.join("prepared");
     let (code, _, errors) = command(&[
@@ -164,17 +167,19 @@ fn waiting_campaign(directory: &Path, scenario: &str) -> (Child, std::path::Path
         .spawn()
         .unwrap();
     let started = Instant::now();
-    while !std::fs::read_to_string(campaign.join("metadata.json"))
-        .is_ok_and(|text| text.contains("in_progress"))
-        || started.elapsed() < Duration::from_millis(500)
-    {
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "the campaign did not start"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for(started, "the campaign did not start", || {
+        std::fs::read_to_string(campaign.join("metadata.json"))
+            .is_ok_and(|text| text.contains("in_progress"))
+    });
     (child, campaign)
+}
+
+/// Poll until `ready`, with a watchdog that only turns a hang into a failure.
+fn wait_for(started: Instant, hang: &str, ready: impl Fn() -> bool) {
+    while !ready() {
+        assert!(started.elapsed() < Duration::from_secs(60), "{hang}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn signal(child: &Child, signal: nix::sys::signal::Signal) {
@@ -185,13 +190,17 @@ fn signal(child: &Child, signal: nix::sys::signal::Signal) {
 fn the_binary_stops_and_records_cancelled_campaigns_on_sigterm() {
     let directory = tempfile::tempdir().unwrap();
     let (child, campaign) = waiting_campaign(directory.path(), "slow");
+    // Signal only once the workload runs, so that cancellation has a process to kill.
+    wait_for(Instant::now(), "the workload did not start", || {
+        directory.path().join("started").exists()
+    });
     signal(&child, nix::sys::signal::Signal::SIGTERM);
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(1));
-    // A slow workload that was not killed would finish, and its sample would be journaled without an error.
+    // A cancelled sample is journaled with an error whether or not its workload was killed, so check how it ended: a workload left to run would exit normally after 30 seconds, well within the default timeout.
     let entries = read_entries(&campaign.join("samples.jsonl")).unwrap();
     assert!(
-        entries.iter().all(|entry| entry.error.is_some()),
+        matches!(&entries[..], [entry] if entry.error.is_some() && entry.signal == Some(9) && !entry.timed_out),
         "the slow workload was not killed: {entries:?}"
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("stopping the campaign"));
