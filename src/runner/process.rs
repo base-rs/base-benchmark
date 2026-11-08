@@ -208,8 +208,16 @@ impl Drop for SignalGuard {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// The groups this thread has killed, in order, so that tests can check the order of kills, which leave no trace a killed process could record.
+    pub(crate) static KILLED: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn kill_group(group: i32) {
+    #[cfg(test)]
+    KILLED.with(|killed| killed.borrow_mut().push(group));
     // An empty group (ESRCH) is the normal case after a clean exit.
     let _ = killpg(Pid::from_raw(group), Signal::SIGKILL);
 }

@@ -192,6 +192,10 @@ fn services_that_fail_before_or_during_the_driver_stop_the_run() {
         let entry = &entries[0];
         assert!(entry.record.is_none());
         assert_eq!(entry.roles.len(), 2, "every role is journalled");
+        if index == 0 {
+            // Its output before the failure is kept: it was read to the end once the service exited.
+            assert_eq!(entry.roles[0].stdout, "starting\n");
+        }
         // A process that had to be stopped after the failure was killed.
         assert!(
             entry
@@ -205,6 +209,7 @@ fn services_that_fail_before_or_during_the_driver_stop_the_run() {
 #[test]
 fn a_service_that_never_becomes_ready_is_killed_and_later_roles_never_start() {
     let directory = tempfile::tempdir().unwrap();
+    // Whether it printed anything before the timeout depends on scheduling, so only what does not is checked.
     let mut plan = session(directory.path(), "echo 'not ready'; sleep 30", &valid());
     plan.roles[0].ready.as_mut().unwrap().timeout_ms = 300;
     let (error, entries) = failed(plan, directory.path());
@@ -218,7 +223,11 @@ fn a_service_that_never_becomes_ready_is_killed_and_later_roles_never_start() {
         unreachable!()
     };
     assert_eq!((server.started, server.signal), (true, Some(9)));
-    assert_eq!(server.stdout, "not ready\n");
+    assert!(
+        "not ready\n".starts_with(&server.stdout),
+        "{}",
+        server.stdout
+    );
     assert!(!client.started && client.exit_code.is_none());
     assert_eq!(
         client.command[2], "{server.address}",
@@ -459,6 +468,11 @@ fn the_session_deadline_and_cancellation_kill_every_role() {
     );
     let entries = read_entries(&output.join("samples.jsonl")).unwrap();
     assert!(!entries[0].timed_out);
+    // The session reports the cancellation, not the exits it caused.
+    assert_eq!(
+        entries[0].error.as_deref(),
+        Some("the campaign was cancelled")
+    );
     assert!(entries[0].roles.iter().all(|role| role.signal == Some(9)));
 }
 
@@ -523,7 +537,7 @@ fn ready_lines_are_read_line_by_line_with_bounded_lines() {
     let pattern = Pattern::parse("ready {address}").unwrap();
     let (sender, events) = mpsc::channel();
     let text = "first\r\nready\nready a:1\r\nafter\n";
-    let tail = read_ready(text.as_bytes(), &pattern, &sender);
+    let tail = read_ready(text.as_bytes(), &pattern, 0, &sender);
     assert_eq!(tail, b"first\r\nready\n");
     let Ok(Event::Ready { line, captures }) = events.try_recv() else {
         panic!("the ready line is reported")
@@ -532,8 +546,263 @@ fn ready_lines_are_read_line_by_line_with_bounded_lines() {
     assert_eq!(captures["address"], "a:1");
     // An overlong line never matches, the retained output is bounded, and output that ends without a ready line is kept.
     let overlong = format!("ready a:{}\nunfinished", "1".repeat(LINE_LIMIT));
-    let tail = read_ready(overlong.as_bytes(), &pattern, &sender);
+    let tail = read_ready(overlong.as_bytes(), &pattern, 3, &sender);
+    assert!(matches!(events.try_recv(), Ok(Event::Unready { role: 3 })));
     assert!(events.try_recv().is_err());
     assert_eq!(tail.len(), STDERR_LIMIT);
     assert!(tail.ends_with(b"111\nunfinished"));
+}
+
+/// Each role's process ID, which its script wrote to `NAME.pid`.
+fn pids(directory: &Path, names: &[&str]) -> Vec<i32> {
+    names
+        .iter()
+        .map(|name| {
+            std::fs::read_to_string(directory.join(format!("{name}.pid")))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// The kills, of `groups` only, that this thread has made since the last call.
+fn kills_of(groups: &[i32]) -> Vec<i32> {
+    process::KILLED
+        .with(|killed| std::mem::take(&mut *killed.borrow_mut()))
+        .into_iter()
+        .filter(|group| groups.contains(group))
+        .collect()
+}
+
+/// A plan whose services `server`, `second`, and `third` and driver `client` each record their process ID; `third` runs `third_body` after doing so, and the others serve or drive.
+fn recording_pids(directory: &Path, third_body: &str, client_body: &str) -> Plan {
+    let record_pid = |name: &str| {
+        format!(
+            "echo $$ > '{}'\n",
+            directory.join(format!("{name}.pid")).display()
+        )
+    };
+    let server = script(
+        directory,
+        "server.sh",
+        &format!("{}{}", record_pid("server"), serving("a:1")),
+    );
+    let second = script(
+        directory,
+        "second.sh",
+        &format!("{}echo ready\nsleep 30 & wait\n", record_pid("second")),
+    );
+    let third = script(
+        directory,
+        "third.sh",
+        &format!("{}{third_body}", record_pid("third")),
+    );
+    let client = script(
+        directory,
+        "client.sh",
+        &format!("{}{client_body}", record_pid("client")),
+    );
+    let mut suite = roles_suite(&server, &client, &[]);
+    for (name, path) in [("second", &second), ("third", &third)] {
+        suite.scenarios[0].roles.push(service(
+            name,
+            shell(),
+            &[&path.display().to_string()],
+            "ready",
+        ));
+    }
+    roles_plan(suite, &directory.join("lock"))
+}
+
+#[test]
+fn after_a_failure_roles_are_killed_and_reaped_in_reverse_start_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let started = directory.path().join("started");
+    // The third service exits once the driver has started, while the others still run.
+    let plan = recording_pids(
+        directory.path(),
+        &format!("echo ready\n{}\nexit 0\n", until_exists(&started)),
+        &format!("touch '{}'; sleep 30", started.display()),
+    );
+    kills_of(&[]);
+    let (error, _) = failed(plan, directory.path());
+    assert!(
+        error.contains("role third (service) exited before it was stopped"),
+        "{error}"
+    );
+    let [server, second, third, client] =
+        pids(directory.path(), &["server", "second", "third", "client"])[..]
+    else {
+        unreachable!()
+    };
+    // Those still running are killed, last started first; then every group's remnants are killed as each is reaped, in the same order.
+    assert_eq!(
+        kills_of(&[server, second, third, client]),
+        [client, second, server, client, third, second, server]
+    );
+}
+
+#[test]
+fn cancellation_kills_roles_in_reverse_start_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let started = directory.path().join("started");
+    let plan = recording_pids(
+        directory.path(),
+        &serving("a:1").replace("ready a:1", "ready"),
+        &format!("touch '{}'; sleep 30", started.display()),
+    );
+    let cancellation = Cancellation::new();
+    let canceller = cancellation.clone();
+    let wait = started.clone();
+    // The canceller thread's own kills are exactly those of the cancellation.
+    let stop = std::thread::spawn(move || {
+        while !wait.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        canceller.cancel();
+        process::KILLED.with(|killed| killed.take())
+    });
+    let output = directory.path().join("campaign");
+    let error = run(plan, &output, &cancellation, &mut Vec::new()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    let kills = stop.join().unwrap();
+    let pids = pids(directory.path(), &["server", "second", "third", "client"]);
+    assert_eq!(kills, pids.into_iter().rev().collect::<Vec<_>>());
+}
+
+#[test]
+fn service_output_after_readiness_is_drained() {
+    let directory = tempfile::tempdir().unwrap();
+    let written = directory.path().join("written");
+    // Far more than a pipe holds: the service would block writing it, and never get to tell the driver, unless the runner keeps reading.
+    let server = format!(
+        "echo 'ready a:1'\nhead -c 4194304 /dev/zero || exit 1\ntouch '{}'\nsleep 30 & wait\n",
+        written.display()
+    );
+    let client = format!("{}\n{}", until_exists(&written), valid());
+    let plan = session(directory.path(), &server, &client);
+    let output = directory.path().join("campaign");
+    run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap();
+    let server = &read_entries(&output.join("samples.jsonl")).unwrap()[0].roles[0];
+    assert_eq!(server.signal, Some(15));
+}
+
+#[test]
+fn a_service_that_prints_its_ready_line_and_exits_exited_before_it_was_stopped() {
+    // The ready line arrives only after the service has exited, so its exit is reported first.
+    let directory = tempfile::tempdir().unwrap();
+    let server = "leader=$$\n(until [ \"$(cut -d' ' -f3 /proc/$leader/stat)\" = Z ]; do sleep 0.01; done; echo 'ready a:1') &\nexit 0\n";
+    let (error, entries) = failed(
+        session(directory.path(), server, &valid()),
+        directory.path(),
+    );
+    assert!(
+        error.contains("role server (service) exited before it was stopped"),
+        "{error}"
+    );
+    assert_eq!(entries[0].roles[0].ready_line.as_deref(), Some("ready a:1"));
+    assert!(!entries[0].roles[1].started);
+    // Printed and exited at once, it fails the same way whichever is reported first.
+    let directory = tempfile::tempdir().unwrap();
+    let (error, _) = failed(
+        session(directory.path(), "echo 'ready a:1'", &valid()),
+        directory.path(),
+    );
+    assert!(
+        error.contains("role server (service) exited before it was stopped"),
+        "{error}"
+    );
+    // One that stops by exiting exited before the driver had finished.
+    let directory = tempfile::tempdir().unwrap();
+    let mut plan = session(directory.path(), server, &valid());
+    plan.roles[0].stop = Some(Stop::Exit);
+    let (error, _) = failed(plan, directory.path());
+    assert!(
+        error.contains("role server (service) exited before the driver had finished"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_service_that_closes_its_output_without_a_ready_line_is_unready_until_it_exits() {
+    let directory = tempfile::tempdir().unwrap();
+    let closed = directory.path().join("closed");
+    // It closes stdout, then exits only once the test has seen that it kept running.
+    let server = format!(
+        "exec >&-\ntouch '{}'\n{}\nexit 0\n",
+        closed.display(),
+        until_exists(&directory.path().join("go"))
+    );
+    let plan = session(directory.path(), &server, &valid());
+    let go = directory.path().join("go");
+    let wait = closed.clone();
+    let release = std::thread::spawn(move || {
+        while !wait.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(go, "").unwrap();
+    });
+    let (error, _) = failed(plan, directory.path());
+    release.join().unwrap();
+    assert!(
+        error.contains("role server (service) exited before it was ready"),
+        "{error}"
+    );
+}
+
+#[test]
+fn arguments_that_name_no_captured_value_fail_the_role() {
+    // Discovered scenarios are checked when planned; a plan built by hand is checked when the role starts.
+    let directory = tempfile::tempdir().unwrap();
+    let mut plan = session(directory.path(), &serving("a:1"), &valid());
+    plan.roles[1].arguments.push("{server.port}".to_owned());
+    let (error, entries) = failed(plan, directory.path());
+    assert!(
+        error.contains(
+            "role client (driver) argument \"{server.port}\": {server.port} names no captured value"
+        ),
+        "{error}"
+    );
+    assert!(!entries[0].roles[1].started);
+    assert_eq!(entries[0].roles[0].signal, Some(9));
+}
+
+#[test]
+fn a_panicking_session_kills_and_reaps_its_roles() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid = directory.path().join("server.pid");
+    let plan = session(
+        directory.path(),
+        &format!("echo $$ > '{}'\n{}", pid.display(), serving("a:1")),
+        &valid(),
+    );
+    let staged = plan
+        .artifacts
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.label.clone(), artifact.executable.clone()))
+        .collect();
+    let cancellation = Cancellation::new();
+    let collection = Collection {
+        plan: &plan,
+        output: directory.path(),
+        staged: &staged,
+        cancellation: &cancellation,
+        host: None,
+    };
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut session = Session::new(&collection, Instant::now());
+        session.identify(&plan.subjects[0], &[None, None]).unwrap();
+        session.start(0).unwrap();
+        session.wait_ready(0).unwrap();
+        panic!("a defect while the service runs");
+    }));
+    assert!(unwound.is_err());
+    let pid = std::fs::read_to_string(&pid).unwrap();
+    assert!(
+        !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+        "the service was killed and reaped"
+    );
 }

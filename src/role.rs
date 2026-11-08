@@ -3,7 +3,7 @@
 
 //! Multi-process roles: a scenario's services and driver, declared in `[[package.metadata.base-benchmark.scenario.role]]`.
 //!
-//! Each role is one supervised process, in its own process group, for every sample. Services start in declared order, each waited on until it prints a line matching its ready pattern; values the pattern captures, such as the address the server bound, are passed to later roles' arguments as `{ROLE.NAME}`. Then the driver runs to completion, and the services are stopped in reverse order. Nothing here assumes that roles share a host: endpoints reach later roles only as captured values.
+//! Each role is one supervised process, in its own process group, for every sample. Services start in declared order, each waited on until it prints a line matching its ready pattern; values the pattern captures, such as the address the server bound, are passed to later roles' arguments as `{ROLE.NAME}`, where `{{` and `}}` stand for literal braces. Then the driver runs to completion, and the services are stopped in reverse order. Nothing here assumes that roles share a host: endpoints reach later roles only as captured values.
 
 use crate::config::{invalid_input, valid_label};
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,7 @@ pub enum RoleProgram {
 
 /// A line a service prints on stdout once it is ready, such as `{address}` for a server that prints only the address it bound.
 ///
-/// The pattern matches a whole line. Text outside braces must appear exactly; each `{NAME}` captures a non-empty part of the line, which later roles' arguments receive as `{ROLE.NAME}`. A capture takes the longest text that lets the rest of the line match, so `{host}:{port}` splits `[::1]:8080` at its last colon. `{{` and `}}` stand for literal braces. Two captures must be separated by text. Lines before the first match are ignored.
+/// The pattern matches a whole line. Text outside braces must appear exactly; each `{NAME}` captures a non-empty part of the line, which later roles' arguments receive as `{ROLE.NAME}`. Earlier captures take precedence: each takes the longest text that lets the rest of the line match, so `{host}:{port}` splits `[::1]:8080` at its last colon. Matching takes time linear in the line's length. `{{` and `}}` stand for literal braces. Two captures must be separated by text. Lines before the first match are ignored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadyLine {
@@ -210,7 +210,7 @@ impl RoleConfiguration {
     }
 }
 
-/// Check a scenario's roles together: names, one driver, one subject, and that every `{ROLE.NAME}` reference names a value captured by a service that starts before the role using it. `subject_arguments` are every argument the subject may receive.
+/// Check a scenario's roles together: names, one driver, one subject, that every brace in an argument is doubled or part of a `{ROLE.NAME}` reference, and that every reference names a value captured by a service that starts before the role using it. `subject_arguments` are every argument the subject may receive.
 pub(crate) fn validate_roles(
     roles: &[Role],
     subject_arguments: &[&String],
@@ -263,7 +263,9 @@ pub(crate) fn validate_roles(
                 .collect()
         };
         for argument in arguments {
-            for (target, value) in references(argument, &names) {
+            let references = references(argument)
+                .map_err(|error| context(format!("role {:?}: {error}", role.name)))?;
+            for (target, value) in references {
                 let known = available
                     .get(target)
                     .is_some_and(|captures| captures.contains(value));
@@ -284,59 +286,91 @@ pub(crate) fn validate_roles(
     Ok(())
 }
 
-/// Every `{ROLE.NAME}` in `argument` whose ROLE is one of `roles`. Other braces are left alone, so arguments can contain JSON.
-fn references<'a>(argument: &'a str, roles: &BTreeSet<&str>) -> Vec<(&'a str, &'a str)> {
-    let mut found = Vec::new();
-    let mut rest = argument;
-    while let Some(start) = rest.find('{') {
-        let after = &rest[start + 1..];
-        let Some(end) = after.find(['{', '}']) else {
-            break;
-        };
-        if after.as_bytes()[end] == b'}' {
-            if let Some((role, name)) = after[..end].split_once('.') {
-                if roles.contains(role) {
-                    found.push((role, name));
-                }
-            }
-        }
-        rest = &after[end..];
-    }
-    found
+/// A part of a role's argument: text, or a `{ROLE.NAME}` reference to a value a service captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Piece<'a> {
+    Text(&'a str),
+    Reference { role: &'a str, name: &'a str },
 }
 
-/// Replace every `{ROLE.NAME}` whose value `captured` holds.
+/// Split a role's argument into text and references. `{{` and `}}` stand for literal braces, as in ready patterns; any other brace that is not part of a `{ROLE.NAME}` reference is an error.
+fn pieces(argument: &str) -> Result<Vec<Piece<'_>>, String> {
+    let mut pieces = Vec::new();
+    let mut rest = argument;
+    while let Some(index) = rest.find(['{', '}']) {
+        if index > 0 {
+            pieces.push(Piece::Text(&rest[..index]));
+        }
+        let brace = &rest[index..];
+        if brace.starts_with("{{") || brace.starts_with("}}") {
+            pieces.push(Piece::Text(&brace[..1]));
+            rest = &brace[2..];
+        } else if brace.starts_with('}') {
+            return Err(format!(
+                "argument {argument:?} closes no reference with `}}`; write `}}}}` for a brace"
+            ));
+        } else {
+            let reference = brace[1..].split_once('}').and_then(|(inside, after)| {
+                let (role, name) = inside.split_once('.')?;
+                let valid = |text: &str, other: char| {
+                    !text.is_empty()
+                        && text.chars().all(|character| {
+                            character.is_ascii_alphanumeric()
+                                || character == '_'
+                                || character == other
+                        })
+                };
+                (valid(role, '-') && valid(name, '_')).then_some((role, name, after))
+            });
+            let Some((role, name, after)) = reference else {
+                return Err(format!(
+                    "argument {argument:?} has a `{{` that starts no reference `{{ROLE.NAME}}`; write `{{{{` for a brace"
+                ));
+            };
+            pieces.push(Piece::Reference { role, name });
+            rest = after;
+        }
+    }
+    if !rest.is_empty() {
+        pieces.push(Piece::Text(rest));
+    }
+    Ok(pieces)
+}
+
+/// Every `{ROLE.NAME}` reference in `argument`, or an error for a brace that is neither part of one nor doubled.
+fn references(argument: &str) -> Result<Vec<(&str, &str)>, String> {
+    Ok(pieces(argument)?
+        .into_iter()
+        .filter_map(|piece| match piece {
+            Piece::Reference { role, name } => Some((role, name)),
+            Piece::Text(_) => None,
+        })
+        .collect())
+}
+
+/// Replace every `{ROLE.NAME}` with the value `captured` holds, and each doubled brace with one. Plans made from discovered scenarios have only valid arguments whose references are captured before the role starts; a plan built otherwise can still name an unknown value, which is an error.
 // Only Linux runs sessions.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn substitute(
     argument: &str,
     captured: &BTreeMap<String, BTreeMap<String, String>>,
-) -> String {
+) -> Result<String, String> {
     let mut output = String::with_capacity(argument.len());
-    let mut rest = argument;
-    while let Some(start) = rest.find('{') {
-        output.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-        let value = after.find(['{', '}']).and_then(|end| {
-            let (role, name) = after[..end].split_once('.')?;
-            (after.as_bytes()[end] == b'}')
-                .then(|| captured.get(role)?.get(name))
-                .flatten()
-                .map(|value| (value, end))
-        });
-        match value {
-            Some((value, end)) => {
+    for piece in pieces(argument)? {
+        match piece {
+            Piece::Text(text) => output.push_str(text),
+            Piece::Reference { role, name } => {
+                let value = captured
+                    .get(role)
+                    .and_then(|values| values.get(name))
+                    .ok_or_else(|| {
+                        format!("argument {argument:?}: {{{role}.{name}}} names no captured value")
+                    })?;
                 output.push_str(value);
-                rest = &after[end + 1..];
-            }
-            None => {
-                output.push('{');
-                rest = after;
             }
         }
     }
-    output.push_str(rest);
-    output
+    Ok(output)
 }
 
 /// A parsed ready pattern: literal text, then each capture with the literal text that follows it, empty only after the last.
@@ -410,33 +444,29 @@ impl Pattern {
     }
 
     /// The values captured from `line`, if the whole line matches.
+    ///
+    /// Each capture takes the longest text that lets the rest of the line match. Equivalently, and in time linear in the line's length: the text after the last capture must end the line, and from the last capture back to the first, the text that follows each capture is found at its last occurrence that leaves the capture after it non-empty. Placing every separator as far right as it can go leaves the most room for the captures before it, so a match is found whenever one exists, and the first capture is the longest possible, then the second given the first, and so on.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn matches(&self, line: &str) -> Option<BTreeMap<String, String>> {
-        let mut captures = BTreeMap::new();
-        line.strip_prefix(self.prefix.as_str())
-            .is_some_and(|rest| match_captures(&self.captures, rest, &mut captures))
-            .then_some(captures)
-    }
-}
-
-/// Match captures, each followed by its literal text, against the whole of `text`, trying the longest value of each capture first.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn match_captures(
-    captures: &[(String, String)],
-    text: &str,
-    values: &mut BTreeMap<String, String>,
-) -> bool {
-    match captures {
-        [] => text.is_empty(),
-        [(name, following), rest @ ..] => (1..=text.len())
-            .rev()
-            .filter(|end| {
-                text.is_char_boundary(*end) && text[*end..].starts_with(following.as_str())
-            })
-            .any(|end| {
-                values.insert(name.clone(), text[..end].to_owned());
-                match_captures(rest, &text[end + following.len()..], values)
-            }),
+        let rest = line.strip_prefix(self.prefix.as_str())?;
+        let Some(((_, last), earlier)) = self.captures.split_last() else {
+            return rest.is_empty().then(BTreeMap::new);
+        };
+        let mut values = BTreeMap::new();
+        // Where the value of the capture being placed ends.
+        let mut end = rest.strip_suffix(last.as_str())?.len();
+        for (index, (_, following)) in earlier.iter().enumerate().rev() {
+            // The text after this capture must end before the last character of the next capture's value.
+            let limit = rest[..end].char_indices().next_back()?.0;
+            let start = rest[..limit].rfind(following.as_str())?;
+            let next = &self.captures[index + 1].0;
+            values.insert(next.clone(), rest[start + following.len()..end].to_owned());
+            end = start;
+        }
+        (end > 0).then(|| {
+            values.insert(self.captures[0].0.clone(), rest[..end].to_owned());
+            values
+        })
     }
 }
 

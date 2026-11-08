@@ -29,6 +29,16 @@ fn ready_patterns_match_whole_lines_and_capture_values() {
     assert_eq!(listening.matches("listening on :8080 ({ok})"), None);
     assert_eq!(listening.matches("listening on a:1 ({ok}) "), None);
     assert_eq!(listening.matches("now listening on a:1 ({ok})"), None);
+    // No separator, or no room left for the capture after it.
+    let pair = Pattern::parse("{a}:{b}!").unwrap();
+    assert_eq!(pair.matches("ab!"), None);
+    assert_eq!(pair.matches("!"), None);
+    assert_eq!(pair.matches(":!"), None);
+    assert_eq!(pair.matches("a:!"), None);
+    assert_eq!(
+        pair.matches("a:b!"),
+        Some(captures(&[("a", "a"), ("b", "b")]))
+    );
 
     // Overlapping occurrences of the literal after a capture are each tried.
     let overlapping = Pattern::parse("{a}aa").unwrap();
@@ -58,25 +68,95 @@ fn invalid_ready_patterns_are_rejected() {
 }
 
 #[test]
-fn references_are_substituted_and_other_braces_kept() {
-    let roles = BTreeSet::from(["server", "relay"]);
+fn long_adversarial_lines_are_matched_by_the_longest_leftmost_rule() {
+    // Backtracking over every split of a 64 KiB line of separators took minutes; the result is what matters here.
+    let separators = ":".repeat(64 * 1024);
+    let three = Pattern::parse("{a}:{b}:{c}").unwrap();
     assert_eq!(
-        references("--to={server.address}/{relay.port}{json}{other.x}{", &roles),
+        three.matches(&separators),
+        Some(captures(&[
+            ("a", &separators[..separators.len() - 4]),
+            ("b", ":"),
+            ("c", ":"),
+        ]))
+    );
+    // A line that almost matches: every separator could end each capture, but the final text never appears.
+    let unmatched = Pattern::parse("{a}:{b}:{c}!").unwrap();
+    assert_eq!(unmatched.matches(&separators), None);
+    let spaced = Pattern::parse("{a} {b} {c} {d}.").unwrap();
+    let spaces = " ".repeat(64 * 1024);
+    assert_eq!(spaced.matches(&spaces), None);
+    assert_eq!(
+        spaced
+            .matches(&format!("{spaces}."))
+            .map(|values| values["d"].clone()),
+        Some(" ".to_owned())
+    );
+    // Separators of several characters, with overlapping occurrences, near the end of a long line.
+    let words = format!("{}x--y--z", "-".repeat(10_000));
+    let dashes = Pattern::parse("{a}--{b}--{c}").unwrap();
+    assert_eq!(
+        dashes.matches(&words),
+        Some(captures(&[
+            ("a", &words[..words.len() - 6]),
+            ("b", "y"),
+            ("c", "z")
+        ]))
+    );
+}
+
+#[test]
+fn arguments_refer_to_captured_values_and_double_literal_braces() {
+    assert_eq!(
+        references("--to={server.address}/{relay.port}{{json}}").unwrap(),
         [("server", "address"), ("relay", "port")]
     );
+    // Doubled braces are text, so a doubled reference is not one.
+    assert_eq!(references("{{server.address}}").unwrap(), []);
     assert_eq!(
-        references("{{server.address}", &roles),
-        [("server", "address")]
+        references("{other-role.x_1}").unwrap(),
+        [("other-role", "x_1")]
     );
+    for (argument, message) in [
+        ("{json}", "starts no reference"),
+        ("{\"to\":1}", "starts no reference"),
+        ("{server.address", "starts no reference"),
+        ("{.address}", "starts no reference"),
+        ("{server.}", "starts no reference"),
+        ("{server.a-b}", "starts no reference"),
+        ("{server.a.b}", "starts no reference"),
+        ("{", "starts no reference"),
+        ("a}", "closes no reference"),
+    ] {
+        let error = references(argument).unwrap_err();
+        assert!(error.contains(message), "{argument}: {error}");
+        assert!(error.contains(&format!("{argument:?}")), "{error}");
+    }
     let captured = BTreeMap::from([("server".to_owned(), captures(&[("address", "a:1")]))]);
     assert_eq!(
-        substitute(
-            "{\"to\":\"{server.address}\"} {server.port} {missing.address} {server.address",
-            &captured
-        ),
-        "{\"to\":\"a:1\"} {server.port} {missing.address} {server.address"
+        substitute("{{\"to\":\"{server.address}\"}}", &captured).unwrap(),
+        "{\"to\":\"a:1\"}"
     );
-    assert_eq!(substitute("{{server.address}}", &captured), "{a:1}");
+    assert_eq!(
+        substitute("{{server.address}} {server.address}", &captured).unwrap(),
+        "{server.address} a:1"
+    );
+    assert_eq!(substitute("plain", &captured).unwrap(), "plain");
+    assert!(
+        substitute("{server.port}", &captured)
+            .unwrap_err()
+            .contains("{server.port} names no captured value")
+    );
+    assert!(
+        substitute("{missing.address}", &captured)
+            .unwrap_err()
+            .contains("{missing.address} names no captured value")
+    );
+    assert!(
+        substitute("{json}", &captured)
+            .unwrap_err()
+            .contains("starts no reference")
+    );
 }
 
 fn configuration(value: serde_json::Value) -> io::Result<Role> {
@@ -277,6 +357,26 @@ fn roles_are_checked_together() {
     let mut unknown = valid.clone();
     unknown[0].arguments = vec!["{server.port}".to_owned()];
     assert!(validate_roles(&unknown, &[], &context).is_err());
+    // A reference to a role that does not exist is an error, not text.
+    unknown[0].arguments = vec!["{proxy.port}".to_owned()];
+    assert!(
+        validate_roles(&unknown, &[], &context)
+            .unwrap_err()
+            .to_string()
+            .contains("role \"client\": {proxy.port} names no value")
+    );
+    // Literal braces are doubled; an undoubled one that is not a reference is an error.
+    unknown[0].arguments = vec!["{{\"json\":1}}".to_owned()];
+    validate_roles(&unknown, &[], &context).unwrap();
+    unknown[0].arguments = vec!["{\"json\":1}".to_owned()];
+    assert!(
+        validate_roles(&unknown, &[], &context)
+            .unwrap_err()
+            .to_string()
+            .contains(
+                "role \"client\": argument \"{\\\"json\\\":1}\" has a `{` that starts no reference"
+            )
+    );
     let mut mode = valid.clone();
     mode[0].arguments.clear();
     mode[0].smoke_arguments = vec!["{relay.address}".to_owned()];

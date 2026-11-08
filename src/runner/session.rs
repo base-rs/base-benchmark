@@ -3,7 +3,7 @@
 
 //! One session of a multi-process scenario: every role of one sample.
 //!
-//! Every executable is verified first. Services start in order, each waited on until it prints its ready line, whose captured values later roles' arguments receive; then the driver runs to completion; then the services are stopped in reverse order. One deadline covers the whole session. On any failure, the deadline, or cancellation, every role's process group still running is killed, in reverse start order, and every role is reaped before the session returns, so before the host lock is released. Helper threads only read output and wait for exits, and report them to the session as events, so the session can always react to the deadline.
+//! Every executable is verified first. Services start in order, each waited on until it prints its ready line, whose captured values later roles' arguments receive; then the driver runs to completion; then the services are stopped in reverse order. One deadline covers the whole session. On any failure, the deadline, or cancellation, every role's process group still running is killed, in reverse start order, and every role is reaped, also in reverse start order, before the session returns, so before the host lock is released. A session that unwinds from a panic does the same when it is dropped. Helper threads only read output and wait for exits, and report them to the session as events, so the session can always react to the deadline.
 
 use super::process::{
     self, Launch, OUTPUT_GRACE, STDERR_LIMIT, STDOUT_LIMIT, read_head, read_tail,
@@ -30,6 +30,8 @@ enum Event {
         line: String,
         captures: BTreeMap<String, String>,
     },
+    /// The service being started closed its stdout without printing its ready line.
+    Unready { role: usize },
     /// The role's process exited; it is not reaped yet.
     Exited { role: usize },
 }
@@ -57,6 +59,8 @@ struct Running {
     started: Instant,
     outputs: Receiver<Output>,
     exited: bool,
+    /// Its stdout closed before it printed its ready line.
+    unready: bool,
     stopping: Option<Stopping>,
     stdout: Option<(Vec<u8>, bool)>,
     /// A descendant that left the group kept its output open after it exited.
@@ -75,6 +79,8 @@ struct Session<'a> {
     deadline: Instant,
     timed_out: bool,
     captured: BTreeMap<String, BTreeMap<String, String>>,
+    /// Every role has been killed if need be and reaped.
+    finished: bool,
 }
 
 /// Run one session of `subject`, recording every role in `entry`, and the driver's record when it succeeds.
@@ -84,34 +90,39 @@ pub(super) fn collect(
     stack_padding: &[Option<usize>],
     entry: &mut SampleEntry,
 ) -> io::Result<()> {
-    let plan = collection.plan;
     let started = Instant::now();
-    let (sender, events) = mpsc::channel();
-    let mut session = Session {
-        collection,
-        roles: &plan.roles,
-        programs: Vec::new(),
-        arguments: Vec::new(),
-        entries: Vec::new(),
-        running: plan.roles.iter().map(|_| None).collect(),
-        sender,
-        events,
-        deadline: started + Duration::from_millis(plan.timeout_ms),
-        timed_out: false,
-        captured: BTreeMap::new(),
-    };
+    let mut session = Session::new(collection, started);
     let identified = session.identify(subject, stack_padding);
     let driven = identified.and_then(|()| session.drive());
     session.finish();
     let result = driven.and_then(|()| session.check());
     entry.duration_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     entry.timed_out = session.timed_out;
-    entry.roles = session.entries;
+    entry.roles = std::mem::take(&mut session.entries);
     entry.record = result?;
     Ok(())
 }
 
-impl Session<'_> {
+impl<'a> Session<'a> {
+    fn new(collection: &'a Collection<'a>, started: Instant) -> Self {
+        let plan = collection.plan;
+        let (sender, events) = mpsc::channel();
+        Session {
+            collection,
+            roles: &plan.roles,
+            programs: Vec::new(),
+            arguments: Vec::new(),
+            entries: Vec::new(),
+            running: plan.roles.iter().map(|_| None).collect(),
+            sender,
+            events,
+            deadline: started + Duration::from_millis(plan.timeout_ms),
+            timed_out: false,
+            captured: BTreeMap::new(),
+            finished: false,
+        }
+    }
+
     /// Each role's program, arguments, and identity, journalled before anything starts; then verify every executable.
     fn identify(&mut self, subject: &Subject, stack_padding: &[Option<usize>]) -> io::Result<()> {
         let plan = self.collection.plan;
@@ -221,10 +232,11 @@ impl Session<'_> {
     fn start(&mut self, index: usize) -> io::Result<()> {
         let collection = self.collection;
         let role = &self.roles[index];
-        let arguments: Vec<String> = self.arguments[index]
+        let arguments = self.arguments[index]
             .iter()
             .map(|argument| substitute(argument, &self.captured))
-            .collect();
+            .collect::<Result<Vec<String>, String>>()
+            .map_err(|error| self.failure(index, &error))?;
         self.entries[index].command = command(&self.programs[index], &arguments);
         let environment = collection.environment(self.entries[index].stack_padding);
         let launch = Launch {
@@ -248,7 +260,7 @@ impl Session<'_> {
                     Pattern::parse(&ready.pattern).expect("scenarios have valid ready patterns");
                 let events = self.sender.clone();
                 std::thread::spawn(move || {
-                    let tail = read_ready(stdout, &pattern, &events);
+                    let tail = read_ready(stdout, &pattern, index, &events);
                     stdout_sender.send(Output::Stdout((tail, false)))
                 });
             }
@@ -270,6 +282,7 @@ impl Session<'_> {
             started,
             outputs: received,
             exited: false,
+            unready: false,
             stopping: None,
             stdout: None,
             escaped: false,
@@ -277,6 +290,7 @@ impl Session<'_> {
         Ok(())
     }
 
+    /// Wait until the service just started prints its ready line. Its exit and its stdout closing are reported by separate threads in either order, so it is judged by whether it printed its ready line, not by which report comes first: one that did and has exited exited before it was stopped, and one whose stdout closed without it and has exited exited before it was ready.
     fn wait_ready(&mut self, index: usize) -> io::Result<()> {
         let ready = self.roles[index]
             .ready
@@ -287,26 +301,39 @@ impl Session<'_> {
             .expect("the service started")
             .started;
         let by = started + Duration::from_millis(ready.timeout_ms);
-        match self.receive(by.min(self.deadline))? {
-            None => Err(self.failure(
-                index,
-                &format!(
-                    "printed no line matching {:?} within {} ms",
-                    ready.pattern, ready.timeout_ms
-                ),
-            )),
-            // Earlier services are ready already, so only this one can become ready.
-            Some(Event::Ready { line, captures }) => {
-                self.entries[index].ready_line = Some(line);
-                self.entries[index].captures = captures.clone();
-                self.captured
-                    .insert(self.roles[index].name.clone(), captures);
-                Ok(())
+        loop {
+            let Some(event) = self.receive(by.min(self.deadline))? else {
+                return Err(self.failure(
+                    index,
+                    &format!(
+                        "printed no line matching {:?} within {} ms",
+                        ready.pattern, ready.timeout_ms
+                    ),
+                ));
+            };
+            match event {
+                // Earlier services are ready already, so only this one can become ready.
+                Event::Ready { line, captures } => {
+                    self.entries[index].ready_line = Some(line);
+                    self.entries[index].captures = captures.clone();
+                    self.captured
+                        .insert(self.roles[index].name.clone(), captures);
+                    return if self.exited(index) {
+                        Err(self.exited_early(index))
+                    } else {
+                        Ok(())
+                    };
+                }
+                Event::Exited { role } if role != index => return Err(self.exited_early(role)),
+                Event::Exited { .. } | Event::Unready { .. } => {}
             }
-            Some(Event::Exited { role }) if role == index => {
-                Err(self.failure(index, "exited before it was ready"))
+            let unready = self.running[index]
+                .as_ref()
+                .expect("the service started")
+                .unready;
+            if unready && self.exited(index) {
+                return Err(self.failure(index, "exited before it was ready"));
             }
-            Some(Event::Exited { role }) => Err(self.exited_early(role)),
         }
     }
 
@@ -369,11 +396,20 @@ impl Session<'_> {
             .events
             .recv_timeout(until.saturating_duration_since(Instant::now()));
         // Every exit is recorded, also one that ends the wait for a cancellation, since cleanup waits for those not yet seen.
-        if let Ok(Event::Exited { role }) = event {
-            self.running[role]
-                .as_mut()
-                .expect("only started roles exit")
-                .exited = true;
+        match event {
+            Ok(Event::Exited { role }) => {
+                self.running[role]
+                    .as_mut()
+                    .expect("only started roles exit")
+                    .exited = true;
+            }
+            Ok(Event::Unready { role }) => {
+                self.running[role]
+                    .as_mut()
+                    .expect("only started roles print")
+                    .unready = true;
+            }
+            _ => {}
         }
         // A cancellation kills every group, so it ends any wait with an exit.
         if cancellation.is_cancelled() {
@@ -393,8 +429,11 @@ impl Session<'_> {
         }
     }
 
-    /// Kill every group still running, in reverse start order, then reap every role and collect its output.
+    /// Kill every group still running, in reverse start order, then reap every role, also in reverse start order, killing what remains of its group, and collect its output. Only the first call does anything.
     fn finish(&mut self) {
+        if std::mem::replace(&mut self.finished, true) {
+            return;
+        }
         for running in self.running.iter().rev().flatten() {
             if !running.exited {
                 process::kill_group(running.group);
@@ -407,7 +446,7 @@ impl Session<'_> {
             }
         }
         let cancellation = self.collection.cancellation;
-        for (index, running) in self.running.iter_mut().enumerate() {
+        for (index, running) in self.running.iter_mut().enumerate().rev() {
             let Some(running) = running else { continue };
             let status = process::reap(&mut running.child, running.group, cancellation);
             let entry = &mut self.entries[index];
@@ -509,6 +548,13 @@ impl Session<'_> {
     }
 }
 
+impl Drop for Session<'_> {
+    /// A session that unwinds from a panic still kills and reaps every role before the host lock, which outlives it, is released.
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 /// How a role's executable is verified before the session.
 enum Verification<'a> {
     Artifact(&'a crate::artifact::Artifact, PathBuf),
@@ -521,8 +567,13 @@ fn command(program: &std::path::Path, arguments: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Read a service's stdout line by line until a line matches `pattern`, report it, and drain the rest. Returns the end of the output before the ready line, for diagnostics.
-fn read_ready(mut reader: impl Read, pattern: &Pattern, events: &Sender<Event>) -> Vec<u8> {
+/// Read a service's stdout line by line until a line matches `pattern`, report it, and drain the rest, so that the service never blocks writing output after its ready line. Reports output that ends without a ready line as the service `role` being unready. Returns the end of the output before the ready line, for diagnostics.
+fn read_ready(
+    mut reader: impl Read,
+    pattern: &Pattern,
+    role: usize,
+    events: &Sender<Event>,
+) -> Vec<u8> {
     let mut tail = Vec::new();
     let mut line = Vec::new();
     let mut buffer = [0; 8192];
@@ -530,6 +581,7 @@ fn read_ready(mut reader: impl Read, pattern: &Pattern, events: &Sender<Event>) 
         let count = reader.read(&mut buffer).unwrap_or(0);
         if count == 0 {
             keep(&mut tail, &line);
+            let _ = events.send(Event::Unready { role });
             return tail;
         }
         let mut chunk = &buffer[..count];
