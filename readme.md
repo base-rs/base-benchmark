@@ -11,7 +11,7 @@ Workloads stay project-owned: a workload binary measures its own operations and 
 
 The `base-benchmark` command and the [`bake-benchmark`](https://github.com/base-rs/bake-benchmark) tasks call the same operations. No Python is involved.
 
-**Status:** an initial release, validated by migrating the `base-html` rendering benchmark. Multi-process scenarios, with services such as a server and a driver such as a load client, are being implemented: their session lifecycle, the driver's measured window, and service CPU per request are, and placement checks and invalid-response handling are not yet. Downstream patch preparation and phase-matched hardware counters are not implemented yet; see [architecture](context/architecture.md).
+**Status:** an initial release, validated by migrating the `base-html` rendering benchmark. Multi-process scenarios, with services such as a server and a driver such as a load client, are being implemented: their session lifecycle, the driver's measured window, service CPU per request, and placement checks are, and invalid-response handling is not yet. Downstream patch preparation and phase-matched hardware counters are not implemented yet; see [architecture](context/architecture.md).
 
 ## Usage
 

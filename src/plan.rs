@@ -3,6 +3,7 @@
 
 use crate::artifact::{ArtifactManifest, ArtifactRole, sha256_identified};
 use crate::config::{Suite, invalid_input};
+use crate::placement::{SharedCore, Topology, describe, shared_cores};
 use crate::role::{ReadyLine, RoleKind, RoleProgram, Stop};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -89,6 +90,8 @@ pub struct PlanOptions {
     pub role_cpus: BTreeMap<String, Vec<usize>>,
     /// External programs by name, as paths on the measuring host; see [`ExternalProgram`].
     pub programs: BTreeMap<String, PathBuf>,
+    /// Which CPUs share physical cores, to check roles' placement. Defaults to this host's, as it reports them; plans are made on the host that measures.
+    pub topology: Option<Topology>,
     /// `perf stat` events counted for the whole workload process.
     pub perf_events: Vec<String>,
     pub perf_program: PathBuf,
@@ -121,6 +124,7 @@ impl PlanOptions {
             cpus: Vec::new(),
             role_cpus: BTreeMap::new(),
             programs: BTreeMap::new(),
+            topology: None,
             perf_events: Vec::new(),
             perf_program: PathBuf::from("perf"),
             timeout: Duration::from_secs(300),
@@ -172,6 +176,15 @@ pub struct Plan {
     /// The external programs its roles run, identified when the plan was made.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub programs: Vec<ExternalProgram>,
+    /// Whether the scenario declares that its roles may share physical cores.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared_placement: bool,
+    /// Pairs of roles whose CPU sets share a physical core on the measuring host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_cores: Vec<SharedCore>,
+    /// Roles' CPUs whose SMT siblings the measuring host did not report, so that sharing a physical core through them cannot be ruled out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_topology: Vec<usize>,
 }
 
 /// One role of every sample. The role that runs the subject takes each subject's program and arguments; every other role runs the same program with the same arguments for every subject.
@@ -257,6 +270,15 @@ impl Plan {
             return Err(invalid_input("rounds and timeout must be positive"));
         }
         let (roles, programs) = plan_roles(&scenario, &options)?;
+        let placed: Vec<usize> = roles
+            .iter()
+            .flat_map(|role| role.cpus.iter().copied())
+            .collect();
+        let topology = options
+            .topology
+            .clone()
+            .unwrap_or_else(|| Topology::read(&placed));
+        let (shared_cores, unknown_topology) = shared_cores(&roles, &topology);
         let variants: Vec<Option<&crate::config::Variant>> = if scenario.variants.is_empty() {
             vec![None]
         } else {
@@ -351,6 +373,9 @@ impl Plan {
             artifacts: options.artifacts,
             roles,
             programs,
+            shared_placement: scenario.shared_placement,
+            shared_cores,
+            unknown_topology,
         };
         plan.check_prerequisites()?;
         Ok(plan)
@@ -367,30 +392,6 @@ impl Plan {
             .filter(|role| role.cpus.is_empty())
             .map(|role| role.name.as_str())
             .collect()
-    }
-
-    /// Each pair of roles whose CPU sets include the same CPU, with those CPUs. Whether roles share physical cores through SMT siblings is not checked yet, so recorded campaigns refuse at least this sharing.
-    pub(crate) fn shared_cpus(&self) -> Vec<String> {
-        let mut shared = Vec::new();
-        for (index, first) in self.roles.iter().enumerate() {
-            for second in &self.roles[index + 1..] {
-                let common: Vec<String> = first
-                    .cpus
-                    .iter()
-                    .filter(|cpu| second.cpus.contains(cpu))
-                    .map(usize::to_string)
-                    .collect();
-                if !common.is_empty() {
-                    shared.push(format!(
-                        "{} and {} share CPU {}",
-                        first.name,
-                        second.name,
-                        common.join(", ")
-                    ));
-                }
-            }
-        }
-        shared
     }
 
     /// Every CPU a workload process may be pinned to: the single-process placement, or every role's.
@@ -476,9 +477,17 @@ impl Plan {
         {
             missing.push("the same toolchain, Cargo version, build environment, and Cargo configuration for every artifact".to_owned());
         }
-        let shared = self.shared_cpus();
-        if !shared.is_empty() {
-            missing.push(format!("roles on separate CPUs ({})", shared.join("; ")));
+        if !self.shared_placement && !self.shared_cores.is_empty() {
+            missing.push(format!(
+                "roles on separate physical cores, or a scenario that declares shared-placement ({})",
+                describe(&self.shared_cores)
+            ));
+        }
+        if !self.unknown_topology.is_empty() {
+            missing.push(format!(
+                "the SMT siblings of CPUs {}, to rule out roles sharing a physical core",
+                cpu_list(&self.unknown_topology)
+            ));
         }
         if missing.is_empty() {
             Ok(())
@@ -628,6 +637,14 @@ impl ExternalProgram {
         }
         Ok(())
     }
+}
+
+/// CPUs as a comma-separated list.
+pub(crate) fn cpu_list(cpus: &[usize]) -> String {
+    cpus.iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Parse a CPU list such as `0,2,4-6` into sorted, unique CPU numbers.

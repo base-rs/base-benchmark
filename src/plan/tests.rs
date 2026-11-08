@@ -408,28 +408,51 @@ fn changed_external_programs_fail_verification() {
 }
 
 #[test]
-fn recorded_campaigns_refuse_roles_that_share_a_cpu() {
-    let recorded = |server: &[usize], client: &[usize]| {
+fn roles_on_shared_physical_cores_must_be_declared_in_recorded_campaigns() {
+    let recorded = |shared_placement: bool, server: Vec<usize>, topology: Topology| {
         let mut options = roles_options(Mode::Recorded);
-        options
-            .role_cpus
-            .insert("server".to_owned(), server.to_vec());
-        options
-            .role_cpus
-            .insert("client".to_owned(), client.to_vec());
-        Plan::new(options).unwrap_err().to_string()
+        options.suite.scenarios[0].shared_placement = shared_placement;
+        options.role_cpus = [
+            ("server".to_owned(), server),
+            ("client".to_owned(), vec![3]),
+        ]
+        .into();
+        options.topology = Some(topology);
+        options.rounds = Some(10);
+        options.decision_rule = Some("rule".to_owned());
+        options.idle_host = true;
+        Plan::new(options)
     };
-    let error = recorded(&[1, 2, 3], &[0, 2, 3]);
+    let siblings = || Topology::new([(1, vec![3]), (3, vec![1]), (2, vec![])].into());
+    let error = recorded(false, vec![1, 2], siblings())
+        .unwrap_err()
+        .to_string();
     assert!(
-        error.contains("roles on separate CPUs (server and client share CPU 2, 3)"),
+        error.contains("roles on separate physical cores, or a scenario that declares shared-placement (server and client on CPUs 1, 3)"),
         "{error}"
     );
-    // Other prerequisites are unmet too; separate CPUs meet this one.
-    assert!(!recorded(&[1, 2], &[3]).contains("separate CPUs"));
-    // Screening allows it.
-    let mut options = roles_options(Mode::Screening);
-    options.role_cpus.insert("server".to_owned(), vec![0]);
-    options.role_cpus.insert("client".to_owned(), vec![0]);
-    let plan = Plan::new(options).unwrap();
-    assert_eq!(plan.shared_cpus(), ["server and client share CPU 0"]);
+    let plan = recorded(true, vec![1, 2], siblings()).unwrap();
+    assert_eq!(plan.shared_cores[0].cpus, [1, 3]);
+    assert!(plan.shared_placement);
+    recorded(false, vec![2], siblings()).unwrap();
+    let error = recorded(false, vec![2], Topology::new([(3, vec![])].into()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("the SMT siblings of CPUs 2, to rule out roles sharing a physical core"),
+        "{error}"
+    );
+    // Screening campaigns are planned, and warned about in their summaries.
+    let mut screening = roles_options(Mode::Screening);
+    screening.role_cpus = [
+        ("server".to_owned(), vec![1]),
+        ("client".to_owned(), vec![1]),
+    ]
+    .into();
+    screening.topology = Some(Topology::default());
+    let plan = Plan::new(screening).unwrap();
+    assert_eq!(
+        (plan.shared_cores.len(), plan.unknown_topology.as_slice()),
+        (1, &[1][..])
+    );
 }
