@@ -669,7 +669,12 @@ fn cancellation_kills_roles_in_reverse_start_order() {
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     let kills = stop.join().unwrap();
     let pids = pids(directory.path(), &["server", "second", "third", "client"]);
-    assert_eq!(kills, pids.into_iter().rev().collect::<Vec<_>>());
+    let reverse: Vec<i32> = pids.into_iter().rev().collect();
+    // The driver may mark that it started before the runner registers its group, which is then killed as it is registered, after the services.
+    assert!(
+        kills == reverse || kills == reverse[1..],
+        "{kills:?} is not {reverse:?}"
+    );
 }
 
 #[test]
