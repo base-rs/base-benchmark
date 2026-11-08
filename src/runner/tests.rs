@@ -93,7 +93,10 @@ fn invalid_samples_fail_the_campaign_and_are_retained() {
     for (body, message) in cases {
         let directory = tempfile::tempdir().unwrap();
         let (mut plan, output) = campaign(directory.path(), body);
-        plan.timeout_ms = 300;
+        // Only the case about the deadline gets a short one, so that a loaded host cannot time out the others before they give their own errors.
+        if message == "timed out" {
+            plan.timeout_ms = 300;
+        }
         let error = run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
         let metadata = read_metadata(&output).unwrap();
@@ -184,15 +187,10 @@ fn cancellation_is_recorded_separately_from_failure() {
 
 /// A fake `perf`: `perf stat --no-big-num -x, -e EVENTS -o FILE -- PROGRAM ARGS...` writes `counters` to FILE, then runs the workload.
 fn fake_perf(directory: &Path, counters: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = directory.join(format!("perf-{}", counters.len()));
-    std::fs::write(
-        &path,
-        format!("#!/bin/sh\noutput=$7\nshift 8\n{counters}\nexec \"$@\"\n"),
+    crate::test_support::write_executable(
+        &directory.join(format!("perf-{}", counters.len())),
+        &format!("#!/bin/sh\noutput=$7\nshift 8\n{counters}\nexec \"$@\"\n"),
     )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
 }
 
 #[test]
@@ -522,7 +520,15 @@ fn workloads_start_from_equal_length_staged_paths_with_stack_padding() {
 #[test]
 fn escaped_descendants_fail_the_campaign() {
     let directory = tempfile::tempdir().unwrap();
-    let (plan, output) = campaign(directory.path(), "setsid sleep 10 & sleep 1; echo '{}'");
+    let left = directory.path().join("left");
+    // The leader exits once the background process has left the group, which it records after `setsid`.
+    let (plan, output) = campaign(
+        directory.path(),
+        &format!(
+            "setsid sh -c 'touch \"$0\"; exec sleep 30' '{0}' & until [ -e '{0}' ]; do sleep 0.01; done; echo '{{}}'",
+            left.display()
+        ),
+    );
     let error = run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap_err();
     assert!(
         error

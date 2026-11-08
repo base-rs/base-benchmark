@@ -130,7 +130,7 @@ pub struct Prepared {
 
 /// Build every tree with the same profile and lockfile policy, once for each feature set, then freeze each executable.
 ///
-/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at another path alone usually gives an identical executable, since Cargo identifies workspace members by their relative paths, so each replica's workspace crates are also built with a distinct `-C metadata` salt, which changes symbol hashes and therefore code layout. Comparing the baseline with its replicas shows how much a change of layout alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds.
+/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at another path alone usually gives an identical executable, since Cargo identifies workspace members by their relative paths, so each replica's workspace crates are also built with a distinct `-C metadata` salt, which changes symbol hashes and therefore code layout. Comparing the baseline with its replicas shows how much a change of layout alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds and again before the manifest is written: a cancelled preparation fails with `Interrupted` and writes no manifest, whether the build that was running finishes, as when only this process is signalled, or fails, as when a terminal's interrupt reaches Cargo too.
 pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Result<Prepared> {
     let (trees, copies) = validate(options)?;
     let output = std::path::absolute(&options.output)?;
@@ -266,6 +266,10 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         artifacts,
         ..ArtifactManifest::default()
     };
+    // A build that Cargo finished after cancellation, such as when only this process was signalled, leaves preparation as cancelled as one stopped between builds.
+    if cancellation.is_cancelled() {
+        return Err(cancelled());
+    }
     let manifest_path = artifact::manifest_path(&output);
     manifest.write(&manifest_path)?;
     Ok(Prepared {
@@ -394,22 +398,38 @@ fn build_feature_sets(
         let platform = artifacts
             .first()
             .and_then(|artifact| host(&artifact.build.toolchain));
-        let dependencies = path_dependencies(&options.cargo, tree, platform, cancellation)
-            .map_err(|error| {
-                // Recorded mode refuses unknown path dependencies, so say why now rather than when a campaign is refused. A cancelled preparation records no campaign.
-                if !cancellation.is_cancelled() {
-                    eprintln!(
-                        "base-benchmark: warning: {label}: cannot read the Cargo metadata of {}, so its path dependencies are unknown and recorded campaigns will refuse it: {error}",
-                        tree.display()
-                    );
-                }
-            })
-            .ok();
+        let dependencies = match path_dependencies(&options.cargo, tree, platform, cancellation) {
+            Ok(dependencies) => Some(dependencies),
+            // Metadata that was not read because preparation was cancelled says nothing about the tree, so preparation fails as cancelled rather than recording the path dependencies as unknown.
+            Err(error) if cancellation.is_cancelled() => {
+                return Err(cancelled_by(format!("{label}: {error}")));
+            }
+            Err(error) => {
+                // Recorded mode refuses unknown path dependencies, so say why now rather than when a campaign is refused.
+                eprintln!(
+                    "base-benchmark: warning: {label}: cannot read the Cargo metadata of {}, so its path dependencies are unknown and recorded campaigns will refuse it: {error}",
+                    tree.display()
+                );
+                None
+            }
+        };
         for artifact in &mut artifacts {
             artifact.source.path_dependencies = dependencies.clone();
         }
     }
     Ok(artifacts)
+}
+
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "preparation was cancelled")
+}
+
+/// The cancellation, with the failure it caused, whose text, such as the writer's or Cargo metadata's standard error, is in no other output.
+fn cancelled_by(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        format!("preparation was cancelled ({error})"),
+    )
 }
 
 /// One build of a tree with one feature set.
@@ -426,12 +446,26 @@ struct Build<'a> {
 }
 
 impl Build<'_> {
+    /// Build and freeze the executable, unless preparation was cancelled. A failure once it is cancelled is the cancellation's, which names it: a terminal's interrupt reaches the whole process group, so Cargo, or another program this runs, such as the writer or `rustc -Vv`, dies of it too.
     fn run(
         self,
         options: &PrepareOptions,
-        mut source: SourceIdentity,
+        source: SourceIdentity,
         cancellation: &Cancellation,
     ) -> io::Result<Artifact> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        self.build(options, source).map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_by(error)
+            } else {
+                error
+            }
+        })
+    }
+
+    fn build(self, options: &PrepareOptions, mut source: SourceIdentity) -> io::Result<Artifact> {
         let Build {
             label,
             role,
@@ -441,12 +475,6 @@ impl Build<'_> {
             executable: frozen,
             salt,
         } = self;
-        if cancellation.is_cancelled() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "preparation was cancelled",
-            ));
-        }
         let suite = &options.suite;
         let mut command = vec![options.cargo.display().to_string(), "build".to_owned()];
         // An overlaid harness may need dependencies the tree's lockfile lacks.
@@ -525,8 +553,10 @@ impl Build<'_> {
             })?;
         let sha256 =
             std::fs::create_dir_all(frozen.parent().expect("an executable has a directory"))
-                .and_then(|()| std::fs::copy(&built, &frozen))
-                .and_then(|_| sha256_identified(&frozen))
+                .and_then(|()| {
+                    artifact::write_executable(&frozen, artifact::Contents::Copy(&built))
+                })
+                .and_then(|()| sha256_identified(&frozen))
                 .map_err(|error| {
                     io::Error::new(
                         error.kind(),
@@ -678,7 +708,6 @@ pub(crate) fn salt_crates(
 ) -> io::Result<()> {
     use sha2::{Digest, Sha256};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
     let quote = |value: &[u8]| {
         let mut quoted = b"'".to_vec();
         for &byte in value {
@@ -702,9 +731,9 @@ pub(crate) fn salt_crates(
     let wrapper = directory.join(format!("{salt}-{}", &digest[..16]));
     // Write a sibling and rename it into place, so a concurrent preparation never runs a partly written script.
     let partial = directory.join(format!(".{salt}-{}-{}", &digest[..16], std::process::id()));
+    // Cargo runs it as soon as it is written, so it is written by a child process, never held open for writing here.
     std::fs::create_dir_all(directory)
-        .and_then(|()| std::fs::write(&partial, &script))
-        .and_then(|()| std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| artifact::write_executable(&partial, artifact::Contents::Script(&script)))
         .and_then(|()| std::fs::rename(&partial, &wrapper))
         .map_err(|error| {
             io::Error::new(
@@ -808,8 +837,9 @@ fn path_dependencies(
         cargo_metadata(command.current_dir(tree))
     };
     let metadata = metadata(true).or_else(|offline| {
+        // The caller reports the cancellation.
         if cancellation.is_cancelled() {
-            return Err(format!("offline, {offline}; preparation was cancelled"));
+            return Err(format!("offline, {offline}"));
         }
         // Fetching can take a while, so it should not be a silent pause.
         eprintln!(
@@ -1095,7 +1125,7 @@ fn sibling_copy_path(tree: &Path, label: &str, output: &Path) -> io::Result<Path
 
 /// Copy a source tree's contents into an existing directory, skipping version control, Cargo target directories (marked by `CACHEDIR.TAG`), and the preparation output.
 ///
-/// Symbolic links are copied as links, so absolute links still point into the original tree. Build scripts that need `.git` see no repository.
+/// Symbolic links are copied as links, so absolute links still point into the original tree. Build scripts that need `.git` see no repository. Files are written in this process, unlike frozen executables (see [`artifact::write_executable`]), so a program in the tree that the build runs, such as a rustc wrapper or linker given by a path into it, can be busy if another thread forks a child that never execs while the file is open.
 pub(crate) fn copy_contents(from: &Path, to: &Path, exclude: &Path) -> io::Result<()> {
     let entries = std::fs::read_dir(from)
         .and_then(|entries| {

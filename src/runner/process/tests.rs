@@ -88,32 +88,32 @@ fn timeouts_kill_the_whole_process_group() {
 
 #[test]
 fn descendants_are_killed_after_the_leader_exits() {
-    let started = Instant::now();
     let execution = run(
         "sleep 30 & echo done",
         Duration::from_secs(20),
         &Cancellation::new(),
     );
+    // A surviving descendant would hold the output open past the grace period, and the sample would fail as escaped.
     assert!(execution.succeeded());
     assert_eq!(execution.stdout, b"done\n");
-    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 #[test]
 fn escaped_descendants_fail_the_sample_instead_of_hanging() {
-    let started = Instant::now();
-    // Give the background process time to leave the group before the leader exits.
+    let directory = tempfile::tempdir().unwrap();
+    let left = directory.path().join("left");
+    // The leader exits once the background process has left the group, which it records after `setsid`.
     let execution = run(
-        "setsid sleep 10 & sleep 1; echo done",
+        &format!(
+            "setsid sh -c 'touch \"$0\"; exec sleep 30' '{0}' & until [ -e '{0}' ]; do sleep 0.01; done; echo done",
+            left.display()
+        ),
         Duration::from_secs(20),
         &Cancellation::new(),
     );
+    // Escaped means the runner stopped waiting after the grace period while the output was still open.
     assert!(execution.escaped);
     assert!(!execution.succeeded());
-    assert!(
-        started.elapsed() < Duration::from_secs(8),
-        "the runner stops waiting after the grace period"
-    );
 }
 
 #[test]
@@ -127,6 +127,9 @@ fn cancellation_stops_running_and_new_processes() {
     let execution = run("sleep 30", Duration::from_secs(20), &cancellation);
     stop.join().unwrap();
     assert!(execution.cancelled && !execution.succeeded());
+    // `sleep 30` outlasts the deadline, so only cancellation's kill stops it before the watchdog does.
+    assert!(!execution.timed_out);
+    assert_eq!(execution.signal, Some(9));
     let execution = run("sleep 30", Duration::from_secs(20), &cancellation);
     assert!(execution.cancelled);
     assert_eq!(execution.signal, Some(9));

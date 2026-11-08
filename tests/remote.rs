@@ -604,7 +604,7 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
     assert!(source.revision.is_some(), "{source:?}");
     assert_eq!(source.dirty, Some(false), "{source:?}");
 
-    // Cancelling stops the host's command, and what it wrote still comes back.
+    // Cancelling stops the host's command, and what it wrote still comes back: its TERM trap writes the status, which waiting for its sleep would not.
     let stopped = directory.path().join("stopped");
     let slow = script(
         &directory.path().join("slow"),
@@ -635,7 +635,6 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
             cancellation.cancel();
         })
     };
-    let begun = std::time::Instant::now();
     let run = arguments(&[
         "work",
         "--manifest-path",
@@ -648,7 +647,10 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
     let error = slow.execute("run", run.clone(), &cancellation).unwrap_err();
     canceller.join().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-    assert!(begun.elapsed() < std::time::Duration::from_secs(20));
+    assert_eq!(
+        error.to_string(),
+        "cancelled; the host's command was stopped"
+    );
     assert_eq!(
         std::fs::read_to_string(stopped.join("status")).unwrap(),
         "stopped\n"
@@ -671,6 +673,55 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
         assert_eq!(both, 1, "{recorded}");
     }
     // A cancelled command never starts.
-    let error = slow.execute("run", run, &cancellation).unwrap_err();
+    let error = slow.execute("run", run.clone(), &cancellation).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+    assert_eq!(
+        error.to_string(),
+        "cancelled before the host's command started"
+    );
+
+    // A terminal's interrupt also reaches rsync, which dies of it: the command is cancelled, not failed.
+    let (started, resume) = (
+        directory.path().join("started"),
+        directory.path().join("resume"),
+    );
+    for fifo in [&started, &resume] {
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let interrupted = Remote {
+        rsync: script(
+            &directory.path().join("interrupted-rsync"),
+            &format!(
+                "#!/bin/sh\necho started > '{}'\nread resumed < '{}'\nkill -INT $$\nkill -KILL $$\n",
+                started.display(),
+                resume.display()
+            ),
+        ),
+        ..slow
+    };
+    let cancellation = Cancellation::new();
+    let canceller = {
+        let cancellation = cancellation.clone();
+        std::thread::spawn(move || {
+            std::fs::read_to_string(&started).unwrap();
+            cancellation.cancel();
+            std::fs::write(&resume, "resumed\n").unwrap();
+        })
+    };
+    let error = interrupted.execute("run", run, &cancellation).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+    // The upload failed, so the host's command never started, and rsync's failure is kept: SIGINT, or SIGKILL if SIGINT was ignored when this process started.
+    let error = error.to_string();
+    assert!(
+        error.starts_with("cancelled before the host's command started (rsync ")
+            && error.contains(" failed with signal: "),
+        "{error}"
+    );
+    canceller.join().unwrap();
 }

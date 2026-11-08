@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// A workload that prints a valid record. `fast` lowers its wall time; `fail` exits unsuccessfully.
+/// A workload that prints a valid record. `fast` lowers its wall time; `fail` exits unsuccessfully; `slow` creates the file named by the next argument, if any, and then sleeps for 30 seconds.
 const MAIN: &str = r##"fn main() {
     let arguments: Vec<String> = std::env::args().collect();
     if arguments.iter().any(|argument| argument == "fail") {
@@ -17,7 +17,10 @@ const MAIN: &str = r##"fn main() {
     if arguments.iter().any(|argument| argument == "needs-extra") && !cfg!(feature = "extra") {
         std::process::exit(4);
     }
-    if arguments.iter().any(|argument| argument == "slow") {
+    if let Some(index) = arguments.iter().position(|argument| argument == "slow") {
+        if let Some(marker) = arguments.get(index + 1) {
+            std::fs::write(marker, "").unwrap();
+        }
         std::thread::sleep(std::time::Duration::from_secs(30));
     }
     let wall = if arguments.iter().any(|argument| argument == "fast") { 900 } else { 1000 };

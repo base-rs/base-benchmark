@@ -160,6 +160,64 @@ fn copies_inherit_the_hash_of_an_unchanged_source() {
 }
 
 #[test]
+fn executables_are_written_with_their_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let source = directory.path().join("tool");
+    std::fs::write(&source, "tool").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let copy = directory.path().join("copy");
+    write_executable(&copy, Contents::Copy(&source)).unwrap();
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "tool");
+    assert_eq!(mode(&copy), 0o750);
+    let script = directory.path().join("script");
+    write_executable(&script, Contents::Script(b"#!/bin/sh\n")).unwrap();
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), "#!/bin/sh\n");
+    assert_eq!(mode(&script), 0o755);
+    assert_eq!(
+        write_executable(&script, Contents::Copy(&directory.path().join("missing")))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    // The writer's own error explains a failure.
+    for contents in [Contents::Copy(&source), Contents::Script(b"#!/bin/sh\n")] {
+        let error = write_executable(&directory.path().join("absent/file"), contents).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("writing failed with exit status"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("absent/file"), "{error}");
+    }
+    // A missing writer is named, so that it is not taken for a missing source.
+    let error =
+        write_through(Path::new("/nonexistent/sh"), &copy, Contents::Copy(&source)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(
+        error
+            .to_string()
+            .starts_with("cannot run the writer, /nonexistent/sh: "),
+        "{error}"
+    );
+    // A writer stopped by a signal, which says nothing, gives its status alone.
+    let killed = crate::test_support::write_executable(
+        &directory.path().join("killed-sh"),
+        "#!/bin/sh\nkill -KILL $$\n",
+    );
+    for contents in [Contents::Copy(&source), Contents::Script(b"#!/bin/sh\n")] {
+        let error = write_through(&killed, &copy, contents).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "writing failed with signal: 9 (SIGKILL)",
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn hashing_reports_read_errors() {
     let directory = tempfile::tempdir().unwrap();
     assert!(sha256_file(directory.path()).is_err());
