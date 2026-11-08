@@ -480,7 +480,7 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
             if plan.roles.is_empty() {
                 ""
             } else {
-                "; a sample's operations are its driver's successful operations, so every per-operation value, the driver's own included, is per successful operation, and request errors are counted per success"
+                "; metrics named ROLE/METRIC were measured on that service over the driver's window, and the others are the driver's record; a sample's operations are its driver's successful operations, so every per-operation value, the driver's own included, is per successful operation, and request errors are counted per success"
             }
         ),
         subjects,
