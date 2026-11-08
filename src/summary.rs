@@ -21,7 +21,7 @@ pub const GENERATOR: &str = concat!("base-benchmark ", env!("CARGO_PKG_VERSION")
 
 /// Descriptive statistics regenerated from raw samples. It contains no acceptance verdict.
 ///
-/// Summaries are produced by [`summarize`] or read from `summary.json`, not constructed by callers, so this, [`SubjectSummary`], [`PairSummary`], [`PairMetric`], and [`OverlaidArtifact`] are `#[non_exhaustive]`: adding a field to them does not break callers.
+/// Summaries are produced by [`summarize`] or read from `summary.json`, not constructed by callers, so this, [`SubjectSummary`], [`MetricSummary`], [`Distribution`], [`PairSummary`], [`PairMetric`], and [`OverlaidArtifact`] are `#[non_exhaustive]`: adding a field to them does not break callers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -70,6 +70,7 @@ pub struct SubjectSummary {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MetricSummary {
     pub name: String,
     pub unit: Unit,
@@ -99,6 +100,7 @@ pub enum Statistic {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Distribution {
     pub median: f64,
     pub minimum: f64,
