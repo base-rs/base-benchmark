@@ -1282,16 +1282,50 @@ fn cancellation_stops_a_version_probe() {
         process::KILLED.with(|killed| killed.take())
     });
     let output = directory.path().join("campaign");
+    kills_of(&[]);
     let error = run(plan, &output, &cancellation, &mut Vec::new()).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-    // The probe ran under the campaign's cancellation, which killed it.
+    // The probe ran under the campaign's cancellation, which killed it: from the canceller, or, if it cancelled before the probe's group was registered, when it was registered. Either way its group is also killed once more as it is reaped. Under any other cancellation, only that last kill happens on these threads.
     let probe: i32 = std::fs::read_to_string(&pid)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    assert_eq!(stop.join().unwrap(), [probe]);
+    let cancelled = stop.join().unwrap();
+    assert!(
+        cancelled.iter().all(|group| *group == probe),
+        "{cancelled:?}"
+    );
+    assert_eq!(cancelled.len() + kills_of(&[probe]).len(), 2);
     assert_eq!(recorded_version(&output), None);
+    assert!(
+        read_entries(&output.join("samples.jsonl"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_version_that_cannot_be_recorded_fails_the_campaign() {
+    // The probe blocks the metadata's rewrite by occupying the name it is written through.
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("campaign");
+    let plan = session(directory.path(), &serving("a:1"), &valid());
+    let plan = with_version(
+        directory.path(),
+        plan,
+        &format!(
+            "mkdir '{}'; echo 'tool 1'; exit 0",
+            output.join("metadata.json.tmp").display()
+        ),
+    );
+    let error = run(plan, &output, &Cancellation::new(), &mut Vec::new())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with(&format!("{}:", output.join("metadata.json").display())),
+        "{error}"
+    );
     assert!(
         read_entries(&output.join("samples.jsonl"))
             .unwrap()
