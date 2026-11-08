@@ -51,7 +51,7 @@ impl Remote {
 
     /// Run `command` (`prepare`, `run`, or `smoke`) with its command-line `arguments` on the host. Progress goes to this process's standard error as it happens.
     ///
-    /// Cancelling `cancellation` stops the host's command, as a termination signal would stop it locally, and its output is still copied back. The host's command also stops when this process exits or the connection drops. A cancelled command fails with `Interrupted`, also when a program it runs fails meanwhile, as rsync, or Cargo finding the workspace, does when a terminal's interrupt reaches it too.
+    /// Cancelling `cancellation` stops the host's command, as a termination signal would stop it locally, and its output is still copied back. The host's command also stops when this process exits or the connection drops. A cancelled command fails with `Interrupted`, also when a program it runs fails meanwhile, as rsync, or Cargo finding the workspace, does when a terminal's interrupt reaches it too. Cancelled before the host's command started, the error says so, with the failure it caused, if any.
     pub fn execute(
         &self,
         command: &str,
@@ -60,8 +60,12 @@ impl Remote {
     ) -> io::Result<Outcome> {
         self.dispatch(command, arguments, cancellation)
             .map_err(|error| {
-                if cancellation.is_cancelled() {
-                    cancelled()
+                // Once the host's command has started, `run` reports a cancellation itself, as `Interrupted`.
+                if cancellation.is_cancelled() && error.kind() != io::ErrorKind::Interrupted {
+                    io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        format!("{BEFORE_STARTING} ({error})"),
+                    )
                 } else {
                     error
                 }
@@ -182,7 +186,7 @@ impl Remote {
     fn run(&self, job: Job, cancellation: &Cancellation) -> io::Result<String> {
         for path in &job.uploads {
             if cancellation.is_cancelled() {
-                return Err(cancelled());
+                return Err(io::Error::new(io::ErrorKind::Interrupted, BEFORE_STARTING));
             }
             self.upload(path)?;
         }
@@ -231,7 +235,10 @@ impl Remote {
             self.download(job.output)
         };
         if cancellation.is_cancelled() {
-            return Err(cancelled());
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "cancelled; the host's command was stopped",
+            ));
         }
         result.and_then(|stdout| downloaded.map(|()| stdout))
     }
@@ -432,12 +439,8 @@ struct Job<'a> {
     output: &'a Path,
 }
 
-fn cancelled() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Interrupted,
-        "cancelled; the host's command was stopped",
-    )
-}
+/// The error of a command cancelled before the host's command started.
+const BEFORE_STARTING: &str = "cancelled before the host's command started";
 
 /// A script that runs `setup`, then `command`, stopping the command with SIGTERM when the script's standard input closes, as when the local side cancels, exits, or loses the connection.
 ///

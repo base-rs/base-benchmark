@@ -642,7 +642,7 @@ fn cancelled_preparation_does_not_read_metadata_online() {
     let cancellation = Cancellation::new();
     cancellation.cancel();
     let error = path_dependencies(&cargo, &base.path, None, &cancellation).unwrap_err();
-    assert!(error.ends_with("preparation was cancelled"), "{error}");
+    assert!(error.starts_with("offline, "), "{error}");
     assert!(error.contains("error: failed to download"), "{error}");
     let calls = std::fs::read_to_string(directory.path().join("cargo.calls")).unwrap();
     assert_eq!(calls.lines().count(), 1, "only offline: {calls}");
@@ -715,9 +715,14 @@ fn preparation_cancelled_during_a_build_fails_without_reading_metadata_online() 
     );
     let output = options.output.clone();
     let error = cancelled_during_build(directory.path(), options, "*", ":").unwrap_err();
-    // The build finished, but its path dependencies are unknown because preparation was cancelled, so it fails as preparation cancelled between builds does, without a second attempt or a warning.
+    // The build finished, but its path dependencies are unknown because preparation was cancelled, so it fails as cancelled, with the offline attempt's error, without a second attempt or a warning.
     assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-    assert_eq!(error.to_string(), "preparation was cancelled");
+    let error = error.to_string();
+    assert!(
+        error.starts_with("preparation was cancelled (base: offline, cargo metadata failed with "),
+        "{error}"
+    );
+    assert!(error.contains("error: failed to download"), "{error}");
     let calls = std::fs::read_to_string(directory.path().join("cargo.calls")).unwrap();
     assert_eq!(calls.lines().count(), 1, "only offline: {calls}");
     assert!(!artifact::manifest_path(&output).exists());
@@ -758,7 +763,13 @@ fn preparation_interrupted_with_its_build_fails_as_cancelled() {
     )
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-    assert_eq!(error.to_string(), "preparation was cancelled");
+    // The cause is kept, killed by SIGINT, or by SIGKILL if SIGINT was ignored.
+    assert!(
+        error
+            .to_string()
+            .starts_with("preparation was cancelled (base: cargo build failed with signal: "),
+        "{error}"
+    );
     assert!(!output.join("artifacts/base/0/fixture").exists());
     assert!(!artifact::manifest_path(&output).exists());
 }

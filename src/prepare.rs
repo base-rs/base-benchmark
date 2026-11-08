@@ -401,7 +401,9 @@ fn build_feature_sets(
         let dependencies = match path_dependencies(&options.cargo, tree, platform, cancellation) {
             Ok(dependencies) => Some(dependencies),
             // Metadata that was not read because preparation was cancelled says nothing about the tree, so preparation fails as cancelled rather than recording the path dependencies as unknown.
-            Err(_) if cancellation.is_cancelled() => return Err(cancelled()),
+            Err(error) if cancellation.is_cancelled() => {
+                return Err(cancelled_by(format!("{label}: {error}")));
+            }
             Err(error) => {
                 // Recorded mode refuses unknown path dependencies, so say why now rather than when a campaign is refused.
                 eprintln!(
@@ -422,6 +424,14 @@ fn cancelled() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "preparation was cancelled")
 }
 
+/// The cancellation, with the failure it caused, whose text, such as the writer's or Cargo metadata's standard error, is in no other output.
+fn cancelled_by(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        format!("preparation was cancelled ({error})"),
+    )
+}
+
 /// One build of a tree with one feature set.
 struct Build<'a> {
     label: &'a str,
@@ -436,7 +446,7 @@ struct Build<'a> {
 }
 
 impl Build<'_> {
-    /// Build and freeze the executable, unless preparation was cancelled. A failure once it is cancelled is the cancellation's: a terminal's interrupt reaches the whole process group, so Cargo, or another program this runs, such as the writer or `rustc -Vv`, dies of it too.
+    /// Build and freeze the executable, unless preparation was cancelled. A failure once it is cancelled is the cancellation's, which names it: a terminal's interrupt reaches the whole process group, so Cargo, or another program this runs, such as the writer or `rustc -Vv`, dies of it too.
     fn run(
         self,
         options: &PrepareOptions,
@@ -448,7 +458,7 @@ impl Build<'_> {
         }
         self.build(options, source).map_err(|error| {
             if cancellation.is_cancelled() {
-                cancelled()
+                cancelled_by(error)
             } else {
                 error
             }
@@ -827,8 +837,9 @@ fn path_dependencies(
         cargo_metadata(command.current_dir(tree))
     };
     let metadata = metadata(true).or_else(|offline| {
+        // The caller reports the cancellation.
         if cancellation.is_cancelled() {
-            return Err(format!("offline, {offline}; preparation was cancelled"));
+            return Err(format!("offline, {offline}"));
         }
         // Fetching can take a while, so it should not be a silent pause.
         eprintln!(
