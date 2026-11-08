@@ -114,6 +114,9 @@ pub struct RoleEntry {
     pub stdout: String,
     /// The end of its stderr.
     pub stderr: String,
+    /// A service's CPU time between the driver's window markers, as `Phase::Window` totals: `cpu_time`, and its division into `user_cpu_time` and `system_cpu_time`. Unavailable when it could not be read; empty for the driver, and when the window never closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub window: Vec<Metric>,
 }
 
 /// A finished campaign directory and its summary.

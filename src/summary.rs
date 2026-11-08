@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 pub const SUMMARY_SCHEMA: &str = "base-benchmark/summary";
-/// Version 2 added quantile statistics.
-pub const SUMMARY_VERSION: u32 = 2;
+/// Version 2 added quantile statistics. Version 3 adds services' metrics over the driver's window, in the window phase and named `ROLE/METRIC`, with the approximate per-operation statistic of their CPU time.
+pub const SUMMARY_VERSION: u32 = 3;
 
 /// A ratio is computed only when the baseline is at least this many measurement quanta, so quantization moves it by at most 1%.
 pub const RESOLUTION_FACTOR: f64 = 100.0;
@@ -94,8 +94,10 @@ pub enum Statistic {
     Mean,
     /// The value the workload reported at this quantile of a distribution, such as 0.99 for the 99th percentile latency. Shown in its unit, not divided. Values at different quantiles are different definitions, never compared. Like any metric, a subject's value is the median over its processes of each process's median sample, so it is not a quantile of every observation pooled together.
     Quantile(f64),
-    /// A total over a window wider than the measured operations, such as the whole process. It is not divided by operations.
+    /// A total over a window wider than the measured operations, such as the whole process, or a service's total over the driver's window. It is not divided by operations.
     Total,
+    /// A service's CPU time over the driver's measured window divided by the driver's operations, all of them successful ones: CPU per request. It is approximate, since the window's edges, failed requests, and work such as draining after the stop marker are not exactly the counted operations.
+    ApproximatePerOperation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -185,6 +187,18 @@ impl ProcessValue {
 
 fn process_values(entry: &SampleEntry) -> ProcessValues {
     let mut grouped: BTreeMap<String, (Metric, Statistic, Vec<f64>, f64, bool)> = BTreeMap::new();
+    let mut add = |metric: &Metric, statistic: Statistic, value: Option<f64>, quantum: f64| {
+        let slot = grouped
+            .entry(metric.name.clone())
+            .or_insert_with(|| (metric.clone(), statistic, Vec::new(), 0.0, false));
+        // A name reused with another definition in one process cannot be combined.
+        slot.4 |= slot.0.unit != metric.unit
+            || slot.0.phase != metric.phase
+            || slot.0.source != metric.source
+            || slot.1 != statistic;
+        slot.2.extend(value);
+        slot.3 = slot.3.max(quantum);
+    };
     let samples = entry.record.iter().flat_map(|record| {
         record
             .samples
@@ -220,16 +234,42 @@ fn process_values(entry: &SampleEntry) -> ProcessValues {
                         (Statistic::PerOperation, None, resolution)
                     }
                 };
-            let slot = grouped
-                .entry(metric.name.clone())
-                .or_insert_with(|| (metric.clone(), statistic, Vec::new(), 0.0, false));
-            // A name reused with another definition in one process cannot be combined.
-            slot.4 |= slot.0.unit != metric.unit
-                || slot.0.phase != metric.phase
-                || slot.0.source != metric.source
-                || slot.1 != statistic;
-            slot.2.extend(value);
-            slot.3 = slot.3.max(quantum);
+            add(metric, statistic, value, quantum);
+        }
+    }
+    // Each service's window totals, named by role, and its CPU time per operation of the driver, the only window values normalized.
+    let operations: u64 = entry
+        .record
+        .iter()
+        .flat_map(|record| &record.samples)
+        .map(|sample| sample.operations)
+        .sum();
+    for role in &entry.roles {
+        for metric in &role.window {
+            let resolution = metric.resolution.unwrap_or(1) as f64;
+            let total = match metric.measurement {
+                Measurement::Total { value } => Some(value as f64),
+                _ => None,
+            };
+            let named = Metric {
+                name: format!("{}/{}", role.role, metric.name),
+                ..metric.clone()
+            };
+            add(&named, Statistic::Total, total, resolution);
+            // CPU times come from the kernel's accounting; only they are divided.
+            if operations > 0 && metric.source == Source::Rusage {
+                let per_operation = Metric {
+                    name: format!("{}/{}_per_operation", role.role, metric.name),
+                    direction: Direction::LowerIsBetter,
+                    ..metric.clone()
+                };
+                add(
+                    &per_operation,
+                    Statistic::ApproximatePerOperation,
+                    total.map(|total| total / operations as f64),
+                    resolution / operations as f64,
+                );
+            }
         }
     }
     grouped
@@ -871,6 +911,7 @@ fn suffix(statistic: Statistic, unit: Unit) -> String {
     match statistic {
         Statistic::PerOperation => format!("{}/op", unit.trim_end()),
         Statistic::Total => format!("{unit}total"),
+        Statistic::ApproximatePerOperation => format!("{}/op, approximate", unit.trim_end()),
         Statistic::Mean => format!("{unit}mean"),
         // 0.99 is p99 and 0.999 is p99.9. Rounding to a billionth of a percent hides only the binary representation's error, so 0.999999 stays p99.9999 rather than reading as p100.
         Statistic::Quantile(quantile) => {

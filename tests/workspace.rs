@@ -811,8 +811,10 @@ fn scenarios_with_roles_run_the_subject_as_a_service_under_a_driver() {
     std::fs::write(
         &driver,
         format!(
-            "echo \"$*\" >> '{}'\necho '{RECORD}'\n",
-            addresses.display()
+            "echo \"$*\" >> '{}'\necho '{}'\necho '{}'\necho '{RECORD}'\n",
+            addresses.display(),
+            base_benchmark::WINDOW_START,
+            base_benchmark::WINDOW_STOP
         ),
     )
     .unwrap();

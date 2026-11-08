@@ -11,11 +11,11 @@ Workloads stay project-owned: a workload binary measures its own operations and 
 
 The `base-benchmark` command and the [`bake-benchmark`](https://github.com/base-rs/bake-benchmark) tasks call the same operations. No Python is involved.
 
-**Status:** an initial release, validated by migrating the `base-html` rendering benchmark. Multi-process scenarios, with services such as a server and a driver such as a load client, are being implemented: their session lifecycle is, and the driver's measured window, service CPU, and placement checks are not yet. Downstream patch preparation and phase-matched hardware counters are not implemented yet; see [architecture](context/architecture.md).
+**Status:** an initial release, validated by migrating the `base-html` rendering benchmark. Multi-process scenarios, with services such as a server and a driver such as a load client, are being implemented: their session lifecycle, the driver's measured window, and service CPU per request are, and placement checks and invalid-response handling are not yet. Downstream patch preparation and phase-matched hardware counters are not implemented yet; see [architecture](context/architecture.md).
 
 ## Usage
 
-See [Using the Shared Benchmark Tooling](context/usage.md) for writing a workload, declaring scenarios in Cargo metadata, and running smoke, screening, and recorded campaigns. Run `base-benchmark help` for command options. Workloads depend on the crate with `default-features = false`, which provides only records and `Interval`.
+See [Using the Shared Benchmark Tooling](context/usage.md) for writing a workload, declaring scenarios in Cargo metadata, and running smoke, screening, and recorded campaigns. Run `base-benchmark help` for command options. Workloads depend on the crate with `default-features = false`, which provides only records, `Interval`, and a driver's `Window`.
 
 ## Design and findings
 

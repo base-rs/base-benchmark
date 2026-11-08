@@ -3,20 +3,19 @@
 
 //! One session of a multi-process scenario: every role of one sample.
 //!
-//! Every executable is verified first. Services start in order, each waited on until it prints its ready line, whose captured values later roles' arguments receive; then the driver runs to completion; then the services are stopped in reverse order. One deadline covers the whole session. On any failure, the deadline, or cancellation, every role's process group still running is killed, in reverse start order, and every role is reaped, also in reverse start order, before the session returns, so before the host lock is released. A session that unwinds from a panic does the same when it is dropped. Helper threads only read output and wait for exits, and report them to the session as events, so the session can always react to the deadline.
+//! Every executable is verified first. Services start in order, each waited on until it prints its ready line, whose captured values later roles' arguments receive; then the driver runs to completion, marking its measured window on stdout, where the runner snapshots every service's CPU time at each marker and acknowledges the start on the driver's stdin; then the services are stopped in reverse order. One deadline covers the whole session. On any failure, the deadline, or cancellation, every role's process group still running is killed, in reverse start order, and every role is reaped, also in reverse start order, before the session returns, so before the host lock is released. A session that unwinds from a panic does the same when it is dropped. Helper threads only read output and wait for exits, and report them to the session as events, so the session can always react to the deadline.
 
-use super::process::{
-    self, Launch, OUTPUT_GRACE, STDERR_LIMIT, STDOUT_LIMIT, read_head, read_tail,
-};
+use super::process::{self, CpuTime, Launch, OUTPUT_GRACE, STDERR_LIMIT, STDOUT_LIMIT, read_tail};
 use super::{Collection, RoleEntry, SampleEntry, cancelled};
 use crate::plan::{PlannedRole, Subject};
-use crate::record::invalid;
+use crate::record::{Metric, Phase, ProcessRecord, Source, Unit, invalid};
 use crate::role::{Pattern, RoleKind, RoleProgram, Stop, substitute};
+use crate::window::{CONTROL_STDIO, CONTROL_VARIABLE, WINDOW_START, WINDOW_STARTED, WINDOW_STOP};
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::{Child, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -34,6 +33,25 @@ enum Event {
     Unready { role: usize },
     /// The role's process exited; it is not reaped yet.
     Exited { role: usize },
+    /// The driver marked its window.
+    Marker(Marker),
+    /// The driver's stdout closed, after every marker on it was reported.
+    Closed,
+}
+
+/// A line on the driver's stdout that begins like a window marker.
+#[derive(Debug, PartialEq, Eq)]
+enum Marker {
+    Start,
+    Stop,
+    Invalid(String),
+}
+
+/// Where the driver's window is, with each service's CPU time at the start once it has begun.
+enum Window {
+    Before,
+    Open(Vec<Option<CpuTime>>),
+    Closed,
 }
 
 /// A role's output, once its stream has closed.
@@ -83,6 +101,11 @@ struct Session<'a> {
     captured: BTreeMap<String, BTreeMap<String, String>>,
     /// Every role has been killed if need be and reaped, and its output collected.
     finished: bool,
+    /// Where acknowledgements of the window's start go.
+    driver_input: Option<ChildStdin>,
+    /// Whether the driver's stdout has closed.
+    closed: bool,
+    window: Window,
 }
 
 /// Run one session of `subject`, recording every role in `entry`, and the driver's record when it succeeds.
@@ -122,6 +145,9 @@ impl<'a> Session<'a> {
             timed_out: false,
             captured: BTreeMap::new(),
             finished: false,
+            driver_input: None,
+            closed: false,
+            window: Window::Before,
         }
     }
 
@@ -172,6 +198,7 @@ impl<'a> Session<'a> {
                 killed_after_grace: false,
                 stdout: String::new(),
                 stderr: String::new(),
+                window: Vec::new(),
             });
             self.programs.push(program);
             self.arguments.push(arguments);
@@ -196,12 +223,25 @@ impl<'a> Session<'a> {
                 self.wait_ready(index)?;
             }
         }
-        while !self.running[driver]
-            .as_ref()
-            .expect("the driver started")
-            .exited
-        {
-            self.receive(self.deadline)?;
+        // Every marker is reported before the driver's stdout closes, so the window is complete once both the driver has exited and its stdout has closed. Output a descendant holds open past the grace period is reported as escaped after cleanup.
+        let mut grace = None;
+        loop {
+            let exited = self.running[driver]
+                .as_ref()
+                .expect("the driver started")
+                .exited;
+            if exited && self.closed {
+                break;
+            }
+            let until = match exited {
+                true => *grace.get_or_insert_with(|| Instant::now() + OUTPUT_GRACE),
+                false => self.deadline,
+            };
+            match self.receive(until.min(self.deadline))? {
+                Some(Event::Marker(marker)) => self.mark(marker)?,
+                Some(_) => {}
+                None => break,
+            }
             if let Some(role) = self.early_exit() {
                 return Err(self.exited_early(role));
             }
@@ -240,7 +280,14 @@ impl<'a> Session<'a> {
             .collect::<Result<Vec<String>, String>>()
             .map_err(|error| self.failure(index, &error))?;
         self.entries[index].command = command(&self.programs[index], &arguments);
-        let environment = collection.environment(self.entries[index].stack_padding);
+        let mut environment = collection.environment(self.entries[index].stack_padding);
+        let stdin = match role.kind {
+            RoleKind::Service => Stdio::null(),
+            RoleKind::Driver => {
+                environment.insert(CONTROL_VARIABLE.to_owned(), CONTROL_STDIO.to_owned());
+                Stdio::piped()
+            }
+        };
         let launch = Launch {
             program: &self.programs[index],
             arguments: &arguments,
@@ -248,13 +295,14 @@ impl<'a> Session<'a> {
             directory: &collection.plan.working_directory,
             cpus: &role.cpus,
         };
-        let (mut child, group) = process::start(&launch, Stdio::null(), collection.cancellation)
+        let (mut child, group) = process::start(&launch, stdin, collection.cancellation)
             .map_err(|error| self.failure(index, &format!("could not start: {error}")))?;
         let started = Instant::now();
         self.entries[index].started = true;
         let (outputs, received) = mpsc::channel();
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
+        let input = child.stdin.take();
         // Kept before any thread starts, since starting one can panic, so that the session kills and reaps the role whatever happens next.
         self.running[index] = Some(Running {
             child,
@@ -280,8 +328,10 @@ impl<'a> Session<'a> {
                 });
             }
             None => {
+                self.driver_input = input;
+                let events = self.sender.clone();
                 std::thread::spawn(move || {
-                    stdout_sender.send(Output::Stdout(read_head(stdout, STDOUT_LIMIT)))
+                    stdout_sender.send(Output::Stdout(read_driver(stdout, &events)))
                 });
             }
         }
@@ -330,6 +380,9 @@ impl<'a> Session<'a> {
                 }
                 Event::Exited { role } if role != index => return Err(self.exited_early(role)),
                 Event::Exited { .. } | Event::Unready { .. } => {}
+                Event::Marker(_) | Event::Closed => {
+                    unreachable!("only the driver marks a window, and it has not started")
+                }
             }
             let unready = self.running[index]
                 .as_ref()
@@ -385,6 +438,56 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// Act on a window marker: snapshot every service at the start, acknowledge it, and at the stop snapshot them again and record what each used in the window.
+    fn mark(&mut self, marker: Marker) -> io::Result<()> {
+        let driver = self.roles.len() - 1;
+        match (marker, &self.window) {
+            (Marker::Start, Window::Before) => {
+                self.window = Window::Open(self.snapshot());
+                // A driver that does not wait for the acknowledgement may have closed its stdin.
+                let input = self.driver_input.as_mut().expect("the driver started");
+                let _ = input.write_all(format!("{WINDOW_STARTED}\n").as_bytes());
+                Ok(())
+            }
+            (Marker::Stop, Window::Open(starts)) => {
+                let ticks = process::ticks_per_second();
+                let stops = self.snapshot();
+                for (index, (start, stop)) in starts.iter().zip(stops).enumerate() {
+                    self.entries[index].window = window_metrics(*start, stop, ticks);
+                }
+                self.window = Window::Closed;
+                Ok(())
+            }
+            (Marker::Start, _) => Err(self.failure(driver, "sent the window start marker twice")),
+            (Marker::Stop, Window::Before) => Err(self.failure(
+                driver,
+                "sent the window stop marker before the start marker",
+            )),
+            (Marker::Stop, Window::Closed) => {
+                Err(self.failure(driver, "sent the window stop marker twice"))
+            }
+            (Marker::Invalid(line), _) => {
+                Err(self.failure(driver, &format!("sent an invalid window marker {line:?}")))
+            }
+        }
+    }
+
+    /// Every service's CPU time.
+    fn snapshot(&self) -> Vec<Option<CpuTime>> {
+        let driver = self.roles.len() - 1;
+        self.running[..driver]
+            .iter()
+            .map(|running| {
+                process::cpu_time(
+                    running
+                        .as_ref()
+                        .expect("services started before the driver")
+                        .group,
+                )
+            })
+            .collect()
+    }
+
     fn exited_early(&self, role: usize) -> io::Error {
         match self.roles[role].stop {
             Some(Stop::Exit) => self.failure(role, "exited before the driver had finished"),
@@ -413,6 +516,7 @@ impl<'a> Session<'a> {
                     .expect("only started roles print")
                     .unready = true;
             }
+            Ok(Event::Closed) => self.closed = true,
             _ => {}
         }
         // A cancellation kills every group, so it ends any wait with an exit.
@@ -491,7 +595,7 @@ impl<'a> Session<'a> {
     }
 
     /// After a session that ran to the end: no escaped descendants, a successful driver and successfully stopped services, and the driver's valid record.
-    fn check(&mut self) -> io::Result<Option<crate::record::ProcessRecord>> {
+    fn check(&mut self) -> io::Result<Option<ProcessRecord>> {
         if let Some(index) = self
             .running
             .iter()
@@ -534,6 +638,11 @@ impl<'a> Session<'a> {
                     ),
                 ));
             }
+        }
+        match self.window {
+            Window::Closed => {}
+            Window::Before => return Err(self.failure(driver, "sent no window start marker")),
+            Window::Open(_) => return Err(self.failure(driver, "sent no window stop marker")),
         }
         let (stdout, truncated) = self.running[driver]
             .as_mut()
@@ -629,6 +738,107 @@ fn keep(tail: &mut VecDeque<u8>, bytes: &[u8]) {
     tail.extend(bytes);
     if tail.len() > STDERR_LIMIT {
         tail.drain(..tail.len() - STDERR_LIMIT);
+    }
+}
+
+/// The metrics the runner records for each service over the window.
+const WINDOW_CPU_METRICS: [&str; 3] = ["cpu_time", "user_cpu_time", "system_cpu_time"];
+
+/// A service's CPU time between its snapshots at the window's start and stop, or unavailable metrics when either could not be read. Total CPU time is precise to the nanosecond; the user and system split is the kernel's, in clock ticks of `1 / ticks_per_second`.
+fn window_metrics(
+    start: Option<CpuTime>,
+    stop: Option<CpuTime>,
+    ticks_per_second: u64,
+) -> Vec<Metric> {
+    let window = |metric: Metric| metric.with_phase(Phase::Window).with_source(Source::Rusage);
+    match start.zip(stop) {
+        Some((start, stop)) => {
+            let tick = 1_000_000_000 / ticks_per_second;
+            let ticks = |before: u64, after: u64| after.saturating_sub(before) * tick;
+            vec![
+                window(Metric::total(
+                    WINDOW_CPU_METRICS[0],
+                    Unit::Nanoseconds,
+                    stop.total_ns.saturating_sub(start.total_ns),
+                )),
+                window(
+                    Metric::total(
+                        WINDOW_CPU_METRICS[1],
+                        Unit::Nanoseconds,
+                        ticks(start.user_ticks, stop.user_ticks),
+                    )
+                    .with_resolution(tick),
+                ),
+                window(
+                    Metric::total(
+                        WINDOW_CPU_METRICS[2],
+                        Unit::Nanoseconds,
+                        ticks(start.system_ticks, stop.system_ticks),
+                    )
+                    .with_resolution(tick),
+                ),
+            ]
+        }
+        None => WINDOW_CPU_METRICS
+            .iter()
+            .map(|name| {
+                window(Metric::unavailable(
+                    *name,
+                    Unit::Nanoseconds,
+                    "the service's CPU time could not be read at a window marker",
+                ))
+            })
+            .collect(),
+    }
+}
+
+/// Read the driver's stdout: report each line that begins `base-benchmark window` as a marker, keep the rest, at most [`STDOUT_LIMIT`] bytes, as its record, and report when it closes. Returns the record and whether it was truncated.
+fn read_driver(mut reader: impl Read, events: &Sender<Event>) -> (Vec<u8>, bool) {
+    let mut record = Vec::new();
+    let mut truncated = false;
+    let mut line = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = reader.read(&mut buffer).unwrap_or(0);
+        let mut chunk = &buffer[..count];
+        while let Some(newline) = chunk.iter().position(|byte| *byte == b'\n') {
+            bounded(&mut line, &chunk[..=newline], &mut truncated);
+            chunk = &chunk[newline + 1..];
+            match marker(&line) {
+                Some(marker) => {
+                    let _ = events.send(Event::Marker(marker));
+                }
+                None => bounded(&mut record, &line, &mut truncated),
+            }
+            line.clear();
+        }
+        bounded(&mut line, chunk, &mut truncated);
+        if count == 0 {
+            bounded(&mut record, &line, &mut truncated);
+            let _ = events.send(Event::Closed);
+            return (record, truncated);
+        }
+    }
+}
+
+/// Append to `buffer`, keeping at most [`STDOUT_LIMIT`] bytes.
+fn bounded(buffer: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
+    let room = STDOUT_LIMIT.saturating_sub(buffer.len());
+    *truncated |= bytes.len() > room;
+    buffer.extend_from_slice(&bytes[..bytes.len().min(room)]);
+}
+
+/// The marker a line of the driver's stdout is, if it begins like one.
+fn marker(line: &[u8]) -> Option<Marker> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    match line {
+        _ if line == WINDOW_START.as_bytes() => Some(Marker::Start),
+        _ if line == WINDOW_STOP.as_bytes() => Some(Marker::Stop),
+        _ if line.starts_with(b"base-benchmark window") => {
+            Some(Marker::Invalid(String::from_utf8_lossy(line).into_owned()))
+        }
+        _ => None,
     }
 }
 

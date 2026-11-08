@@ -22,9 +22,10 @@
 //! }
 //! ```
 //!
-//! The same operations are available through the `base-benchmark` command and, separately, the `bake-benchmark` task library. Records and `Interval` are always available; preparation, collection, summaries, and the command need the default `runner` feature, so workloads can depend on the crate with `default-features = false`. The runner builds on every platform, so a project's task package can depend on it everywhere. Collecting samples needs Linux, the only platform it is tested on; the host lock and replica copies of symbolic links need Unix. Elsewhere those operations return [`std::io::ErrorKind::Unsupported`] errors. `Interval` measures through `getrusage`, so it needs Unix.
+//! The same operations are available through the `base-benchmark` command and, separately, the `bake-benchmark` task library. Records, `Interval`, and a driver's [`Window`] are always available; preparation, collection, summaries, and the command need the default `runner` feature, so workloads can depend on the crate with `default-features = false`. The runner builds on every platform, so a project's task package can depend on it everywhere. Collecting samples needs Linux, the only platform it is tested on; the host lock and replica copies of symbolic links need Unix. Elsewhere those operations return [`std::io::ErrorKind::Unsupported`] errors. `Interval` measures through `getrusage`, so it needs Unix.
 mod record;
 mod usage;
+mod window;
 
 #[cfg(feature = "runner")]
 mod artifact;
@@ -54,6 +55,9 @@ pub use record::{
     Source, Unit,
 };
 pub use usage::{CurrentProcess, Interval, ResourceSource, ResourceUsage};
+pub use window::{
+    CONTROL_STDIO, CONTROL_VARIABLE, WINDOW_START, WINDOW_STARTED, WINDOW_STOP, Window,
+};
 
 #[cfg(feature = "runner")]
 pub use artifact::{

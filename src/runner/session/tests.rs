@@ -6,6 +6,7 @@ use crate::plan::Plan;
 use crate::role::Role;
 use crate::runner::{CampaignStatus, Cancellation, read_entries, read_metadata, run};
 use crate::test_support::{record, roles_plan, roles_suite, script, service, shell};
+use crate::window::{WINDOW_START, WINDOW_STARTED, WINDOW_STOP};
 use std::path::Path;
 
 /// Wait until FILE exists, polling, in a fixture script.
@@ -29,8 +30,12 @@ fn session(directory: &Path, server: &str, client: &str) -> Plan {
     roles_plan(roles_suite(&server, &client, &[]), &directory.join("lock"))
 }
 
+/// A driver that marks an empty window and prints its record.
 fn valid() -> String {
-    format!("echo '{}'", record("same", 100))
+    format!(
+        "echo '{WINDOW_START}'; echo '{WINDOW_STOP}'; echo '{}'",
+        record("same", 100)
+    )
 }
 
 /// A service that prints its ready line and then waits for signals.
@@ -178,7 +183,7 @@ fn services_that_fail_before_or_during_the_driver_stop_the_run() {
         ),
         (
             serving("a:1"),
-            "echo not-json".to_owned(),
+            format!("echo '{WINDOW_START}'; echo '{WINDOW_STOP}'; echo not-json"),
             "role client (driver) stdout is not exactly one process record",
         ),
     ];
@@ -880,4 +885,249 @@ fn a_session_whose_cleanup_panics_partway_still_reaps_every_other_role() {
         !Path::new(&server).exists(),
         "dropping the session reaped the server"
     );
+}
+
+/// A service that burns `ticks` clock ticks of CPU before it is ready and again when stopped, and on SIGUSR1 burns 5 ticks and then creates `done`; otherwise it waits. Its ready line carries its process ID.
+fn burning_service(done: &Path) -> String {
+    format!(
+        r#"ticks() {{ read -r stat < /proc/$$/stat; set -- ${{stat##*") "}}; t=$(( ${{12}} + ${{13}} )); }}
+burn() {{ n=$1; ticks; s=$t; while ticks; [ $(( t - s )) -lt "$n" ]; do :; done; }}
+echo "control ${{BASE_BENCHMARK_CONTROL-unset}}" >&2
+burn 3
+trap 'burn 3; exit 0' TERM
+trap 'burn 5; : > "{}"' USR1
+sleep 300 &
+echo "ready $$"
+while :; do wait; done
+"#,
+        done.display()
+    )
+}
+
+/// A driver that waits until the service whose process ID is its first argument is blocked, marks its window with an acknowledged start, runs `work` inside it, and prints its record.
+fn marking_driver(work: &str) -> String {
+    format!(
+        r#"[ "$BASE_BENCHMARK_CONTROL" = stdio ] || exit 8
+until [ "$(cut -d' ' -f3 /proc/$1/stat)" = S ]; do sleep 0.01; done
+echo '{WINDOW_START}'
+read -r acknowledgement
+[ "$acknowledgement" = '{WINDOW_STARTED}' ] || exit 9
+{work}
+echo '{WINDOW_STOP}'
+echo '{}'
+"#,
+        record("same", 100)
+    )
+}
+
+fn window_value(entry: &SampleEntry, name: &str) -> u64 {
+    let metric = entry.roles[0]
+        .window
+        .iter()
+        .find(|metric| metric.name == name)
+        .unwrap();
+    assert_eq!(
+        (metric.phase, metric.source),
+        (Phase::Window, Source::Rusage)
+    );
+    match metric.measurement {
+        crate::record::Measurement::Total { value } => value,
+        _ => panic!("{name} is a total"),
+    }
+}
+
+#[test]
+fn service_cpu_is_measured_only_between_the_drivers_markers() {
+    let ticks = process::ticks_per_second();
+    let tick = 1_000_000_000 / ticks;
+    let directory = tempfile::tempdir().unwrap();
+    let done = directory.path().join("done");
+    // A service that burns CPU only before it is ready and after it is stopped shows none in an empty window.
+    let quiet = session(
+        directory.path(),
+        &burning_service(&done),
+        &marking_driver(":"),
+    );
+    let output = directory.path().join("quiet");
+    let campaign = run(quiet, &output, &Cancellation::new(), &mut Vec::new()).unwrap();
+    let entries = read_entries(&output.join("samples.jsonl")).unwrap();
+    assert_eq!(window_value(&entries[0], "cpu_time"), 0);
+    assert_eq!(window_value(&entries[0], "user_cpu_time"), 0);
+    assert_eq!(entries[0].roles[0].stderr, "control unset\n");
+    assert!(entries[0].roles[1].window.is_empty());
+    let summary = &campaign.summary.subjects[0];
+    let metric = |name: &str| {
+        summary
+            .metrics
+            .iter()
+            .find(|metric| metric.name == name)
+            .unwrap()
+    };
+    assert_eq!(
+        metric("server/cpu_time").statistic,
+        crate::summary::Statistic::Total
+    );
+    assert_eq!(
+        metric("server/cpu_time_per_operation").statistic,
+        crate::summary::Statistic::ApproximatePerOperation
+    );
+
+    // CPU the service spends inside the window, at the driver's request, is counted.
+    let directory = tempfile::tempdir().unwrap();
+    let done = directory.path().join("done");
+    let busy = session(
+        directory.path(),
+        &burning_service(&done),
+        &marking_driver(&format!("kill -USR1 $1; {}", until_exists(&done))),
+    );
+    let output = directory.path().join("busy");
+    run(busy, &output, &Cancellation::new(), &mut Vec::new()).unwrap();
+    let entries = read_entries(&output.join("samples.jsonl")).unwrap();
+    let split =
+        window_value(&entries[0], "user_cpu_time") + window_value(&entries[0], "system_cpu_time");
+    assert!(split >= 5 * tick, "{split}");
+    // Rounding each of the split's parts down to a tick loses less than two ticks of the precise total.
+    let total = window_value(&entries[0], "cpu_time");
+    assert!(total >= 3 * tick, "{total}");
+}
+
+#[test]
+fn drivers_must_mark_one_window() {
+    let record = format!("echo '{}'", record("same", 100));
+    let cases = [
+        (
+            record.clone(),
+            "role client (driver) sent no window start marker",
+        ),
+        (
+            format!("echo '{WINDOW_START}'; {record}"),
+            "sent no window stop marker",
+        ),
+        (
+            format!("echo '{WINDOW_STOP}'; sleep 30"),
+            "sent the window stop marker before the start marker",
+        ),
+        (
+            format!("echo '{WINDOW_START}'; echo '{WINDOW_START}'; sleep 30"),
+            "sent the window start marker twice",
+        ),
+        (
+            format!("echo '{WINDOW_START}'; echo '{WINDOW_STOP}'; echo '{WINDOW_STOP}'; sleep 30"),
+            "sent the window stop marker twice",
+        ),
+        (
+            "echo 'base-benchmark window pause'; sleep 30".to_owned(),
+            "sent an invalid window marker \"base-benchmark window pause\"",
+        ),
+    ];
+    for (index, (client, message)) in cases.into_iter().enumerate() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().join(index.to_string());
+        std::fs::create_dir(&directory).unwrap();
+        let (error, entries) = failed(session(&directory, &serving("a:1"), &client), &directory);
+        assert!(error.contains(message), "{message}: {error}");
+        assert!(entries[0].record.is_none());
+    }
+}
+
+#[test]
+fn escaped_descendants_of_the_driver_fail_the_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let left = directory.path().join("left");
+    let client = format!(
+        "setsid sh -c 'touch \"$0\"; exec sleep 30' '{0}' &\n{1}\n{2}",
+        left.display(),
+        until_exists(&left),
+        valid()
+    );
+    let (error, _) = failed(
+        session(directory.path(), &serving("a:1"), &client),
+        directory.path(),
+    );
+    assert!(
+        error.contains("role client (driver) left a descendant outside its process group"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_drivers_stdout_carries_markers_then_its_record() {
+    let (sender, events) = mpsc::channel();
+    let text = format!(
+        "{WINDOW_START}\r\nrecord part\nbase-benchmark window pause\n{WINDOW_STOP}\n{{\"last\":true}}"
+    );
+    let (record, truncated) = read_driver(text.as_bytes(), &sender);
+    assert_eq!(
+        (record.as_slice(), truncated),
+        (&b"record part\n{\"last\":true}"[..], false)
+    );
+    let markers: Vec<_> = events
+        .try_iter()
+        .map(|event| match event {
+            Event::Marker(marker) => Some(marker),
+            Event::Closed => None,
+            _ => panic!("only markers and the close are reported"),
+        })
+        .collect();
+    assert_eq!(
+        markers,
+        [
+            Some(Marker::Start),
+            Some(Marker::Invalid("base-benchmark window pause".to_owned())),
+            Some(Marker::Stop),
+            None
+        ]
+    );
+    // The record is bounded, whether or not its lines end.
+    let long = vec![b'x'; STDOUT_LIMIT + 5];
+    let (record, truncated) = read_driver(&long[..], &sender);
+    assert_eq!((record.len(), truncated), (STDOUT_LIMIT, true));
+    let mut lines = vec![b'y'; STDOUT_LIMIT - 1];
+    lines.extend_from_slice(b"\nmore\n");
+    let (record, truncated) = read_driver(&lines[..], &sender);
+    assert_eq!((record.len(), truncated), (STDOUT_LIMIT, true));
+}
+
+#[test]
+fn window_metrics_are_differences_or_unavailable() {
+    let at = |total_ns, user_ticks, system_ticks| CpuTime {
+        total_ns,
+        user_ticks,
+        system_ticks,
+    };
+    let metrics = window_metrics(Some(at(100, 2, 3)), Some(at(350, 5, 3)), 100);
+    let values: Vec<_> = metrics
+        .iter()
+        .map(|metric| {
+            (
+                metric.name.as_str(),
+                metric.measurement.clone(),
+                metric.resolution,
+            )
+        })
+        .collect();
+    use crate::record::Measurement::Total;
+    assert_eq!(
+        values,
+        [
+            ("cpu_time", Total { value: 250 }, None),
+            (
+                "user_cpu_time",
+                Total { value: 30_000_000 },
+                Some(10_000_000)
+            ),
+            ("system_cpu_time", Total { value: 0 }, Some(10_000_000)),
+        ]
+    );
+    for missing in [
+        window_metrics(None, Some(at(1, 1, 1)), 100),
+        window_metrics(Some(at(1, 1, 1)), None, 100),
+    ] {
+        assert_eq!(missing.len(), 3);
+        assert!(missing.iter().all(|metric| metric.phase == Phase::Window
+            && matches!(
+                metric.measurement,
+                crate::record::Measurement::Unavailable { .. }
+            )));
+    }
 }
