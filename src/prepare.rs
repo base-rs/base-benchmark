@@ -42,7 +42,7 @@ impl FromStr for Tree {
 pub struct PrepareOptions {
     pub suite: Suite,
     pub trees: Vec<Tree>,
-    /// How many copies of the baseline to rebuild at other paths, each one sample of build layout. Defaults to one when comparing two or more trees, otherwise none.
+    /// How many copies of the baseline to rebuild at other paths, with salted crate metadata, each one sample of build layout. Defaults to one when comparing two or more trees, otherwise none.
     pub replicas: Option<usize>,
     /// A new directory that receives frozen executables and `artifacts.json`.
     pub output: PathBuf,
@@ -130,7 +130,7 @@ pub struct Prepared {
 
 /// Build every tree with the same profile and lockfile policy, once for each feature set, then freeze each executable.
 ///
-/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at a different path changes Cargo's package metadata hashes and therefore code layout; comparing the baseline with its replicas shows how much a change of that kind alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds.
+/// A layout replica copies the baseline to a sibling directory of the baseline tree, so relative path dependencies still resolve, builds it, and removes the copy. Rebuilding the same source at another path alone usually gives an identical executable, since Cargo identifies workspace members by their relative paths, so each replica's workspace crates are also built with a distinct `-C metadata` salt, which changes symbol hashes and therefore code layout. Comparing the baseline with its replicas shows how much a change of layout alone moves the results. A tree's feature sets share its target directory, which is removed once its last executable is frozen. Cancellation is checked between builds.
 pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Result<Prepared> {
     let (trees, copies) = validate(options)?;
     let output = std::path::absolute(&options.output)?;
@@ -379,6 +379,9 @@ fn build_feature_sets(
                     .join(label)
                     .join(index.to_string())
                     .join(&options.suite.binary),
+                // A replica rebuilt at another path is usually identical to its baseline, since Cargo hashes workspace members by their relative paths; salting every crate's metadata changes symbol hashes and therefore code layout. The wrapper that adds it is a shell script.
+                salt: (role == ArtifactRole::LayoutReplica && cfg!(unix))
+                    .then(|| format!("base-benchmark-{label}")),
             };
             build.run(options, source.clone(), cancellation)
         })
@@ -397,6 +400,8 @@ struct Build<'a> {
     features: &'a [String],
     /// Where to freeze the executable.
     executable: PathBuf,
+    /// Salt for the workspace's crate metadata, for layout replicas.
+    salt: Option<String>,
 }
 
 impl Build<'_> {
@@ -413,6 +418,7 @@ impl Build<'_> {
             target,
             features,
             executable: frozen,
+            salt,
         } = self;
         if cancellation.is_cancelled() {
             return Err(io::Error::new(
@@ -451,18 +457,33 @@ impl Build<'_> {
                 format!(" with features {}", features.join(","))
             }
         );
-        let result = Command::new(&command[0])
+        let mut cargo = Command::new(&command[0]);
+        cargo
             .args(&command[1..])
             .current_dir(tree)
             .stdin(Stdio::null())
-            .stderr(Stdio::inherit())
-            .output();
-        let output_text = result.map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("{label}: cannot run {}: {error}", command[0]),
+            .stderr(Stdio::inherit());
+        let configuration = configuration_files(
+            tree,
+            cargo_home(std::env::var_os("CARGO_HOME"), std::env::var_os("HOME")),
+        );
+        let salted = salt.as_ref().map_or(Ok(()), |salt| {
+            existing_wrapper(
+                [
+                    std::env::var_os("RUSTC_WRAPPER"),
+                    std::env::var_os("CARGO_BUILD_RUSTC_WRAPPER"),
+                ],
+                &configuration,
             )
-        })?;
+            .and_then(|existing| salt_crates(&mut cargo, target, salt, existing))
+        });
+        let output_text = salted
+            .and_then(|()| {
+                cargo.output().map_err(|error| {
+                    io::Error::new(error.kind(), format!("cannot run {}: {error}", command[0]))
+                })
+            })
+            .map_err(|error| io::Error::new(error.kind(), format!("{label}: {error}")))?;
         if !output_text.status.success() {
             return Err(io::Error::other(format!(
                 "{label}: cargo build failed with {}",
@@ -508,13 +529,124 @@ impl Build<'_> {
                 toolchain,
                 cargo: version(&options.cargo)?,
                 environment: build_environment(std::env::vars()),
-                configuration: configuration_files(
-                    tree,
-                    cargo_home(std::env::var_os("CARGO_HOME"), std::env::var_os("HOME")),
-                ),
+                configuration,
+                layout_salt: salt,
             },
         })
     }
+}
+
+/// The rustc wrapper a build would use, which the salting wrapper must run in turn: `RUSTC_WRAPPER`, then `CARGO_BUILD_RUSTC_WRAPPER`, where an empty value means none.
+///
+/// A wrapper set in Cargo configuration would be replaced, and reading it would need Cargo's own configuration rules, so such a configuration is an error asking for the environment variable instead.
+pub(crate) fn existing_wrapper(
+    environment: [Option<std::ffi::OsString>; 2],
+    configuration: &[ConfigurationFile],
+) -> io::Result<Option<std::ffi::OsString>> {
+    if let Some(value) = environment.into_iter().flatten().next() {
+        return Ok(Some(value).filter(|value| !value.is_empty()));
+    }
+    // A key `rustc-wrapper`, bare or quoted, in a table, dotted, or in an inline table, assigned with `=`, outside comments.
+    let sets_wrapper = |text: String| {
+        text.lines().map(uncommented).any(|line| {
+            line.match_indices("rustc-wrapper").any(|(index, key)| {
+                let before = line[..index].trim_end_matches('"').chars().last();
+                let after = line[index + key.len()..]
+                    .trim_start_matches('"')
+                    .trim_start();
+                before.is_none_or(|character| " \t{,.".contains(character))
+                    && after.starts_with('=')
+            })
+        })
+    };
+    match configuration
+        .iter()
+        .find(|file| sets_wrapper(std::fs::read_to_string(&file.path).unwrap_or_default()))
+    {
+        Some(file) => Err(invalid_input(format!(
+            "{}: sets build.rustc-wrapper, which salting layout replicas would replace; set RUSTC_WRAPPER in the environment instead, which the salting wrapper runs",
+            file.path.display()
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// A TOML line without its comment: anything after a `#` outside a string.
+fn uncommented(line: &str) -> &str {
+    let mut quote = None;
+    for (index, character) in line.char_indices() {
+        match (quote, character) {
+            (None, '#') => return &line[..index],
+            (None, '"' | '\'') => quote = Some(character),
+            (Some(open), close) if open == close => quote = None,
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Build every crate with `-C metadata=SALT` added, through a `RUSTC_WRAPPER` script that runs `existing`, the wrapper the build would otherwise use, in turn. `RUSTFLAGS` and Cargo configuration are untouched.
+///
+/// The script lives in `directory`, the replica's own target directory inside the new preparation output, so no other user can replace it; its name comes from the salt and its contents. Cargo does not hash a `RUSTC_WRAPPER`'s path, so the executable depends only on the salt and the wrapper it chains.
+#[cfg(unix)]
+pub(crate) fn salt_crates(
+    cargo: &mut Command,
+    directory: &Path,
+    salt: &str,
+    existing: Option<std::ffi::OsString>,
+) -> io::Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let quote = |value: &[u8]| {
+        let mut quoted = b"'".to_vec();
+        for &byte in value {
+            match byte {
+                b'\'' => quoted.extend_from_slice(b"'\\''"),
+                byte => quoted.push(byte),
+            }
+        }
+        quoted.push(b'\'');
+        quoted
+    };
+    let mut script = b"#!/bin/sh\nexec ".to_vec();
+    if let Some(existing) = &existing {
+        script.extend(quote(existing.as_bytes()));
+        script.push(b' ');
+    }
+    script.extend_from_slice(b"\"$@\" -C metadata=");
+    script.extend(quote(salt.as_bytes()));
+    script.push(b'\n');
+    let digest = format!("{:x}", Sha256::digest(&script));
+    let wrapper = directory.join(format!("{salt}-{}", &digest[..16]));
+    // Write a sibling and rename it into place, so a concurrent preparation never runs a partly written script.
+    let partial = directory.join(format!(".{salt}-{}-{}", &digest[..16], std::process::id()));
+    std::fs::create_dir_all(directory)
+        .and_then(|()| std::fs::write(&partial, &script))
+        .and_then(|()| std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| std::fs::rename(&partial, &wrapper))
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{}: cannot write the layout salt wrapper: {error}",
+                    wrapper.display()
+                ),
+            )
+        })?;
+    cargo.env("RUSTC_WRAPPER", wrapper);
+    Ok(())
+}
+
+// Replicas are salted only on Unix, so this is never called elsewhere.
+#[cfg(not(unix))]
+pub(crate) fn salt_crates(
+    _cargo: &mut Command,
+    _directory: &Path,
+    _salt: &str,
+    _existing: Option<std::ffi::OsString>,
+) -> io::Result<()> {
+    Ok(())
 }
 
 /// Find the executable Cargo reported for `binary`, wherever the configured target directory layout put it.

@@ -80,6 +80,7 @@ impl ArtifactManifest {
                     cargo: "unknown".to_owned(),
                     environment: BTreeMap::new(),
                     configuration: Vec::new(),
+                    layout_salt: None,
                 },
             }],
         })
@@ -257,7 +258,7 @@ impl Artifact {
 pub enum ArtifactRole {
     Baseline,
     Candidate,
-    /// The baseline's source copied to another path and rebuilt, exposing build-layout sensitivity.
+    /// The baseline's source copied to another path and rebuilt with salted crate metadata, exposing build-layout sensitivity.
     LayoutReplica,
 }
 
@@ -326,6 +327,9 @@ pub struct BuildIdentity {
     pub environment: BTreeMap<String, String>,
     /// Cargo configuration files that apply to the tree, from the tree upward and `$CARGO_HOME`, with their contents' hashes.
     pub configuration: Vec<ConfigurationFile>,
+    /// The `-C metadata` value added to the workspace's own crates, which gives a layout replica a different code layout from its baseline. `None` for every other build.
+    #[serde(default)]
+    pub layout_salt: Option<String>,
 }
 
 impl BuildIdentity {
