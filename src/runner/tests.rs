@@ -520,7 +520,15 @@ fn workloads_start_from_equal_length_staged_paths_with_stack_padding() {
 #[test]
 fn escaped_descendants_fail_the_campaign() {
     let directory = tempfile::tempdir().unwrap();
-    let (plan, output) = campaign(directory.path(), "setsid sleep 10 & sleep 1; echo '{}'");
+    let left = directory.path().join("left");
+    // The leader exits once the background process has left the group, which it records after `setsid`.
+    let (plan, output) = campaign(
+        directory.path(),
+        &format!(
+            "setsid sh -c 'touch \"$0\"; exec sleep 30' '{0}' & until [ -e '{0}' ]; do sleep 0.01; done; echo '{{}}'",
+            left.display()
+        ),
+    );
     let error = run(plan, &output, &Cancellation::new(), &mut Vec::new()).unwrap_err();
     assert!(
         error
