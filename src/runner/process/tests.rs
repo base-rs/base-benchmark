@@ -319,28 +319,30 @@ fn exits_are_observed_without_reaping() {
 }
 
 #[test]
-fn workloads_start_with_the_stop_signals_this_process_ignores_at_their_defaults() {
-    let ignored = || ignored_signals(std::fs::read_to_string("/proc/self/status").ok().as_deref());
-    let stopping = STOP_SIGNALS
-        .iter()
-        .fold(0, |mask, stop| mask | 1 << (*stop as i32 - 1));
+fn workloads_start_with_the_stop_signals_at_their_defaults_and_unblocked() {
+    use crate::test_support::{mask_of, signal_mask};
+    let this_thread = || std::fs::read_to_string("/proc/thread-self/status").unwrap();
+    let stopping = mask_of(&STOP_SIGNALS);
     assert_eq!(STOP_SIGNALS.map(Signal::as_str), crate::role::STOP_SIGNALS);
-    crate::test_support::with_signals_ignored(
-        "runner::process::tests::workloads_start_with_the_stop_signals_this_process_ignores_at_their_defaults",
+    crate::test_support::with_signals(
+        "runner::process::tests::workloads_start_with_the_stop_signals_at_their_defaults_and_unblocked",
+        &STOP_SIGNALS,
         &STOP_SIGNALS,
         || {
             let execution = run(
-                "grep SigIgn /proc/self/status",
+                "grep -E '^Sig(Ign|Blk):' /proc/self/status",
                 Duration::from_secs(20),
                 &Cancellation::new(),
             );
             assert!(execution.succeeded());
             let status = String::from_utf8(execution.stdout).unwrap();
-            assert_eq!(ignored_signals(Some(&status)) & stopping, 0, "{status}");
+            assert_eq!(signal_mask(&status, "SigIgn") & stopping, 0, "{status}");
+            assert_eq!(signal_mask(&status, "SigBlk") & stopping, 0, "{status}");
             // What the child runs before it execs.
-            assert_eq!(ignored() & stopping, stopping);
             reset_stop_signals().unwrap();
-            assert_eq!(ignored() & stopping, 0);
+            let status = this_thread();
+            assert_eq!(signal_mask(&status, "SigIgn") & stopping, 0, "{status}");
+            assert_eq!(signal_mask(&status, "SigBlk") & stopping, 0, "{status}");
         },
     );
 }

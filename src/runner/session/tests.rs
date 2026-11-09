@@ -803,15 +803,21 @@ fn a_panicking_session_kills_and_reaps_its_roles() {
 }
 
 #[test]
-fn services_stop_by_signals_that_base_benchmark_started_with_ignored() {
+fn services_stop_by_signals_that_base_benchmark_started_with_ignored_or_blocked() {
     use nix::sys::signal::Signal;
-    crate::test_support::with_signals_ignored(
-        "runner::session::tests::services_stop_by_signals_that_base_benchmark_started_with_ignored",
+    crate::test_support::with_signals(
+        "runner::session::tests::services_stop_by_signals_that_base_benchmark_started_with_ignored_or_blocked",
         &[Signal::SIGINT, Signal::SIGQUIT, Signal::SIGHUP],
+        &[
+            Signal::SIGINT,
+            Signal::SIGQUIT,
+            Signal::SIGHUP,
+            Signal::SIGTERM,
+        ],
         || {
-            for signal in ["SIGINT", "SIGQUIT", "SIGHUP"] {
+            for signal in ["SIGINT", "SIGQUIT", "SIGHUP", "SIGTERM"] {
                 let directory = tempfile::tempdir().unwrap();
-                // A shell cannot trap a signal ignored when it started, so with that signal ignored this service would outlast its grace period.
+                // A shell cannot trap a signal ignored when it started, and never receives one that stays blocked, so with that signal ignored or blocked this service would outlast its grace period.
                 let server = format!("trap 'exit 0' {}\n{}", &signal[3..], serving("a:1"));
                 let mut plan = session(directory.path(), &server, &valid());
                 plan.roles[0].stop = Some(Stop::Signal {

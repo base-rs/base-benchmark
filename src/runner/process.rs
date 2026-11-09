@@ -293,9 +293,9 @@ pub(crate) fn execute(
     check_collection().map(|()| unreachable!("collection is unsupported here"))
 }
 
-/// Start a process leading its own group, with the launch's environment, directory, and CPUs, piped stdout and stderr, `stdin`, and every stop signal at its default disposition, and register its group with `cancellation`. Returns the child and its group.
+/// Start a process leading its own group, with the launch's environment, directory, and CPUs, piped stdout and stderr, `stdin`, and every stop signal at its default disposition and unblocked, and register its group with `cancellation`. Returns the child and its group.
 ///
-/// Signals this process ignores, such as `SIGINT` and `SIGQUIT` after `&` in a non-interactive shell or `SIGHUP` under `nohup`, would otherwise stay ignored in the child, so that a service would outlast its stop signal and be killed after its grace period. The stop signals include the termination signals.
+/// Signals this process ignores, such as `SIGINT` and `SIGQUIT` after `&` in a non-interactive shell or `SIGHUP` under `nohup`, would otherwise stay ignored in the child, and signals blocked in the spawning thread, as a launcher's signal mask passes to what it starts, would stay blocked, so that a service would outlast its stop signal and be killed after its grace period. The stop signals include the termination signals.
 #[cfg(target_os = "linux")]
 pub(crate) fn start(
     launch: &Launch,
@@ -335,14 +335,17 @@ const STOP_SIGNALS: [Signal; 6] = [
     Signal::SIGUSR2,
 ];
 
-/// Reset every stop signal to its default disposition. It runs between fork and exec, so it only calls `signal`, which is async-signal-safe, and allocates nothing. Resetting a signal other than `SIGKILL` or `SIGSTOP` cannot fail.
+/// Reset every stop signal to its default disposition and unblock it, leaving other signals' dispositions and the rest of the signal mask as inherited. It runs between fork and exec, so it only calls `signal`, `sigemptyset`, `sigaddset`, and `pthread_sigmask`, which are async-signal-safe, and allocates nothing. Resetting a signal other than `SIGKILL` or `SIGSTOP`, and unblocking a valid signal, cannot fail.
 #[cfg(target_os = "linux")]
 fn reset_stop_signals() -> io::Result<()> {
-    use nix::sys::signal::{SigHandler, signal};
+    use nix::sys::signal::{SigHandler, SigSet, signal};
+    let mut stopping = SigSet::empty();
     for stop in STOP_SIGNALS {
         // SAFETY: the default disposition runs no handler.
         let _ = unsafe { signal(stop, SigHandler::SigDfl) };
+        stopping.add(stop);
     }
+    let _ = stopping.thread_unblock();
     Ok(())
 }
 
