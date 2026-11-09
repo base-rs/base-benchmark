@@ -34,6 +34,8 @@ pub mod cli;
 #[cfg(feature = "runner")]
 mod config;
 #[cfg(feature = "runner")]
+mod placement;
+#[cfg(feature = "runner")]
 mod plan;
 #[cfg(feature = "runner")]
 mod prepare;
@@ -68,6 +70,8 @@ pub use artifact::{
 pub use config::{
     METADATA_KEY, Scenario, Suite, Variant, canonical_features, cargo_program, discover, select,
 };
+#[cfg(feature = "runner")]
+pub use placement::{SharedCore, Topology};
 #[cfg(feature = "runner")]
 pub use plan::{
     ExternalProgram, Mode, PLAN_SCHEMA, PLAN_VERSION, Pair, PairKind, Plan, PlanOptions,

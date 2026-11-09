@@ -259,6 +259,7 @@ fn scenarios_declare_roles() {
             "name": "hello",
             "arguments": ["serve"],
             "variants": [{ "name": "base" }, { "name": "hyper", "arguments": ["hyper"] }],
+            "shared-placement": true,
             "role": [
                 { "name": "client", "kind": "driver", "external": "load", "arguments": ["closed", "--address", "{server.address}"] },
                 { "name": "server", "kind": "service", "subject": true, "ready": "{address}", "stop": "SIGINT" },
@@ -279,7 +280,18 @@ fn scenarios_declare_roles() {
             ("server", crate::role::RoleKind::Service)
         ]
     );
+    assert!(hello.shared_placement);
     assert!(suites[0].scenario("plain").unwrap().roles.is_empty());
+    let value = metadata(
+        scenario(json!({ "name": "a", "shared-placement": true })),
+        &["workload"],
+    );
+    assert!(
+        parse_metadata(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("shared-placement applies only to scenarios with roles")
+    );
     // Listings show roles only for scenarios that have them.
     let listed = serde_json::to_value(&suites[0]).unwrap();
     assert!(listed["scenarios"][0]["roles"].is_array());

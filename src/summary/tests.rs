@@ -1031,3 +1031,50 @@ fn service_cpu_over_the_window_is_divided_only_into_approximate_cpu_per_request(
         summary.report()
     );
 }
+
+#[test]
+fn shared_placement_is_warned_about_unless_declared_and_then_labelled() {
+    use crate::placement::SharedCore;
+    let mut plan = pinned(&[("baseline", ArtifactRole::Baseline)], &[]);
+    let entries = [entry("baseline", 1, vec![wall(100)], Vec::new())];
+    plan.shared_cores = vec![SharedCore {
+        roles: ["server".to_owned(), "client".to_owned()],
+        cpus: vec![1, 5],
+    }];
+    plan.unknown_topology = vec![9];
+    let summary = summarize(&plan, &entries);
+    assert_eq!(summary.placement, None);
+    for expected in [
+        "roles share physical cores, which the scenario does not declare, so they contend for them: server and client on CPUs 1, 5",
+        "the SMT siblings of CPUs 9 are unknown, so roles may share a physical core",
+    ] {
+        assert!(
+            summary.warnings.contains(&expected.to_owned()),
+            "{:?}",
+            summary.warnings
+        );
+    }
+    // Declared sharing is not warned about, nor are CPUs whose siblings are unknown, through which it could only share more.
+    plan.shared_placement = true;
+    let summary = summarize(&plan, &entries);
+    assert!(
+        summary
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("physical core"))
+    );
+    assert_eq!(
+        summary.placement.as_deref(),
+        Some("deliberately shared: server and client on CPUs 1, 5")
+    );
+    assert!(
+        summary
+            .report()
+            .contains("placement: deliberately shared: server and client on CPUs 1, 5\n")
+    );
+    plan.shared_cores.clear();
+    assert_eq!(
+        summarize(&plan, &entries).placement.as_deref(),
+        Some("deliberately shared")
+    );
+}

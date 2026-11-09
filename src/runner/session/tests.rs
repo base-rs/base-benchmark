@@ -1173,3 +1173,22 @@ fn the_drivers_stdin_closes_once_the_snapshotted_start_is_acknowledged() {
         ["snapshot", "acknowledged"]
     );
 }
+
+#[test]
+fn undeclared_shared_placement_is_reported_when_the_campaign_starts() {
+    // A screening campaign that fails has no summary to warn in, so the warning is printed as it starts.
+    let directory = tempfile::tempdir().unwrap();
+    let mut plan = session(directory.path(), "echo starting; exit 3", &valid());
+    plan.shared_cores = vec![crate::placement::SharedCore {
+        roles: ["server".to_owned(), "client".to_owned()],
+        cpus: vec![1, 5],
+    }];
+    let mut progress = Vec::new();
+    let output = directory.path().join("campaign");
+    run(plan, &output, &Cancellation::new(), &mut progress).unwrap_err();
+    let progress = String::from_utf8(progress).unwrap();
+    assert!(
+        progress.starts_with("base-benchmark: warning: roles share physical cores, which the scenario does not declare, so they contend for them: server and client on CPUs 1, 5\n"),
+        "{progress}"
+    );
+}

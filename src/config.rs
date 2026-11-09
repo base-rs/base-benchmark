@@ -72,6 +72,9 @@ pub struct Scenario {
     /// Its services and driver, when it is a multi-process scenario; empty for a single-process workload. The role that runs the subject takes the scenario's arguments and variants.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<Role>,
+    /// Whether its roles may deliberately share physical cores, for example to model contention on a cloud host. Campaigns are then labelled as deliberately shared rather than refused or warned about.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared_placement: bool,
 }
 
 impl Scenario {
@@ -104,6 +107,11 @@ impl Scenario {
             if !names.contains(baseline.as_str()) {
                 return Err(context(format!("baseline {baseline:?} is not a variant")));
             }
+        }
+        if self.shared_placement && self.roles.is_empty() {
+            return Err(context(
+                "shared-placement applies only to scenarios with roles".to_owned(),
+            ));
         }
         let subject_arguments: Vec<&String> = self
             .arguments
@@ -159,6 +167,8 @@ struct ScenarioConfiguration {
     features: Option<Vec<String>>,
     #[serde(default)]
     role: Vec<RoleConfiguration>,
+    #[serde(default)]
+    shared_placement: bool,
 }
 
 impl PackageConfiguration {
@@ -210,6 +220,7 @@ impl PackageConfiguration {
                         .unwrap_or_else(|| variants.clone()),
                     features: canonical_features(scenario.features.as_deref().unwrap_or(&features)),
                     roles,
+                    shared_placement: scenario.shared_placement,
                 })
             })
             .collect()

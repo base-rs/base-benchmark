@@ -45,6 +45,9 @@ pub struct Summary {
     /// Artifacts built with the current workload package overlaid onto their trees, and what that changed in their lockfiles. Omitted when nothing was overlaid, so summaries of other campaigns are unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlays: Vec<OverlaidArtifact>,
+    /// How a multi-process scenario's roles were placed, when the scenario declares that they may share physical cores: `deliberately shared`, with the roles that did. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
 }
 
 /// An artifact whose tree was built with another workload package in place of its own.
@@ -450,6 +453,10 @@ pub fn summarize(plan: &Plan, entries: &[SampleEntry]) -> Summary {
         pairs,
         warnings: warnings.into_lines(),
         overlays,
+        placement: plan.shared_placement.then(|| match plan.shared_cores.as_slice() {
+            [] => "deliberately shared".to_owned(),
+            shared => format!("deliberately shared: {}", crate::placement::describe(shared)),
+        }),
     }
 }
 
@@ -562,10 +569,31 @@ pub fn sign_test(improved: usize, regressed: usize) -> f64 {
     (2.0 * tail).min(1.0)
 }
 
+/// Roles' undeclared sharing of physical cores, which recorded campaigns refuse and other measured campaigns warn about, in their summaries and when they start, so that a campaign that fails still shows them.
+pub(crate) fn placement_warnings(plan: &Plan) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if plan.mode == Mode::Smoke || plan.shared_placement {
+        return warnings;
+    }
+    if !plan.shared_cores.is_empty() {
+        warnings.push(format!("roles share physical cores, which the scenario does not declare, so they contend for them: {}", crate::placement::describe(&plan.shared_cores)));
+    }
+    if !plan.unknown_topology.is_empty() {
+        warnings.push(format!(
+            "the SMT siblings of CPUs {} are unknown, so roles may share a physical core",
+            crate::plan::cpu_list(&plan.unknown_topology)
+        ));
+    }
+    warnings
+}
+
 /// Hazards that make a comparison weaker than its numbers suggest.
 fn interpretation_warnings(plan: &Plan, pairs: &[PairSummary], warnings: &mut Warnings) {
     if plan.mode != Mode::Smoke && plan.roles.is_empty() && plan.cpus.is_empty() {
         warnings.add(Hazard::Control, "no CPU placement: workload processes may run on different cores or core types between rounds".to_owned(), None);
+    }
+    for warning in placement_warnings(plan) {
+        warnings.add(Hazard::Control, warning, None);
     }
     let unplaced = plan.unplaced_roles();
     if plan.mode != Mode::Smoke && !unplaced.is_empty() {
@@ -773,6 +801,9 @@ impl Summary {
         );
         if let Some(rule) = &self.decision_rule {
             let _ = writeln!(text, "decision rule: {rule}");
+        }
+        if let Some(placement) = &self.placement {
+            let _ = writeln!(text, "placement: {placement}");
         }
         // Overlaid trees did not build their own workload, and their builds may not have kept the versions they lock.
         let mut packages: Vec<(&DependencyIdentity, Vec<&str>)> = Vec::new();

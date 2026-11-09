@@ -408,28 +408,83 @@ fn changed_external_programs_fail_verification() {
 }
 
 #[test]
-fn recorded_campaigns_refuse_roles_that_share_a_cpu() {
-    let recorded = |server: &[usize], client: &[usize]| {
+fn roles_on_shared_physical_cores_must_be_declared_in_recorded_campaigns() {
+    let recorded = |shared_placement: bool, server: Vec<usize>, topology: Topology| {
         let mut options = roles_options(Mode::Recorded);
-        options
-            .role_cpus
-            .insert("server".to_owned(), server.to_vec());
-        options
-            .role_cpus
-            .insert("client".to_owned(), client.to_vec());
-        Plan::new(options).unwrap_err().to_string()
+        options.suite.scenarios[0].shared_placement = shared_placement;
+        options.role_cpus = [
+            ("server".to_owned(), server),
+            ("client".to_owned(), vec![3]),
+        ]
+        .into();
+        options.topology = Some(topology);
+        options.rounds = Some(10);
+        options.decision_rule = Some("rule".to_owned());
+        options.idle_host = true;
+        Plan::new(options)
     };
-    let error = recorded(&[1, 2, 3], &[0, 2, 3]);
+    let siblings = || Topology::new([(1, vec![3]), (3, vec![1]), (2, vec![])].into());
+    let error = recorded(false, vec![1, 2], siblings())
+        .unwrap_err()
+        .to_string();
     assert!(
-        error.contains("roles on separate CPUs (server and client share CPU 2, 3)"),
+        error.contains("roles on separate physical cores, or a scenario that declares shared-placement (server and client on CPUs 1, 3)"),
         "{error}"
     );
-    // Other prerequisites are unmet too; separate CPUs meet this one.
-    assert!(!recorded(&[1, 2], &[3]).contains("separate CPUs"));
-    // Screening allows it.
-    let mut options = roles_options(Mode::Screening);
-    options.role_cpus.insert("server".to_owned(), vec![0]);
-    options.role_cpus.insert("client".to_owned(), vec![0]);
-    let plan = Plan::new(options).unwrap();
-    assert_eq!(plan.shared_cpus(), ["server and client share CPU 0"]);
+    let plan = recorded(true, vec![1, 2], siblings()).unwrap();
+    assert_eq!(plan.shared_cores[0].cpus, [1, 3]);
+    assert!(plan.shared_placement);
+    recorded(false, vec![2], siblings()).unwrap();
+    let error = recorded(false, vec![2], Topology::new([(3, vec![])].into()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("the SMT siblings of CPUs 2, to rule out roles sharing a physical core"),
+        "{error}"
+    );
+    // A scenario that declares shared placement need not rule it out.
+    let plan = recorded(true, vec![2], Topology::new([(3, vec![])].into())).unwrap();
+    assert_eq!(plan.unknown_topology, [2]);
+    // Screening campaigns are planned, and warned about in their summaries.
+    let mut screening = roles_options(Mode::Screening);
+    screening.role_cpus = [
+        ("server".to_owned(), vec![1]),
+        ("client".to_owned(), vec![1]),
+    ]
+    .into();
+    screening.topology = Some(Topology::default());
+    let plan = Plan::new(screening).unwrap();
+    assert_eq!(
+        (plan.shared_cores.len(), plan.unknown_topology.as_slice()),
+        (1, &[1][..])
+    );
+}
+
+#[test]
+fn roles_must_be_placed_on_cpus_that_exist_and_are_online() {
+    let directory = tempfile::tempdir().unwrap();
+    let cpus = directory.path().join("sys/devices/system/cpu");
+    for cpu in 0..3 {
+        let topology = cpus.join(format!("cpu{cpu}/topology"));
+        std::fs::create_dir_all(&topology).unwrap();
+        std::fs::write(topology.join("thread_siblings_list"), format!("{cpu}\n")).unwrap();
+    }
+    std::fs::write(cpus.join("present"), "0-3\n").unwrap();
+    std::fs::write(cpus.join("online"), "0-2\n").unwrap();
+    let plan = |client: Vec<usize>| {
+        let mut options = roles_options(Mode::Screening);
+        options.role_cpus = [
+            ("server".to_owned(), vec![1]),
+            ("client".to_owned(), client),
+        ]
+        .into();
+        options.topology = Some(Topology::read_from(directory.path(), &[0, 1, 2, 3, 9]));
+        Plan::new(options)
+    };
+    plan(vec![2]).unwrap();
+    let error = plan(vec![3, 9, 2]).unwrap_err().to_string();
+    assert!(
+        error.contains("roles are placed on CPUs this host cannot run them on: CPU 3 is offline, CPU 9 does not exist"),
+        "{error}"
+    );
 }

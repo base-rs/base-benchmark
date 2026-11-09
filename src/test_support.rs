@@ -109,6 +109,7 @@ pub fn suite(script: &Path, variants: &[&str]) -> Suite {
             baseline: None,
             features: Vec::new(),
             roles: Vec::new(),
+            shared_placement: false,
         }],
     }
 }
