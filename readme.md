@@ -17,6 +17,8 @@ The `base-benchmark` command and the [`bake-benchmark`](https://github.com/base-
 
 See [Using the Shared Benchmark Tooling](context/usage.md) for writing a workload, declaring scenarios in Cargo metadata, and running smoke, screening, and recorded campaigns. Run `base-benchmark help` for command options. Workloads depend on the crate with `default-features = false`, which provides only records, `Interval`, and a driver's `Window`.
 
+The hosts that Base projects measure on are described once, for every repository, in [hosts](hosts/readme.md): their hardware, settings, and how to measure there. Each benchmark keeps its own CPU placement on a host in its repository.
+
 ## Design and findings
 
 - [Architecture](context/architecture.md) and [requirements](design/architecture.md), including the agreed, not yet implemented, [multi-process roles](design/roles.md).

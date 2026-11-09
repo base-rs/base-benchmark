@@ -7,7 +7,7 @@ license = "MIT"
 description = "Bake-independent benchmark measurement and experiment tooling for Base projects"
 repository = "https://github.com/base-rs/base-benchmark"
 readme = "readme.md"
-include = ["src/**", "context/**", "templates/**", "Cargo.toml", "readme.md", "license.md", "releases.md"]
+include = ["src/**", "context/**", "templates/**", "Cargo.toml", "/readme.md", "/license.md", "/releases.md"]
 
 [workspace]
 members = ["bake"]
