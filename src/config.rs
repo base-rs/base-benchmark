@@ -193,7 +193,7 @@ impl PackageConfiguration {
                 let roles = scenario
                     .role
                     .into_iter()
-                    .map(|role| role.resolve(&context))
+                    .map(|role| role.resolve(package, &context))
                     .collect::<io::Result<Vec<_>>>()?;
                 Ok(Scenario {
                     name: scenario.name.clone(),

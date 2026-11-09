@@ -161,7 +161,7 @@ fn arguments_refer_to_captured_values_and_double_literal_braces() {
 
 fn configuration(value: serde_json::Value) -> io::Result<Role> {
     let configuration = RoleConfiguration::deserialize(value).unwrap();
-    configuration.resolve(&|message| invalid_input(message))
+    configuration.resolve("workload", &|message| invalid_input(message))
 }
 
 #[test]
@@ -213,6 +213,34 @@ fn role_declarations_resolve_defaults() {
 }
 
 #[test]
+fn helper_binaries_default_to_the_declaring_package() {
+    let own = configuration(serde_json::json!({
+        "name": "client", "kind": "driver", "binary": "load",
+    }))
+    .unwrap();
+    assert_eq!(
+        own.program,
+        RoleProgram::Binary {
+            package: "workload".to_owned(),
+            binary: "load".to_owned(),
+            features: Vec::new()
+        }
+    );
+    let other = configuration(serde_json::json!({
+        "name": "client", "kind": "driver", "binary": "load", "package": "wrapper", "features": ["b", "a,b"],
+    }))
+    .unwrap();
+    assert_eq!(
+        other.program,
+        RoleProgram::Binary {
+            package: "wrapper".to_owned(),
+            binary: "load".to_owned(),
+            features: vec!["a".to_owned(), "b".to_owned()]
+        }
+    );
+}
+
+#[test]
 fn invalid_role_declarations_are_rejected() {
     for (value, message) in [
         (
@@ -226,6 +254,18 @@ fn invalid_role_declarations_are_rejected() {
         (
             serde_json::json!({ "name": "a", "kind": "driver", "external": "x/y" }),
             "external program names",
+        ),
+        (
+            serde_json::json!({ "name": "a", "kind": "driver", "external": "x", "binary": "y" }),
+            "exactly one program",
+        ),
+        (
+            serde_json::json!({ "name": "a", "kind": "driver", "external": "x", "package": "y" }),
+            "choose the build of a `binary`",
+        ),
+        (
+            serde_json::json!({ "name": "a", "kind": "driver", "subject": true, "features": [] }),
+            "choose the build of a `binary`",
         ),
         (
             serde_json::json!({ "name": "a", "kind": "service", "subject": true }),

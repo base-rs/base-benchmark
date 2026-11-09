@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub const MANIFEST_SCHEMA: &str = "base-benchmark/artifacts";
-/// Version 2 records each artifact's features, so one manifest can hold several builds of each tree. Version 1 manifests embedded in older campaigns can still be read, so those campaigns can be summarized again, but preparation must be repeated to run them.
-pub const MANIFEST_VERSION: u32 = 2;
+/// Version 2 records each artifact's features, so one manifest can hold several builds of each tree. Version 3 adds helper binaries that roles run, which version 2 manifests do not have, so those still run. Version 1 manifests embedded in older campaigns can still be read, so those campaigns can be summarized again, but preparation must be repeated to run them.
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// Frozen executables prepared before any measurement, with the identity of each source tree and build.
 ///
@@ -26,6 +26,9 @@ pub struct ArtifactManifest {
     pub binary: String,
     pub profile: String,
     pub artifacts: Vec<Artifact>,
+    /// Workspace binaries that roles run for every subject, built once from the baseline tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub helpers: Vec<HelperArtifact>,
     /// Version 1 recorded one feature set for every artifact. It is accepted only so that campaigns embedding a version 1 manifest still parse.
     #[serde(default, rename = "features", skip_serializing)]
     pub(crate) legacy_features: Option<Vec<String>>,
@@ -58,6 +61,7 @@ impl ArtifactManifest {
             binary: suite.binary.clone(),
             profile: "unknown".to_owned(),
             legacy_features: None,
+            helpers: Vec::new(),
             artifacts: vec![Artifact {
                 label: "unprepared".to_owned(),
                 role: ArtifactRole::Baseline,
@@ -118,8 +122,17 @@ impl ArtifactManifest {
         })
     }
 
+    /// The index among `helpers` of the helper built from `package`'s `binary` with `features`.
+    pub fn helper_index(&self, package: &str, binary: &str, features: &[String]) -> Option<usize> {
+        self.helpers.iter().position(|helper| {
+            helper.package == package
+                && helper.binary == binary
+                && helper.artifact.features.as_deref() == Some(features)
+        })
+    }
+
     pub fn validate(&self) -> io::Result<()> {
-        if self.schema != MANIFEST_SCHEMA || self.version != MANIFEST_VERSION {
+        if self.schema != MANIFEST_SCHEMA || !(2..=MANIFEST_VERSION).contains(&self.version) {
             let advice = if self.version < MANIFEST_VERSION {
                 "; prepare the trees again"
             } else {
@@ -260,6 +273,17 @@ pub enum ArtifactRole {
     Candidate,
     /// The baseline's source copied to another path and rebuilt with salted crate metadata, exposing build-layout sensitivity.
     LayoutReplica,
+    /// A workspace binary that a role runs for every subject, built once from the baseline tree and never salted.
+    Helper,
+}
+
+/// A workspace binary that roles of multi-process scenarios run, the same executable for every subject: built once, from the baseline tree, unsalted, and recorded as a fixed artifact, whose role is [`ArtifactRole::Helper`] and whose label is its binary's name.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperArtifact {
+    pub package: String,
+    pub binary: String,
+    pub artifact: Artifact,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

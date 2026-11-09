@@ -3,8 +3,8 @@
 
 use crate::artifact::{
     self, Artifact, ArtifactManifest, ArtifactRole, BuildIdentity, ConfigurationFile,
-    DependencyIdentity, MANIFEST_SCHEMA, MANIFEST_VERSION, SourceIdentity, sha256_file,
-    sha256_identified,
+    DependencyIdentity, HelperArtifact, MANIFEST_SCHEMA, MANIFEST_VERSION, SourceIdentity,
+    sha256_file, sha256_identified,
 };
 use crate::config::{Suite, canonical_features, invalid_input, valid_label};
 use crate::runner::Cancellation;
@@ -50,8 +50,19 @@ pub struct PrepareOptions {
     pub feature_sets: Vec<Vec<String>>,
     /// Build every tree with this workload package in place of the tree's own.
     pub overlay: Option<Overlay>,
+    /// Workspace binaries that roles run, built once from the baseline tree: those of the scenarios to be run.
+    pub helpers: Vec<Helper>,
     pub cargo: PathBuf,
     pub rustc: PathBuf,
+}
+
+/// A workspace binary that a role of a multi-process scenario runs for every subject.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Helper {
+    pub package: String,
+    pub binary: String,
+    /// Sorted and without duplicates.
+    pub features: Vec<String>,
 }
 
 /// A workload package copied into every tree before building, so that revisions from before the workload existed, or with an older version of it, run the same harness.
@@ -190,6 +201,7 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         .as_ref()
         .and_then(|harness| harness.lockfile.as_deref());
     let mut artifacts = Vec::new();
+    let mut helpers = Vec::new();
     for (index, (label, path)) in trees.iter().enumerate() {
         let role = if index == 0 {
             ArtifactRole::Baseline
@@ -218,12 +230,12 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
             &source,
             cancellation,
         )?;
-        artifacts.extend(with_lockfile_changes(
-            built,
-            path,
-            directory,
-            current_lockfile,
-        ));
+        let built = with_lockfile_changes(built, path, directory, current_lockfile);
+        // Helpers are built once, from the baseline tree as it was built, with its identity.
+        if index == 0 {
+            helpers = build_helpers(options, &output, directory, &built[0].source, cancellation)?;
+        }
+        artifacts.extend(built);
     }
     // The baseline's source identity is the same for each of its feature sets.
     let baseline = artifacts[0].source.clone();
@@ -264,6 +276,7 @@ pub fn prepare(options: &PrepareOptions, cancellation: &Cancellation) -> io::Res
         binary: options.suite.binary.clone(),
         profile: options.suite.profile.clone(),
         artifacts,
+        helpers,
         ..ArtifactManifest::default()
     };
     // A build that Cargo finished after cancellation, such as when only this process was signalled, leaves preparation as cancelled as one stopped between builds.
@@ -374,6 +387,8 @@ fn build_feature_sets(
             let build = Build {
                 label,
                 role,
+                package: &options.suite.package,
+                binary: &options.suite.binary,
                 tree,
                 target: &target,
                 features,
@@ -420,6 +435,47 @@ fn build_feature_sets(
     Ok(artifacts)
 }
 
+/// Build every helper in `tree`, the baseline's directory, sharing a target directory of their own, removed afterwards, and freeze each under `helpers/N/`.
+fn build_helpers(
+    options: &PrepareOptions,
+    output: &Path,
+    tree: &Path,
+    source: &SourceIdentity,
+    cancellation: &Cancellation,
+) -> io::Result<Vec<HelperArtifact>> {
+    let target = output.join("targets").join(".helpers");
+    let helpers = options
+        .helpers
+        .iter()
+        .enumerate()
+        .map(|(index, helper)| {
+            let build = Build {
+                label: &helper.binary,
+                role: ArtifactRole::Helper,
+                package: &helper.package,
+                binary: &helper.binary,
+                tree,
+                target: &target,
+                features: &helper.features,
+                executable: output
+                    .join("helpers")
+                    .join(index.to_string())
+                    .join(&helper.binary),
+                salt: None,
+            };
+            build
+                .run(options, source.clone(), cancellation)
+                .map(|artifact| HelperArtifact {
+                    package: helper.package.clone(),
+                    binary: helper.binary.clone(),
+                    artifact,
+                })
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&target);
+    helpers
+}
+
 fn cancelled() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "preparation was cancelled")
 }
@@ -436,6 +492,8 @@ fn cancelled_by(error: impl std::fmt::Display) -> io::Error {
 struct Build<'a> {
     label: &'a str,
     role: ArtifactRole,
+    package: &'a str,
+    binary: &'a str,
     tree: &'a Path,
     target: &'a Path,
     features: &'a [String],
@@ -469,6 +527,8 @@ impl Build<'_> {
         let Build {
             label,
             role,
+            package,
+            binary,
             tree,
             target,
             features,
@@ -486,9 +546,9 @@ impl Build<'_> {
             "--manifest-path".to_owned(),
             tree.join("Cargo.toml").display().to_string(),
             "--package".to_owned(),
-            suite.package.clone(),
+            package.to_owned(),
             "--bin".to_owned(),
-            suite.binary.clone(),
+            binary.to_owned(),
             "--profile".to_owned(),
             suite.profile.clone(),
             "--target-dir".to_owned(),
@@ -544,11 +604,10 @@ impl Build<'_> {
                 output_text.status
             )));
         }
-        let built = executable(&String::from_utf8_lossy(&output_text.stdout), &suite.binary)
-            .ok_or_else(|| {
+        let built =
+            executable(&String::from_utf8_lossy(&output_text.stdout), binary).ok_or_else(|| {
                 io::Error::other(format!(
-                    "{label}: cargo reported no executable for {}",
-                    suite.binary
+                    "{label}: cargo reported no executable for {binary}"
                 ))
             })?;
         let sha256 =

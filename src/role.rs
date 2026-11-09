@@ -27,6 +27,12 @@ pub enum RoleProgram {
     Subject,
     /// A program outside the workspace, such as nginx, whose path on the measuring host is given when the scenario runs, never in package metadata.
     External { name: String },
+    /// A binary of a workspace package, such as a load client or a wrapper of a separately published one, built once from the baseline tree with `features`, sorted and without duplicates, and run unchanged for every subject.
+    Binary {
+        package: String,
+        binary: String,
+        features: Vec<String>,
+    },
 }
 
 /// A line a service prints on stdout once it is ready, such as `{address}` for a server that prints only the address it bound.
@@ -92,6 +98,9 @@ pub(crate) struct RoleConfiguration {
     #[serde(default)]
     subject: bool,
     external: Option<String>,
+    binary: Option<String>,
+    package: Option<String>,
+    features: Option<Vec<String>>,
     #[serde(default)]
     arguments: Vec<String>,
     #[serde(default)]
@@ -105,23 +114,38 @@ pub(crate) struct RoleConfiguration {
 }
 
 impl RoleConfiguration {
-    /// Resolve defaults; `context` prefixes errors with the package and scenario.
-    pub(crate) fn resolve(self, context: &dyn Fn(String) -> io::Error) -> io::Result<Role> {
+    /// Resolve defaults, with `package` the declaring package; `context` prefixes errors with the package and scenario.
+    pub(crate) fn resolve(
+        self,
+        package: &str,
+        context: &dyn Fn(String) -> io::Error,
+    ) -> io::Result<Role> {
         let role = |message: String| context(format!("role {:?}: {message}", self.name));
-        let program = match (self.subject, &self.external) {
-            (true, None) => RoleProgram::Subject,
-            (false, Some(name)) if valid_label(name) => {
+        if self.binary.is_none() && (self.package.is_some() || self.features.is_some()) {
+            return Err(role(
+                "`package` and `features` choose the build of a `binary`".to_owned(),
+            ));
+        }
+        let program = match (self.subject, &self.external, &self.binary) {
+            (true, None, None) => RoleProgram::Subject,
+            (false, Some(name), None) if valid_label(name) => {
                 RoleProgram::External { name: name.clone() }
             }
-            (false, Some(name)) => {
+            (false, Some(name), None) => {
                 return Err(role(format!(
                     "external program names may contain only ASCII letters, digits, '.', '_', and '-', not {name:?}"
                 )));
             }
+            (false, None, Some(binary)) => RoleProgram::Binary {
+                package: self.package.clone().unwrap_or_else(|| package.to_owned()),
+                binary: binary.clone(),
+                features: crate::config::canonical_features(
+                    self.features.as_deref().unwrap_or_default(),
+                ),
+            },
             _ => {
                 return Err(role(
-                    "declare exactly one program: `subject = true` or `external = \"NAME\"`"
-                        .to_owned(),
+                    "declare exactly one program: `subject = true`, `external = \"NAME\"`, or `binary = \"NAME\"`".to_owned(),
                 ));
             }
         };

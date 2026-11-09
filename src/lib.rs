@@ -64,7 +64,8 @@ pub use window::{
 #[cfg(feature = "runner")]
 pub use artifact::{
     Artifact, ArtifactManifest, ArtifactRole, BuildIdentity, ConfigurationFile, DependencyIdentity,
-    MANIFEST_SCHEMA, MANIFEST_VERSION, SourceIdentity, sha256_file, sha256_identified,
+    HelperArtifact, MANIFEST_SCHEMA, MANIFEST_VERSION, SourceIdentity, sha256_file,
+    sha256_identified,
 };
 #[cfg(feature = "runner")]
 pub use config::{
@@ -79,7 +80,7 @@ pub use plan::{
     parse_cpus,
 };
 #[cfg(feature = "runner")]
-pub use prepare::{Overlay, PrepareOptions, Prepared, Tree, prepare};
+pub use prepare::{Helper, Overlay, PrepareOptions, Prepared, Tree, prepare};
 #[cfg(feature = "runner")]
 pub use role::{
     DEFAULT_READY_TIMEOUT_MS, DEFAULT_STOP_GRACE_MS, ReadyLine, Role, RoleKind, RoleProgram,

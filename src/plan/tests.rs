@@ -295,12 +295,15 @@ fn roles_start_services_first_and_variants_change_only_the_subject() {
         ]
     );
     let shell = Path::new(SHELL).canonicalize().unwrap();
+    // The shell's version depends on which shell it is.
+    let version = plan.programs[0].version.clone();
     assert_eq!(
         plan.programs,
         [ExternalProgram {
             name: "shell".to_owned(),
             path: shell.clone(),
-            sha256: crate::artifact::sha256_file(&shell).unwrap()
+            sha256: crate::artifact::sha256_file(&shell).unwrap(),
+            version
         }]
     );
     plan.programs[0].verify().unwrap();
@@ -487,4 +490,34 @@ fn roles_must_be_placed_on_cpus_that_exist_and_are_online() {
         error.contains("roles are placed on CPUs this host cannot run them on: CPU 3 is offline, CPU 9 does not exist"),
         "{error}"
     );
+}
+
+#[test]
+fn helper_roles_need_prepared_helpers() {
+    let mut options = roles_options(Mode::Screening);
+    options.suite.scenarios[0].roles[0].program = crate::role::RoleProgram::Binary {
+        package: "fixture".to_owned(),
+        binary: "load".to_owned(),
+        features: Vec::new(),
+    };
+    let error = Plan::new(options.clone()).unwrap_err().to_string();
+    assert!(
+        error.contains("role \"client\" runs fixture's binary load with features [], which these artifacts do not include"),
+        "{error}"
+    );
+    let mut helper = artifact("load", ArtifactRole::Helper, Path::new(SHELL));
+    helper.features = Some(Vec::new());
+    options.artifacts.helpers = vec![crate::artifact::HelperArtifact {
+        package: "fixture".to_owned(),
+        binary: "load".to_owned(),
+        artifact: helper,
+    }];
+    let plan = Plan::new(options).unwrap();
+    assert_eq!(plan.artifacts.helper_index("fixture", "load", &[]), Some(0));
+    assert_eq!(
+        plan.artifacts
+            .helper_index("fixture", "load", &["x".to_owned()]),
+        None
+    );
+    assert!(plan.programs.is_empty());
 }

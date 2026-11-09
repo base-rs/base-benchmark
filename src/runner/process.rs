@@ -298,6 +298,16 @@ pub(crate) fn execute(
     check_collection().map(|()| unreachable!("collection is unsupported here"))
 }
 
+/// Collecting samples needs Linux; see the module documentation. Campaigns check first, so this is not reached.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn execute_keeping_stderr_head(
+    _launch: &Launch,
+    _timeout: Duration,
+    _cancellation: &Cancellation,
+) -> io::Result<Execution> {
+    check_collection().map(|()| unreachable!("collection is unsupported here"))
+}
+
 /// Start a process leading its own group, with the launch's environment, directory, and CPUs, piped stdout and stderr, `stdin`, and every stop signal at its default disposition and unblocked, and register its group with `cancellation`. Returns the child and its group.
 ///
 /// Signals this process ignores, such as `SIGINT` and `SIGQUIT` after `&` in a non-interactive shell or `SIGHUP` under `nohup`, would otherwise stay ignored in the child, and signals blocked in the spawning thread, as a launcher's signal mask passes to what it starts, would stay blocked, so that a service would outlast its stop signal and be killed after its grace period. The stop signals include the termination signals.
@@ -474,12 +484,36 @@ impl Drop for Unreaped<'_> {
     }
 }
 
-/// Run one workload process to completion with bounded output, a deadline, CPU placement, and process-group cleanup.
+/// Run one workload process to completion with bounded output, a deadline, CPU placement, and process-group cleanup. Only the end of its stderr is kept.
 #[cfg(target_os = "linux")]
 pub(crate) fn execute(
     launch: &Launch,
     timeout: Duration,
     cancellation: &Cancellation,
+) -> io::Result<Execution> {
+    run_to_end(launch, timeout, cancellation, |stderr| {
+        read_tail(stderr, STDERR_LIMIT)
+    })
+}
+
+/// Run a process as [`execute`] does, but keep the start of its stderr rather than the end, for a program whose first line matters, such as its version.
+#[cfg(target_os = "linux")]
+pub(crate) fn execute_keeping_stderr_head(
+    launch: &Launch,
+    timeout: Duration,
+    cancellation: &Cancellation,
+) -> io::Result<Execution> {
+    run_to_end(launch, timeout, cancellation, |stderr| {
+        read_head(stderr, STDERR_LIMIT).0
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn run_to_end(
+    launch: &Launch,
+    timeout: Duration,
+    cancellation: &Cancellation,
+    read_stderr: fn(std::process::ChildStderr) -> Vec<u8>,
 ) -> io::Result<Execution> {
     let started = Instant::now();
     let (child, group) = start(launch, Stdio::null(), cancellation)?;
@@ -495,7 +529,7 @@ pub(crate) fn execute(
     let stderr = workload.child.stderr.take().expect("stderr is piped");
     let stdout_sender = sender.clone();
     std::thread::spawn(move || stdout_sender.send(Output::Stdout(read_head(stdout, STDOUT_LIMIT))));
-    std::thread::spawn(move || sender.send(Output::Stderr(read_tail(stderr, STDERR_LIMIT))));
+    std::thread::spawn(move || sender.send(Output::Stderr(read_stderr(stderr))));
 
     let timed_out = Arc::new(AtomicBool::new(false));
     let (done, finished) = mpsc::channel::<()>();

@@ -214,6 +214,8 @@ pub struct ExternalProgram {
     /// The path it was given by, made absolute and canonical on the measuring host.
     pub path: PathBuf,
     pub sha256: String,
+    /// The first line it printed for `--version` when the campaign started, or `None` when that failed, so its version is unknown, or before the campaign started. Campaigns ask under the host lock, on the CPUs of the role that runs it.
+    pub version: Option<String>,
 }
 
 /// One executable and argument list, run once per round.
@@ -570,6 +572,23 @@ fn plan_roles(
                     .collect()
             }
         };
+        if let RoleProgram::Binary {
+            package,
+            binary,
+            features,
+        } = &role.program
+        {
+            if options
+                .artifacts
+                .helper_index(package, binary, features)
+                .is_none()
+            {
+                return Err(invalid_input(format!(
+                    "role {:?} runs {package}'s binary {binary} with features {features:?}, which these artifacts do not include; prepare the scenario again",
+                    role.name
+                )));
+            }
+        }
         if let RoleProgram::External { name } = &role.program {
             if !programs.iter().any(|program| &program.name == name) {
                 let path = options.programs.get(name).ok_or_else(|| {
@@ -619,6 +638,7 @@ impl ExternalProgram {
         })?;
         Ok(Self {
             name: name.to_owned(),
+            version: None,
             path: resolved,
             sha256,
         })

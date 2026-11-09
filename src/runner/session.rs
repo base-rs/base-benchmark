@@ -178,6 +178,21 @@ impl<'a> Session<'a> {
                         artifact.sha256.clone(),
                     )
                 }
+                RoleProgram::Binary {
+                    package,
+                    binary,
+                    features,
+                } => {
+                    let found = plan
+                        .artifacts
+                        .helper_index(package, binary, features)
+                        .expect("plans check that the helpers their roles run were prepared");
+                    let executable = self.collection.staged[&super::helper_key(found)].clone();
+                    let artifact = &plan.artifacts.helpers[found].artifact;
+                    verifications
+                        .push((index, Verification::Artifact(artifact, executable.clone())));
+                    (executable, role.arguments.clone(), artifact.sha256.clone())
+                }
                 RoleProgram::External { name } => {
                     let program = plan
                         .programs

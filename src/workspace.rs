@@ -4,7 +4,8 @@
 use crate::artifact::ArtifactManifest;
 use crate::config::{self, Scenario, Suite};
 use crate::plan::{Mode, Plan, PlanOptions, default_lock_path};
-use crate::prepare::{Overlay, PrepareOptions, Prepared, Tree, prepare};
+use crate::prepare::{Helper, Overlay, PrepareOptions, Prepared, Tree, prepare};
+use crate::role::RoleProgram;
 use crate::runner::{self, Campaign, Cancellation};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -127,9 +128,19 @@ impl Workspace {
                 .collect::<io::Result<Vec<_>>>()?
         };
         let mut feature_sets: Vec<Vec<String>> = Vec::new();
+        let mut helpers: Vec<Helper> = Vec::new();
         for scenario in scenarios {
             if !feature_sets.contains(&scenario.features) {
                 feature_sets.push(scenario.features.clone());
+            }
+            for helper in scenario
+                .roles
+                .iter()
+                .filter_map(|role| helper(&role.program))
+            {
+                if !helpers.contains(&helper) {
+                    helpers.push(helper);
+                }
             }
         }
         let output = request
@@ -144,6 +155,7 @@ impl Workspace {
                 output,
                 feature_sets,
                 overlay,
+                helpers,
                 cargo: self.cargo.clone(),
                 rustc: self.rustc.clone(),
             },
@@ -220,7 +232,7 @@ impl Workspace {
         )
     }
 
-    /// Run once, with its smoke arguments, every scenario whose features `features` includes, using an executable built outside preparation with those features, such as a workload's `CARGO_BIN_EXE_*` in its own tests. Scenarios that need other features are skipped, since the executable cannot run them.
+    /// Run once, with its smoke arguments, every scenario whose features `features` includes, using an executable built outside preparation with those features, such as a workload's `CARGO_BIN_EXE_*` in its own tests. Scenarios that need other features, or whose roles run helper binaries, are skipped, since the executable cannot run them and no helper was built.
     pub fn smoke_executable(
         &self,
         package: Option<&str>,
@@ -236,6 +248,7 @@ impl Workspace {
         std::fs::create_dir_all(output)
             .and_then(|()| ArtifactManifest::unprepared(&suite, executable))
             .and_then(|manifest| manifest.write(&manifest_path))?;
+        // An executable built outside preparation comes with no helpers.
         let scenarios = suite
             .scenarios
             .iter()
@@ -244,6 +257,10 @@ impl Workspace {
                     .features
                     .iter()
                     .all(|feature| features.contains(&feature.as_str()))
+                    && scenario
+                        .roles
+                        .iter()
+                        .all(|role| helper(&role.program).is_none())
             })
             .collect::<Vec<_>>();
         if scenarios.is_empty() {
@@ -290,6 +307,22 @@ impl Workspace {
                 self.run(request, cancellation, progress)
             })
             .collect()
+    }
+}
+
+/// The helper a role's program needs built, if any.
+fn helper(program: &RoleProgram) -> Option<Helper> {
+    match program {
+        RoleProgram::Binary {
+            package,
+            binary,
+            features,
+        } => Some(Helper {
+            package: package.clone(),
+            binary: binary.clone(),
+            features: features.clone(),
+        }),
+        _ => None,
     }
 }
 
