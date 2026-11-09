@@ -108,19 +108,24 @@ impl Cancellation {
 
     /// Cancel when the process receives SIGINT, SIGTERM, or SIGHUP, until the guard is dropped.
     ///
-    /// The first signal cancels every guarded campaign, so workloads are killed before locks are released. A signal while nothing is guarded, or a second signal, exits the process with status 128 plus the signal number. The handler stays installed for the life of the process. On Linux, signals already ignored when it is installed, as under `nohup`, stay ignored. Systems other than Unix install no handler.
+    /// The first signal cancels every guarded campaign, so workloads are killed before locks are released. A signal while nothing is guarded, or a second signal, exits the process with status 128 plus the signal number. The handler stays installed for the life of the process. On Linux, signals already ignored when it is installed, as under `nohup`, stay ignored. Signals blocked when it is installed, as a launcher's signal mask passes to what it starts, are handled all the same: the handler's own thread, which lives as long as the process, unblocks them, so a signal sent to the process reaches it, though a signal sent to a thread that blocks it, as `raise` does, waits for that thread. Systems other than Unix install no handler.
     pub fn on_termination_signals(&self) -> SignalGuard {
         #[cfg(unix)]
         HANDLER.call_once(|| {
-            use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+            use nix::sys::signal::{SigSet, Signal};
             let ignored =
                 ignored_signals(std::fs::read_to_string("/proc/self/status").ok().as_deref());
-            let handled = [SIGINT, SIGTERM, SIGHUP]
+            let handled: SigSet = [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP]
                 .into_iter()
-                .filter(|signal| ignored & (1 << (signal - 1)) == 0);
-            let mut signals = signal_hook::iterator::Signals::new(handled)
-                .expect("termination signals are not forbidden signals");
+                .filter(|signal| ignored & (1 << (*signal as i32 - 1)) == 0)
+                .collect();
+            let mut signals =
+                signal_hook::iterator::Signals::new(handled.iter().map(|signal| signal as i32))
+                    .expect("termination signals are not forbidden signals");
             std::thread::spawn(move || {
+                handled
+                    .thread_unblock()
+                    .expect("termination signals can be unblocked");
                 for signal in signals.forever() {
                     respond(signal);
                 }

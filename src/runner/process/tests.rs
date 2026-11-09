@@ -135,13 +135,13 @@ fn cancellation_stops_running_and_new_processes() {
     assert_eq!(execution.signal, Some(9));
 }
 
-#[test]
-fn the_first_termination_signal_cancels_guarded_campaigns() {
+fn cancels_guarded_campaigns_on_the_first_termination_signal() {
     let cancellation = Cancellation::new();
     let guard = cancellation.on_termination_signals();
     let other = Cancellation::new();
     drop(other.on_termination_signals());
-    nix::sys::signal::raise(Signal::SIGTERM).unwrap();
+    // Signal this process, as a user or a service manager does, rather than this thread, as `raise` does.
+    nix::sys::signal::kill(nix::unistd::getpid(), Signal::SIGTERM).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !cancellation.is_cancelled() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -156,6 +156,21 @@ fn the_first_termination_signal_cancels_guarded_campaigns() {
         !guarded()
             .iter()
             .any(|guarded| Arc::ptr_eq(&guarded.0, &cancellation.0))
+    );
+}
+
+#[test]
+fn the_first_termination_signal_cancels_guarded_campaigns() {
+    cancels_guarded_campaigns_on_the_first_termination_signal();
+}
+
+#[test]
+fn termination_signals_blocked_when_base_benchmark_started_still_cancel_guarded_campaigns() {
+    crate::test_support::with_signals(
+        "runner::process::tests::termination_signals_blocked_when_base_benchmark_started_still_cancel_guarded_campaigns",
+        &[],
+        &[Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP],
+        cancels_guarded_campaigns_on_the_first_termination_signal,
     );
 }
 
