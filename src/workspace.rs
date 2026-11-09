@@ -6,11 +6,12 @@ use crate::config::{self, Scenario, Suite};
 use crate::plan::{Mode, Plan, PlanOptions, default_lock_path};
 use crate::prepare::{Overlay, PrepareOptions, Prepared, Tree, prepare};
 use crate::runner::{self, Campaign, Cancellation};
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// The default deadline for one workload process.
+/// The default deadline for one workload process, or for one session of a multi-process scenario.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The semantic operations shared by the `base-benchmark` command and the Bake tasks.
@@ -19,6 +20,8 @@ pub struct Workspace {
     pub manifest_path: PathBuf,
     pub cargo: PathBuf,
     pub rustc: PathBuf,
+    /// External programs that roles run, by the name they declare, as paths on the measuring host. Runs and smoke runs identify the programs their scenarios use, and fail if one is missing.
+    pub programs: BTreeMap<String, PathBuf>,
 }
 
 /// A request to prepare artifacts. Unset options take the core's defaults.
@@ -48,9 +51,12 @@ pub struct RunRequest {
     /// Defaults to the mode's round count.
     pub rounds: Option<u32>,
     pub seed: Option<u64>,
+    /// CPUs a single-process scenario's workloads are pinned to.
     pub cpus: Vec<usize>,
+    /// CPUs each role of a multi-process scenario is pinned to, by role name.
+    pub role_cpus: BTreeMap<String, Vec<usize>>,
     pub perf_events: Vec<String>,
-    /// Defaults to [`DEFAULT_TIMEOUT`].
+    /// Defaults to [`DEFAULT_TIMEOUT`]: the deadline of one workload process, or of a whole session of a multi-process scenario.
     pub timeout: Option<Duration>,
     /// Defaults to [`default_lock_path`].
     pub lock: Option<PathBuf>,
@@ -79,7 +85,14 @@ impl Workspace {
             manifest_path: manifest_path.into(),
             cargo: config::cargo_program(),
             rustc: config::program(std::env::var_os("RUSTC"), "rustc"),
+            programs: BTreeMap::new(),
         }
+    }
+
+    /// Give the path of the external program that roles declare as `name`.
+    pub fn with_program(mut self, name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        self.programs.insert(name.into(), path.into());
+        self
     }
 
     pub fn suites(&self) -> io::Result<Vec<Suite>> {
@@ -158,6 +171,8 @@ impl Workspace {
             rounds: request.rounds,
             seed: request.seed,
             cpus: request.cpus,
+            role_cpus: request.role_cpus,
+            programs: self.programs.clone(),
             perf_events: request.perf_events,
             timeout: request.timeout.unwrap_or(DEFAULT_TIMEOUT),
             lock: request.lock.unwrap_or_else(default_lock_path),

@@ -135,13 +135,13 @@ fn cancellation_stops_running_and_new_processes() {
     assert_eq!(execution.signal, Some(9));
 }
 
-#[test]
-fn the_first_termination_signal_cancels_guarded_campaigns() {
+fn cancels_guarded_campaigns_on_the_first_termination_signal() {
     let cancellation = Cancellation::new();
     let guard = cancellation.on_termination_signals();
     let other = Cancellation::new();
     drop(other.on_termination_signals());
-    nix::sys::signal::raise(Signal::SIGTERM).unwrap();
+    // Signal this process, as a user or a service manager does, rather than this thread, as `raise` does.
+    nix::sys::signal::kill(nix::unistd::getpid(), Signal::SIGTERM).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !cancellation.is_cancelled() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -156,6 +156,21 @@ fn the_first_termination_signal_cancels_guarded_campaigns() {
         !guarded()
             .iter()
             .any(|guarded| Arc::ptr_eq(&guarded.0, &cancellation.0))
+    );
+}
+
+#[test]
+fn the_first_termination_signal_cancels_guarded_campaigns() {
+    cancels_guarded_campaigns_on_the_first_termination_signal();
+}
+
+#[test]
+fn termination_signals_blocked_when_base_benchmark_started_still_cancel_guarded_campaigns() {
+    crate::test_support::with_signals(
+        "runner::process::tests::termination_signals_blocked_when_base_benchmark_started_still_cancel_guarded_campaigns",
+        &[],
+        &[Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP],
+        cancels_guarded_campaigns_on_the_first_termination_signal,
     );
 }
 
@@ -296,4 +311,86 @@ fn each_guard_releases_only_its_own_registration() {
     assert_eq!(count(), 1);
     drop(second);
     assert_eq!(count(), 0);
+}
+
+#[test]
+fn exits_are_observed_without_reaping() {
+    let arguments = vec!["-c".to_owned(), "sleep 30".to_owned()];
+    let environment = environment();
+    let launch = Launch {
+        program: Path::new(SHELL),
+        arguments: &arguments,
+        environment: &environment,
+        directory: Path::new("/"),
+        cpus: &[],
+    };
+    let cancellation = Cancellation::new();
+    let (mut child, group) = start(&launch, Stdio::null(), &cancellation).unwrap();
+    assert!(!has_exited(group));
+    kill_group(group);
+    wait_exit(group);
+    assert!(has_exited(group), "an exited leader stays unreaped");
+    assert_eq!(reap(&mut child, group, &cancellation).signal(), Some(9));
+}
+
+#[test]
+fn workloads_start_with_the_stop_signals_at_their_defaults_and_unblocked() {
+    use crate::test_support::{mask_of, signal_mask};
+    let this_thread = || std::fs::read_to_string("/proc/thread-self/status").unwrap();
+    let stopping = mask_of(&STOP_SIGNALS);
+    assert_eq!(STOP_SIGNALS.map(Signal::as_str), crate::role::STOP_SIGNALS);
+    crate::test_support::with_signals(
+        "runner::process::tests::workloads_start_with_the_stop_signals_at_their_defaults_and_unblocked",
+        &STOP_SIGNALS,
+        &STOP_SIGNALS,
+        || {
+            let execution = run(
+                "grep -E '^Sig(Ign|Blk):' /proc/self/status",
+                Duration::from_secs(20),
+                &Cancellation::new(),
+            );
+            assert!(execution.succeeded());
+            let status = String::from_utf8(execution.stdout).unwrap();
+            assert_eq!(signal_mask(&status, "SigIgn") & stopping, 0, "{status}");
+            assert_eq!(signal_mask(&status, "SigBlk") & stopping, 0, "{status}");
+            // What the child runs before it execs.
+            reset_stop_signals().unwrap();
+            let status = this_thread();
+            assert_eq!(signal_mask(&status, "SigIgn") & stopping, 0, "{status}");
+            assert_eq!(signal_mask(&status, "SigBlk") & stopping, 0, "{status}");
+        },
+    );
+}
+
+#[test]
+fn a_workload_dropped_before_it_is_reaped_is_killed_and_reaped() {
+    let arguments = vec!["-c".to_owned(), "sleep 30".to_owned()];
+    let environment = environment();
+    let launch = Launch {
+        program: Path::new(SHELL),
+        arguments: &arguments,
+        environment: &environment,
+        directory: Path::new("/"),
+        cpus: &[],
+    };
+    let cancellation = Cancellation::new();
+    let (child, group) = start(&launch, Stdio::null(), &cancellation).unwrap();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _workload = Unreaped {
+            child,
+            group,
+            cancellation: &cancellation,
+            reaped: false,
+        };
+        panic!("a defect while the workload runs");
+    }));
+    assert!(unwound.is_err());
+    assert!(
+        !Path::new(&format!("/proc/{group}")).exists(),
+        "the workload was killed and reaped"
+    );
+    assert!(
+        cancellation.0.active.lock().unwrap().is_empty(),
+        "the workload's group is no longer registered"
+    );
 }

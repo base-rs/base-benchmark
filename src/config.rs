@@ -1,6 +1,7 @@
 // Released under the MIT License.
 // Copyright, 2026, by Samuel Williams.
 
+use crate::role::{Role, RoleConfiguration};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -68,6 +69,9 @@ pub struct Scenario {
     /// The Cargo features its artifacts are built with: its own, or the package's, sorted and without duplicates. Scenarios with different features run different builds of each tree.
     #[serde(default)]
     pub features: Vec<String>,
+    /// Its services and driver, when it is a multi-process scenario; empty for a single-process workload. The role that runs the subject takes the scenario's arguments and variants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<Role>,
 }
 
 impl Scenario {
@@ -101,7 +105,14 @@ impl Scenario {
                 return Err(context(format!("baseline {baseline:?} is not a variant")));
             }
         }
-        Ok(())
+        let subject_arguments: Vec<&String> = self
+            .arguments
+            .iter()
+            .chain(&self.smoke_arguments)
+            .chain(&self.measure_arguments)
+            .chain(self.variants.iter().flat_map(|variant| &variant.arguments))
+            .collect();
+        crate::role::validate_roles(&self.roles, &subject_arguments, &|message| context(message))
     }
 }
 
@@ -146,40 +157,60 @@ struct ScenarioConfiguration {
     variants: Option<Vec<Variant>>,
     baseline: Option<String>,
     features: Option<Vec<String>>,
+    #[serde(default)]
+    role: Vec<RoleConfiguration>,
 }
 
 impl PackageConfiguration {
     /// Resolve package-level defaults into each scenario.
-    fn scenarios(&self) -> Vec<Scenario> {
-        self.scenario
-            .iter()
-            .map(|scenario| Scenario {
-                name: scenario.name.clone(),
-                arguments: self
-                    .arguments
-                    .iter()
-                    .chain(&scenario.arguments)
-                    .cloned()
-                    .collect(),
-                smoke_arguments: scenario
-                    .smoke_arguments
-                    .clone()
-                    .unwrap_or_else(|| self.smoke_arguments.clone()),
-                measure_arguments: scenario
-                    .measure_arguments
-                    .clone()
-                    .unwrap_or_else(|| self.measure_arguments.clone()),
-                variants: scenario
-                    .variants
-                    .clone()
-                    .unwrap_or_else(|| self.variants.clone()),
-                baseline: match &scenario.variants {
-                    Some(_) => scenario.baseline.clone(),
-                    None => scenario.baseline.clone().or_else(|| self.baseline.clone()),
-                },
-                features: canonical_features(
-                    scenario.features.as_deref().unwrap_or(&self.features),
-                ),
+    fn scenarios(self, package: &str) -> io::Result<Vec<Scenario>> {
+        let Self {
+            arguments,
+            smoke_arguments,
+            measure_arguments,
+            variants,
+            baseline,
+            features,
+            scenario,
+            ..
+        } = self;
+        scenario
+            .into_iter()
+            .map(|scenario| {
+                let context = |message: String| {
+                    invalid_input(format!("{package} scenario {:?}: {message}", scenario.name))
+                };
+                let roles = scenario
+                    .role
+                    .into_iter()
+                    .map(|role| role.resolve(&context))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Ok(Scenario {
+                    name: scenario.name.clone(),
+                    arguments: arguments
+                        .iter()
+                        .chain(&scenario.arguments)
+                        .cloned()
+                        .collect(),
+                    smoke_arguments: scenario
+                        .smoke_arguments
+                        .clone()
+                        .unwrap_or_else(|| smoke_arguments.clone()),
+                    measure_arguments: scenario
+                        .measure_arguments
+                        .clone()
+                        .unwrap_or_else(|| measure_arguments.clone()),
+                    baseline: match &scenario.variants {
+                        Some(_) => scenario.baseline.clone(),
+                        None => scenario.baseline.clone().or_else(|| baseline.clone()),
+                    },
+                    variants: scenario
+                        .variants
+                        .clone()
+                        .unwrap_or_else(|| variants.clone()),
+                    features: canonical_features(scenario.features.as_deref().unwrap_or(&features)),
+                    roles,
+                })
             })
             .collect()
     }
@@ -271,7 +302,9 @@ pub(crate) fn parse_metadata(metadata: &Value) -> io::Result<Vec<Suite>> {
                 )));
             }
         };
-        let mut scenarios = configuration.scenarios();
+        let profile = configuration.profile.clone();
+        let package_features = canonical_features(&configuration.features);
+        let mut scenarios = configuration.scenarios(&name)?;
         let mut scenario_names = BTreeSet::new();
         for scenario in &mut scenarios {
             scenario.validate(&name)?;
@@ -290,8 +323,8 @@ pub(crate) fn parse_metadata(metadata: &Value) -> io::Result<Vec<Suite>> {
             package: name,
             workspace_root: workspace_root.clone(),
             binary,
-            profile: configuration.profile,
-            features: canonical_features(&configuration.features),
+            profile,
+            features: package_features,
             scenarios,
         });
     }

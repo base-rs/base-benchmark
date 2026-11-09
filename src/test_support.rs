@@ -8,6 +8,7 @@ use crate::artifact::{
 };
 use crate::config::{Scenario, Suite, Variant};
 use crate::plan::{Mode, Plan, PlanOptions};
+use crate::role::{ReadyLine, Role, RoleKind, RoleProgram, Stop};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -107,6 +108,7 @@ pub fn suite(script: &Path, variants: &[&str]) -> Suite {
                 .collect(),
             baseline: None,
             features: Vec::new(),
+            roles: Vec::new(),
         }],
     }
 }
@@ -190,4 +192,141 @@ pub fn vendored_tree(directory: &Path) -> PathBuf {
     )
     .unwrap();
     tree
+}
+
+/// A service role named `name`, running `program`, ready on `pattern`, stopped with SIGTERM.
+pub fn service(name: &str, program: RoleProgram, arguments: &[&str], pattern: &str) -> Role {
+    Role {
+        name: name.to_owned(),
+        kind: RoleKind::Service,
+        program,
+        arguments: arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect(),
+        smoke_arguments: Vec::new(),
+        measure_arguments: Vec::new(),
+        ready: Some(ReadyLine {
+            pattern: pattern.to_owned(),
+            timeout_ms: 20_000,
+        }),
+        stop: Some(Stop::Signal {
+            signal: "SIGTERM".to_owned(),
+            grace_ms: 20_000,
+        }),
+    }
+}
+
+/// The external program `shell`, `/bin/sh`.
+pub fn shell() -> RoleProgram {
+    RoleProgram::External {
+        name: "shell".to_owned(),
+    }
+}
+
+/// A suite whose scenario `work` runs `service` as the subject in the service role `server`, ready on `ready {address}`, and the driver `client`, the external program `shell` running `driver` with the server's address and `smoke` or `measure`.
+pub fn roles_suite(service_script: &Path, driver: &Path, variants: &[&str]) -> Suite {
+    let mut suite = suite(service_script, variants);
+    suite.scenarios[0].roles = vec![
+        Role {
+            name: "client".to_owned(),
+            kind: RoleKind::Driver,
+            program: shell(),
+            arguments: vec![driver.display().to_string(), "{server.address}".to_owned()],
+            smoke_arguments: vec!["smoke".to_owned()],
+            measure_arguments: vec!["measure".to_owned()],
+            ready: None,
+            stop: None,
+        },
+        service("server", RoleProgram::Subject, &[], "ready {address}"),
+    ];
+    suite
+}
+
+/// A screening plan of one round of a suite with roles, running `/bin/sh` as the subject and as the external program `shell`.
+pub fn roles_plan(suite: Suite, lock: &Path) -> Plan {
+    let artifacts = manifest(vec![artifact(
+        "baseline",
+        ArtifactRole::Baseline,
+        Path::new(SHELL),
+    )]);
+    let mut options = PlanOptions::new(suite, "work", artifacts, Mode::Screening);
+    options.rounds = Some(1);
+    options.seed = Some(7);
+    options.lock = lock.to_owned();
+    options.timeout = Duration::from_secs(20);
+    options.programs = [("shell".to_owned(), PathBuf::from(SHELL))].into();
+    Plan::new(options).unwrap()
+}
+
+/// A mask of signals, such as `SigIgn` or `SigBlk`, from the `field` line of a `/proc` status file.
+pub fn signal_mask(status: &str, field: &str) -> u64 {
+    let mask = status
+        .lines()
+        .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+        .unwrap();
+    u64::from_str_radix(mask.trim(), 16).unwrap()
+}
+
+/// The mask of `signals`, as `/proc` status files show masks.
+pub fn mask_of(signals: &[nix::sys::signal::Signal]) -> u64 {
+    signals
+        .iter()
+        .fold(0, |mask, signal| mask | 1 << (*signal as i32 - 1))
+}
+
+/// Run the test named `test`, its path within the crate, again in a child process that starts with `ignored` signals ignored, as `&` in a non-interactive shell leaves `SIGINT` and `SIGQUIT` and `nohup` leaves `SIGHUP`, and `blocked` signals blocked, as a launcher's signal mask passes to what it starts, and require that it passes there. In that child, which first checks that the signals are ignored and blocked in the thread that runs the test, run `body` instead.
+pub fn with_signals(
+    test: &str,
+    ignored: &[nix::sys::signal::Signal],
+    blocked: &[nix::sys::signal::Signal],
+    body: impl FnOnce(),
+) {
+    const PASSED: &str = "BASE_BENCHMARK_TEST_SIGNALS_PASSED";
+    if let Some(passed) = std::env::var_os(PASSED) {
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        assert_eq!(
+            signal_mask(&status, "SigIgn") & mask_of(ignored),
+            mask_of(ignored),
+            "{ignored:?} are ignored"
+        );
+        assert_eq!(
+            signal_mask(&status, "SigBlk") & mask_of(blocked),
+            mask_of(blocked),
+            "{blocked:?} are blocked"
+        );
+        body();
+        std::fs::write(passed, "").unwrap();
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let passed = directory.path().join("passed");
+    // A shell ignores a signal for the programs it then runs with `trap ''`, as `nohup` does with `SIGHUP`.
+    let trap: String = ignored
+        .iter()
+        .map(|ignoring| format!("trap '' {}; ", ignoring.as_str().trim_start_matches("SIG")))
+        .collect();
+    let mut command = Command::new(SHELL);
+    command
+        .arg("-c")
+        .arg(format!("{trap}exec \"$0\" \"$@\""))
+        .arg(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--test-threads=1", "--nocapture"])
+        .env(PASSED, &passed);
+    // A child starts with the signal mask of the thread that spawns it, and a thread with its creator's, so block the signals in a thread of their own.
+    let blocking: nix::sys::signal::SigSet = blocked.iter().copied().collect();
+    let output = std::thread::spawn(move || {
+        blocking.thread_block().unwrap();
+        command.output().unwrap()
+    })
+    .join()
+    .unwrap();
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{report}");
+    // A filter that matches no test also passes.
+    assert!(passed.exists(), "{test} ran in the child: {report}");
 }

@@ -11,6 +11,9 @@ use base_benchmark::{
 };
 use std::path::Path;
 
+/// The record the fixture's driver prints.
+const RECORD: &str = r#"{"schema":"base-benchmark/process-record","version":2,"workload":"client","parameters":{},"samples":[{"operations":4,"metrics":[{"name":"wall_time","unit":"nanoseconds","phase":"measured","source":"wall","direction":"lower_is_better","measurement":{"kind":"total","value":400}}]}]}"#;
+
 fn workspace(path: &Path) -> Workspace {
     Workspace::new(support::workspace(path, ""))
 }
@@ -797,4 +800,107 @@ fn run_outputs_are_made_absolute() {
         )
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+}
+
+#[test]
+fn scenarios_with_roles_run_the_subject_as_a_service_under_a_driver() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    let addresses = directory.path().join("addresses");
+    let driver = directory.path().join("driver.sh");
+    std::fs::write(
+        &driver,
+        format!(
+            "echo \"$*\" >> '{}'\necho '{RECORD}'\n",
+            addresses.display()
+        ),
+    )
+    .unwrap();
+    let scenario = format!(
+        "\n[[package.metadata.base-benchmark.scenario]]\nname = \"hello\"\narguments = [\"serve\"]\nvariants = [{{ name = \"reference\" }}, {{ name = \"fast\", arguments = [\"fast\"] }}]\n\n[[package.metadata.base-benchmark.scenario.role]]\nname = \"server\"\nkind = \"service\"\nsubject = true\nready = \"listening on {{address}}\"\n\n[[package.metadata.base-benchmark.scenario.role]]\nname = \"client\"\nkind = \"driver\"\nexternal = \"shell\"\narguments = [\"{}\", \"{{server.address}}\"]\nsmoke-arguments = [\"smoke\"]\nmeasure-arguments = [\"measure\"]\n",
+        driver.display()
+    );
+    let workspace = Workspace::new(support::workspace(&project, &scenario));
+    let lock = directory.path().join("lock");
+    // Smoke runs every scenario, so they need the driver's program too.
+    let error = workspace
+        .smoke(
+            None,
+            Some(directory.path().join("unprovided")),
+            Some(lock.clone()),
+            &Cancellation::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("give its path with --program shell=PATH"),
+        "{error}"
+    );
+    let workspace = workspace.with_program("shell", "/bin/sh");
+    let campaigns = workspace
+        .smoke(
+            None,
+            Some(directory.path().join("smoke")),
+            Some(lock.clone()),
+            &Cancellation::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(campaigns.len(), 2);
+
+    let prepared = workspace
+        .prepare(
+            PrepareRequest {
+                output: Some(directory.path().join("prepared")),
+                ..PrepareRequest::default()
+            },
+            &Cancellation::new(),
+        )
+        .unwrap();
+    let request = RunRequest {
+        scenario: "hello".to_owned(),
+        output: Some(directory.path().join("campaign")),
+        role_cpus: [("client".to_owned(), vec![0])].into(),
+        ..request(&prepared.manifest_path, &lock)
+    };
+    let campaign = workspace
+        .run(request, &Cancellation::new(), &mut Vec::new())
+        .unwrap();
+    // The driver's record is each subject's sample, and the variant reaches only the subject.
+    let subjects: Vec<_> = campaign
+        .summary
+        .subjects
+        .iter()
+        .map(|subject| (subject.label.as_str(), subject.processes))
+        .collect();
+    assert_eq!(subjects, [("current/reference", 2), ("current/fast", 2)]);
+    assert!(
+        campaign
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("no CPU placement for role(s) server")),
+        "{:?}",
+        campaign.warnings
+    );
+    let entries = base_benchmark::read_entries(&campaign.output.join("samples.jsonl")).unwrap();
+    let addresses = std::fs::read_to_string(&addresses).unwrap();
+    for entry in &entries {
+        let server = &entry.roles[0];
+        let address = &server.captures["address"];
+        assert!(address.starts_with("127.0.0.1:"), "{address}");
+        assert_eq!(
+            server.signal,
+            Some(15),
+            "the service died from its stop signal"
+        );
+        assert_eq!(entry.roles[1].cpus, [0]);
+        assert!(
+            addresses.contains(&format!("{address} measure\n")),
+            "{addresses}"
+        );
+        // The fast variant's ready line carries its argument, which the pattern's single capture takes too.
+        assert_eq!(entry.subject.ends_with("fast"), address.ends_with(" fast"));
+    }
 }

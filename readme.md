@@ -5,13 +5,13 @@ Bake-independent Rust measurement and experiment tooling for Base projects.
 Workloads stay project-owned: a workload binary measures its own operations and writes one process record. `base-benchmark` does the rest:
 
 - builds labelled source trees into frozen executables with build and dependency provenance, plus same-source layout replicas;
-- runs every subject in seeded random rounds under a host-wide lock, from equal-length paths with a controlled environment and random stack padding, with CPU placement, deadlines, and process-group cleanup;
+- runs every subject in seeded random rounds under a host-wide lock, from equal-length paths with a controlled environment and random stack padding, with CPU placement, deadlines, and process-group cleanup, alone or as one role of a session with services and a driver;
 - rejects malformed or inconsistent evidence, including subjects that did different work;
 - summarizes paired changes with explicit metric scopes, resolution-aware ratios, sign tests, and interpretation warnings.
 
 The `base-benchmark` command and the [`bake-benchmark`](https://github.com/base-rs/bake-benchmark) tasks call the same operations. No Python is involved.
 
-**Status:** an initial release, validated by migrating the `base-html` rendering benchmark. Multi-process server/client roles, downstream patch preparation, and phase-matched hardware counters are not implemented yet; see [architecture](context/architecture.md).
+**Status:** an initial release, validated by migrating the `base-html` rendering benchmark. Multi-process scenarios, with services such as a server and a driver such as a load client, are being implemented: their session lifecycle is, and the driver's measured window, service CPU, and placement checks are not yet. Downstream patch preparation and phase-matched hardware counters are not implemented yet; see [architecture](context/architecture.md).
 
 ## Usage
 

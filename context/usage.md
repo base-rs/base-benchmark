@@ -57,6 +57,39 @@ Keys are `binary` (needed only with several binary targets), `profile` (default 
 
 A scenario that needs other features, such as a diagnostic build that counts allocations or reports internal statistics, sets its own `features`. Preparation builds each tree once for every distinct feature set of the scenarios it prepares, and a run uses only the builds with exactly its scenario's features. Timed scenarios keep the package's features, so a diagnostic feature never reaches their builds. `--scenario NAME`, repeatable, prepares only the feature sets those scenarios need; a run of a scenario whose features were not prepared fails and says so. Each subject runs `arguments`, then its variant's arguments, then the smoke arguments in smoke mode or the measure arguments otherwise, so the two never collide.
 
+## Declare a multi-process scenario
+
+A scenario can declare **roles**, each one process, in its own process group, for every sample: **services**, such as a server, and exactly one **driver**, such as a load client. Exactly one role runs the **subject**, the artifact and variant being compared, with the scenario's `arguments`, its variants', and its `smoke-arguments` or `measure-arguments`, as a single-process scenario runs it; every other role runs the same program with the same arguments for every subject, so variants change only the subject. A role runs the subject with `subject = true`, or a program outside the workspace with `external = "NAME"`, whose path on the measuring host each run gives with `--program NAME=PATH`, never in package metadata.
+
+```toml
+[[package.metadata.base-benchmark.scenario]]
+name = "hello"
+variants = [{ name = "native", arguments = ["base-native"] }, { name = "hyper", arguments = ["hyper-tokio"] }]
+
+[[package.metadata.base-benchmark.scenario.role]]
+name = "server"
+kind = "service"
+subject = true
+ready = "{address}"
+
+[[package.metadata.base-benchmark.scenario.role]]
+name = "client"
+kind = "driver"
+external = "load"
+arguments = ["closed", "--address", "{server.address}", "--connections", "64"]
+smoke-arguments = ["--duration", "200ms"]
+measure-arguments = ["--warmup", "2s", "--duration", "8s"]
+```
+
+Each sample is one **session**. Every executable is verified first, external programs included. Services start in declared order, and each is waited on until it prints, on stdout, a line matching its `ready` pattern, within `ready-timeout-seconds` (10 by default). A pattern matches a whole line: text outside braces must appear exactly, and each `{NAME}` captures a non-empty part; two captures need text between them. Earlier captures take precedence, each taking the longest part that lets the rest of the line match, so `listening on {host}:{port}` splits `listening on [::1]:8080` at its last colon. Matching takes time linear in the line's length, and lines longer than 64 KiB never match. `{{` and `}}` are literal braces. Later roles receive captured values in their arguments as `{ROLE.NAME}`, so endpoints, such as the address a server bound to port 0, are passed on rather than fixed in advance. Braces in the arguments of a multi-process scenario's roles, the subject's included, follow the same rule: write `{{` and `}}` for literal braces, as in `{{"to":"{server.address}"}}`; any other brace, and a reference to a value that no service started before the role captures, is an error when the scenario is planned. Then the driver runs to completion, and the services are stopped in reverse order: by default with `SIGTERM` to the service's process group, then `SIGKILL` to the group if it has not exited after `stop-grace-seconds` (10 by default). `stop` names another signal, `SIGINT`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`, or `SIGUSR2`, or is `"exit"` for a service that exits by itself once the driver has finished. Drivers have no `ready` or `stop`.
+
+- **The sample.** The driver writes the sample's record, exactly as a single-process workload does: its operations, its workload name, signature, and parameters, which the campaign checks as it checks any workload's. Leave values that change between samples without changing the work, such as the server's address, out of its parameters.
+- **Launch controls.** Every role starts as a single-process workload does: a cleared, recorded environment with its own stack padding, and the workspace root as its working directory. Every role, like every workload, also starts with the stop signals at their default dispositions and unblocked, even when `base-benchmark` itself started with them ignored, as under `nohup`, or blocked, as a launcher's signal mask passes to what it starts. The subject is staged under an equal-length path; external programs run from their resolved paths.
+- **Placement.** `--role-cpus ROLE=CPUS`, once for each role, pins each role to its own CPUs; `--cpus` places only single-process scenarios. Recorded campaigns need a CPU set for every role, and refuse roles whose CPU sets include the same CPU; summaries warn about roles without one.
+- **Deadline.** `--timeout-seconds` covers the whole session. When it passes, when the run is cancelled, or when any role fails, every role's process group still running is killed, in reverse start order, and every role is reaped, also in reverse start order, before the host lock is released.
+- **Failures.** A service that never prints its ready line, exits before it is stopped (or, for `stop = "exit"`, before the driver has finished), or does not stop successfully, and a driver that exits unsuccessfully or writes an invalid record, stop the run with an error naming the role, as a failed sample does. A service that prints its ready line and has exited by the time it is to be stopped has exited before it was stopped, even if its exit is noticed before its ready line is read; one that exits without printing it has exited before it was ready. A service still running when its stop signal is sent is judged by how it then stops, so one that exits by itself with status 0 at that moment cannot be told apart from one that stopped successfully. A service stops successfully when it exits with status 0 or dies from its stop signal. A service killed after its grace period is journalled as `killed_after_grace` and does not fail the sample.
+- **The journal.** Each sample of `samples.jsonl` lists every role, also when the sample failed: its command with captured values, CPUs, stack padding, executable hash, host, ready line and captures, exit status, and the end of its stderr, and for a service, of its stdout before the ready line. The plan in `metadata.json` records each external program's resolved path and SHA-256, and a program changed during the campaign fails it.
+
 ## Run it
 
 Add the Bake tasks to the private `bake/` package with `cargo add --manifest-path bake/Cargo.toml bake-benchmark` and `cargo bake --regenerate`. The `base-benchmark` command offers the same operations, options, and defaults; only the spelling differs where Bake has its own conventions. Run `cargo bake benchmark:run --help` or `base-benchmark help` for every option.
@@ -66,7 +99,7 @@ Add the Bake tasks to the private `bake/` package with `cargo add --manifest-pat
 | `benchmark:list` | Show discovered suites, scenarios, variants, and each scenario's resolved baseline. Nothing is built. |
 | `benchmark:smoke` | Build the current tree and run every scenario once with smoke arguments. Not performance evidence; no comparisons are computed. |
 | `benchmark:prepare --tree LABEL=PATH ...` | Build trees, baseline first, into frozen artifacts plus `--replicas N` layout replicas of the baseline (one by default for two or more trees, otherwise none), once for each feature set of the scenarios, or of those named with `--scenario`. `--overlay true` builds every tree with this workspace's workload package. Writes `artifacts.json`. |
-| `benchmark:run SCENARIO --artifacts FILE` | Collect `--rounds` seeded random rounds under the host lock. `--mode` is `screening` (default) or `recorded`. `--cpus` pins workloads; `--perf-event` adds whole-process counters; `--stack-padding false` disables stack padding. |
+| `benchmark:run SCENARIO --artifacts FILE` | Collect `--rounds` seeded random rounds under the host lock. `--mode` is `screening` (default) or `recorded`. `--cpus` pins workloads, and `--role-cpus ROLE=CPUS` each role of a multi-process scenario; `--program NAME=PATH` gives an external program's path; `--perf-event` adds whole-process counters to single-process scenarios; `--stack-padding false` disables stack padding. |
 | `benchmark:summarize DIR` | Regenerate `summary.json` from a complete campaign's raw samples. |
 
 ### Comparing revisions with the current workload
@@ -77,12 +110,12 @@ Scenario arguments always come from the current workspace, so every tree must co
 - **The tree's workspace.** It must list the package as a member, by name or with a glob, and define whatever the package inherits with `workspace = true`. Inherited dependencies take the tree's versions and features, and the tree's `[patch]` applies.
 - **Provenance.** Each artifact records the overlaid package's path and Git state, read once per preparation, and recorded campaigns require it to be committed and unmodified. Reports name the overlaid package and the artifacts built with it, and list each artifact's lockfile changes, and `summary.json` records the same in `overlays`, so an overlaid comparison describes itself.
 
-Every task except `summarize` accepts `--manifest-path` for a standalone workspace, such as a benchmark suite excluded from the main workspace. Relative paths are resolved against the project root. The first SIGINT, SIGTERM, or SIGHUP stops preparation, writing no manifest and reporting it as cancelled: after the build in progress, or at once when the signal reaches Cargo too, as Ctrl-C does; or it kills the running workload's process group and records the campaign as cancelled; a second signal exits immediately.
+Every task except `summarize` accepts `--manifest-path` for a standalone workspace, such as a benchmark suite excluded from the main workspace. Relative paths are resolved against the project root. The first SIGINT, SIGTERM, or SIGHUP stops preparation, writing no manifest and reporting it as cancelled: after the build in progress, or at once when the signal reaches Cargo too, as Ctrl-C does; or it kills the running workload's process group and records the campaign as cancelled; a second signal exits immediately. This holds even when `base-benchmark` started with these signals blocked; signals it started with ignored, as `nohup` ignores `SIGHUP`, stay ignored on Linux.
 
 Recorded runs require:
 
 - at least 10 rounds;
-- explicit CPU placement, a `--decision-rule`, and `--idle-host true`;
+- explicit CPU placement, for every role of a multi-process scenario, a `--decision-rule`, and `--idle-host true`;
 - committed, unmodified trees and out-of-tree path dependencies;
 - the same toolchain, Cargo version, build environment variables, and Cargo configuration for every artifact;
 - a layout replica when comparing separately built trees.
@@ -107,7 +140,7 @@ base-benchmark summarize target/base-benchmark/periodic-screening-TIME
 - **Outputs come back.** Commands get an explicit `--output`, the same default directory a local run would use. Afterwards that directory is copied back, also when the command failed or was cancelled, so such campaigns can be inspected locally. A command that failed before creating it has nothing to copy back, so its own error is all that is reported. A mirrored output whose local copy is gone is cleared first, so the command sees a new directory. Downloaded artifact manifests and campaigns name the host's paths: run prepared artifacts on the same host, and summarize campaigns anywhere.
 - **Interruption.** SIGINT, SIGTERM, or SIGHUP locally, or a dropped connection, sends the host's command SIGTERM, and the cancelled campaign is still copied back when the connection allows. A remote `prepare` stops after the build in progress. SSH can still prompt on the terminal, for example for a password. If the connection is lost before the output comes back, it remains only in the host's mirror; running again with the same `--output` clears it, so copy it first if it matters.
 - **The command on the host.** By default the host runs the crates.io release of this version, installed with `cargo install --locked` under `DIRECTORY/tool` when it is missing; an unreleased build needs `--remote-program PATH`, a path on the host, such as a build of the same revision there. Remote scripts run with `sh` from standard input, whatever the remote user's login shell.
-- **Other arguments** pass unchanged and are checked by the host's command. `--lock` names a file on the host; a relative one is relative to the remote user's home.
+- **Other arguments** pass unchanged and are checked by the host's command. `--lock` and `--program` name files on the host; a relative one is relative to the remote user's home.
 - **Requirements.** `ssh`, and `rsync` 3.2.3 or later, on both machines, and a POSIX shell and Cargo on the host. `BASE_BENCHMARK_SSH` and `BASE_BENCHMARK_RSYNC` name other local programs. The host lock, CPU placement, and the idle-host declaration all apply to the host. Preparation does not take the host lock, so prepare before measuring rather than during another campaign.
 
 ## How samples are launched

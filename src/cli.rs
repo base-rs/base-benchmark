@@ -20,16 +20,20 @@ usage: base-benchmark COMMAND [--name value]...
   list       [--manifest-path PATH]
   prepare    [--manifest-path PATH] [--package NAME] [--tree LABEL=PATH]... [--replicas N] [--output DIR]
              [--scenario NAME]... [--overlay true]
-  smoke      [--manifest-path PATH] [--package NAME] [--output DIR] [--lock PATH]
+  smoke      [--manifest-path PATH] [--package NAME] [--output DIR] [--lock PATH] [--program NAME=PATH]...
   run        SCENARIO --artifacts FILE [--mode smoke|screening|recorded] [--package NAME]
-             [--manifest-path PATH] [--rounds N] [--seed N] [--cpus 0,2] [--perf-event EVENT]...
-             [--timeout-seconds N] [--lock PATH] [--output DIR] [--decision-rule TEXT] [--idle-host true]
-             [--stack-padding false]
+             [--manifest-path PATH] [--rounds N] [--seed N] [--cpus 0,2] [--role-cpus ROLE=0,2]...
+             [--program NAME=PATH]... [--perf-event EVENT]... [--timeout-seconds N] [--lock PATH]
+             [--output DIR] [--decision-rule TEXT] [--idle-host true] [--stack-padding false]
   summarize  DIR
   version
 
+--cpus places a single-process scenario's workloads; --role-cpus places each role of a multi-process scenario.
+--program gives the path of an external program a role runs, on the host that runs the roles.
+
 Prepare, run, and smoke also accept --host HOST [--remote-directory DIR] [--remote-program PATH] to run on
-another host over SSH, mirroring local paths there with rsync and copying the output back.
+another host over SSH, mirroring local paths there with rsync and copying the output back. Program paths name
+files on that host and pass unchanged.
 
 Run, smoke, and summarize print a report on stdout; list and prepare print JSON. Progress goes to stderr.";
 
@@ -102,6 +106,7 @@ fn execute(arguments: Vec<String>, out: &mut dyn Write, errors: &mut dyn Write) 
         }
         "smoke" => {
             let workspace = Workspace::new(options.path("manifest-path")?);
+            let workspace = options.programs(workspace)?;
             let package = options.take("package")?;
             let output = options.take("output")?.map(PathBuf::from);
             let lock = options.take("lock")?.map(PathBuf::from);
@@ -116,6 +121,7 @@ fn execute(arguments: Vec<String>, out: &mut dyn Write, errors: &mut dyn Write) 
         }
         "run" => {
             let workspace = Workspace::new(options.path("manifest-path")?);
+            let workspace = options.programs(workspace)?;
             let request = RunRequest {
                 package: options.take("package")?,
                 mode: options.parsed("mode")?,
@@ -126,6 +132,14 @@ fn execute(arguments: Vec<String>, out: &mut dyn Write, errors: &mut dyn Write) 
                     .map(|cpus| parse_cpus(&cpus))
                     .transpose()?
                     .unwrap_or_default(),
+                role_cpus: options
+                    .take_all("role-cpus")
+                    .iter()
+                    .map(|value| {
+                        let (role, cpus) = assignment(value, "ROLE=CPUS")?;
+                        Ok((role.to_owned(), parse_cpus(cpus)?))
+                    })
+                    .collect::<io::Result<_>>()?,
                 perf_events: options.take_all("perf-event"),
                 timeout: options.parsed("timeout-seconds")?.map(Duration::from_secs),
                 lock: options.take("lock")?.map(PathBuf::from),
@@ -156,6 +170,14 @@ fn execute(arguments: Vec<String>, out: &mut dyn Write, errors: &mut dyn Write) 
             "unknown command {command:?}\n{USAGE}"
         ))),
     }
+}
+
+/// Split `NAME=VALUE`, where neither may be empty.
+fn assignment<'a>(value: &'a str, form: &str) -> io::Result<(&'a str, &'a str)> {
+    value
+        .split_once('=')
+        .filter(|(name, value)| !name.is_empty() && !value.is_empty())
+        .ok_or_else(|| invalid_input(format!("expected {form}, got {value:?}")))
 }
 
 fn print_json(out: &mut dyn Write, value: &impl serde::Serialize) -> io::Result<()> {
@@ -214,6 +236,20 @@ impl Options {
     fn required(&mut self, name: &str) -> io::Result<String> {
         self.take(name)?
             .ok_or_else(|| invalid_input(format!("--{name} is required")))
+    }
+
+    /// Add every `--program NAME=PATH` to `workspace`.
+    fn programs(&mut self, mut workspace: Workspace) -> io::Result<Workspace> {
+        for value in self.take_all("program") {
+            let (name, path) = assignment(&value, "NAME=PATH")?;
+            if workspace.programs.contains_key(name) {
+                return Err(invalid_input(format!(
+                    "--program {name} was given more than once"
+                )));
+            }
+            workspace = workspace.with_program(name, path);
+        }
+        Ok(workspace)
     }
 
     /// The workspace manifest, `Cargo.toml` by default.

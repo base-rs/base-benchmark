@@ -33,6 +33,7 @@ fn entry(
         stderr: String::new(),
         record: Some(ProcessRecord::new("fixture", serde_json::json!({})).with_sample(sample)),
         process_metrics,
+        roles: Vec::new(),
     }
 }
 

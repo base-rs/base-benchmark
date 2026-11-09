@@ -724,4 +724,44 @@ fn remote_commands_mirror_their_inputs_and_bring_back_their_outputs() {
         "{error}"
     );
     canceller.join().unwrap();
+
+    // External programs and role placement name the host's programs and CPUs, so they pass unchanged rather than being mirrored.
+    let recorded = directory.path().join("recorded");
+    let recording = script(
+        &directory.path().join("recording"),
+        &format!(
+            "#!/bin/sh
+printf '%s\\n' \"$@\" > '{}'\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) mkdir -p \"$2\"; shift;; esac; shift; done\n",
+            recorded.display()
+        ),
+    );
+    let recording = Remote {
+        program: Some(recording.display().to_string()),
+        ..remote.clone()
+    };
+    recording
+        .execute_now(
+            "run",
+            arguments(&[
+                "work",
+                "--manifest-path",
+                &plain,
+                "--artifacts",
+                &prepared.join("artifacts.json").display().to_string(),
+                "--program",
+                "load=/opt/load/bin/base-benchmark-load",
+                "--role-cpus",
+                "server=2-3",
+                "--output",
+                &directory.path().join("passed").display().to_string(),
+            ]),
+        )
+        .unwrap();
+    let recorded = std::fs::read_to_string(&recorded).unwrap();
+    assert!(
+        recorded.contains(
+            "\n--program\nload=/opt/load/bin/base-benchmark-load\n--role-cpus\nserver=2-3\n"
+        ),
+        "{recorded}"
+    );
 }

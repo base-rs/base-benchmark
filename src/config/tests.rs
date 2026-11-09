@@ -250,3 +250,75 @@ fn scenarios_inherit_or_replace_the_package_features_in_canonical_order() {
     assert_eq!(features("replaces"), ["allocations", "diagnostics"]);
     assert!(features("none").is_empty());
 }
+
+#[test]
+fn scenarios_declare_roles() {
+    let configuration = json!({
+        "arguments": ["--threads", "1"],
+        "scenario": [{
+            "name": "hello",
+            "arguments": ["serve"],
+            "variants": [{ "name": "base" }, { "name": "hyper", "arguments": ["hyper"] }],
+            "role": [
+                { "name": "client", "kind": "driver", "external": "load", "arguments": ["closed", "--address", "{server.address}"] },
+                { "name": "server", "kind": "service", "subject": true, "ready": "{address}", "stop": "SIGINT" },
+            ],
+        }, { "name": "plain" }],
+    });
+    let suites = parse_metadata(&metadata(configuration, &["workload"])).unwrap();
+    let hello = suites[0].scenario("hello").unwrap();
+    assert_eq!(hello.arguments, ["--threads", "1", "serve"]);
+    assert_eq!(
+        hello
+            .roles
+            .iter()
+            .map(|role| (role.name.as_str(), role.kind))
+            .collect::<Vec<_>>(),
+        [
+            ("client", crate::role::RoleKind::Driver),
+            ("server", crate::role::RoleKind::Service)
+        ]
+    );
+    assert!(suites[0].scenario("plain").unwrap().roles.is_empty());
+    // Listings show roles only for scenarios that have them.
+    let listed = serde_json::to_value(&suites[0]).unwrap();
+    assert!(listed["scenarios"][0]["roles"].is_array());
+    assert!(listed["scenarios"][1].get("roles").is_none());
+
+    for (role, message) in [
+        (
+            json!([{ "name": "client", "kind": "driver", "subject": true, "ready": "x" }]),
+            "scenario \"a\": role \"client\": a driver runs to completion",
+        ),
+        (
+            json!([{ "name": "client", "kind": "driver", "external": "load" }]),
+            "scenario \"a\": exactly one role runs the subject",
+        ),
+        (
+            json!([{ "name": "client", "kind": "driver", "subject": true, "unknown": 1 }]),
+            "unknown field",
+        ),
+    ] {
+        let value = metadata(
+            scenario(json!({ "name": "a", "role": role })),
+            &["workload"],
+        );
+        let error = parse_metadata(&value).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+    // The subject's arguments, including its variants', may refer only to services that start before it.
+    let value = metadata(
+        scenario(json!({
+            "name": "a",
+            "variants": [{ "name": "x", "arguments": ["{client.address}"] }],
+            "role": [{ "name": "client", "kind": "driver", "subject": true }],
+        })),
+        &["workload"],
+    );
+    assert!(
+        parse_metadata(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("{client.address} names no value")
+    );
+}
