@@ -380,6 +380,58 @@ pub(crate) fn has_exited(group: i32) -> bool {
     status != Some(Ok(WaitStatus::StillAlive))
 }
 
+/// A process's CPU time, read from outside it.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CpuTime {
+    /// Every thread's, including those that have exited, from the process's CPU-time clock, in nanoseconds. Child processes are not included.
+    pub total_ns: u64,
+    /// The kernel's division of it between user and system time, in clock ticks, from `/proc/PID/stat`.
+    pub user_ticks: u64,
+    pub system_ticks: u64,
+}
+
+/// The CPU time of process `pid`, or `None` when it cannot be read, as when the process is gone.
+#[cfg(target_os = "linux")]
+pub(crate) fn cpu_time(pid: i32) -> Option<CpuTime> {
+    use nix::time::{clock_getcpuclockid, clock_gettime};
+    let total = clock_getcpuclockid(Pid::from_raw(pid))
+        .and_then(clock_gettime)
+        .ok();
+    let split = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat_times(&stat));
+    total
+        .zip(split)
+        .map(|(total, (user_ticks, system_ticks))| CpuTime {
+            total_ns: u64::try_from(total.tv_sec()).unwrap_or(0) * 1_000_000_000
+                + u64::try_from(total.tv_nsec()).unwrap_or(0),
+            user_ticks,
+            system_ticks,
+        })
+}
+
+/// The user and system time, in clock ticks, from the text of `/proc/PID/stat`: its 14th and 15th fields. The command, the second, is in parentheses and may contain spaces, so fields are counted after its closing parenthesis.
+#[cfg(target_os = "linux")]
+pub(crate) fn stat_times(stat: &str) -> Option<(u64, u64)> {
+    stat.rsplit_once(") ").and_then(|(_, fields)| {
+        let mut fields = fields.split_whitespace().skip(11);
+        Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+    })
+}
+
+/// The clock ticks per second of `/proc` times, `USER_HZ`.
+#[cfg(target_os = "linux")]
+pub(crate) fn ticks_per_second() -> u64 {
+    use nix::unistd::{SysconfVar, sysconf};
+    sysconf(SysconfVar::CLK_TCK)
+        .ok()
+        .flatten()
+        .and_then(|ticks| u64::try_from(ticks).ok())
+        .filter(|ticks| *ticks > 0)
+        .unwrap_or(100)
+}
+
 /// Kill what remains of an exited leader's group, then reap the leader.
 #[cfg(target_os = "linux")]
 pub(crate) fn reap(

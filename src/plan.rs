@@ -187,6 +187,9 @@ pub struct PlannedRole {
     pub cpus: Vec<usize>,
     pub ready: Option<ReadyLine>,
     pub stop: Option<Stop>,
+    /// Variables it receives in addition to the plan's environment: for the driver, `BASE_BENCHMARK_CONTROL`, which tells it how to send its window markers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
 }
 
 /// A program outside the workspace that a role runs, identified on the measuring host. Its hash is verified before every sample, so a program changed during the campaign fails it.
@@ -573,6 +576,13 @@ fn plan_roles(
                 .unwrap_or_default(),
             ready: role.ready.clone(),
             stop: role.stop.clone(),
+            environment: match role.kind {
+                RoleKind::Service => BTreeMap::new(),
+                RoleKind::Driver => BTreeMap::from([(
+                    crate::window::CONTROL_VARIABLE.to_owned(),
+                    crate::window::CONTROL_STDIO.to_owned(),
+                )]),
+            },
         });
     }
     Ok((roles, programs))

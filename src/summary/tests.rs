@@ -717,7 +717,7 @@ fn quantiles_are_compared_only_at_the_same_quantile() {
     assert_eq!(serialized, serde_json::json!({"quantile": 0.99}));
     let parsed: Statistic = serde_json::from_value(serialized).unwrap();
     assert_eq!(parsed, Statistic::Quantile(0.99));
-    assert_eq!(summary.version, 2);
+    assert_eq!(summary.version, SUMMARY_VERSION);
 }
 
 #[test]
@@ -947,4 +947,87 @@ fn overlaid_artifacts_and_their_lockfile_changes_are_described() {
     ] {
         assert!(report.contains(expected), "{expected}: {report}");
     }
+}
+
+#[test]
+fn service_cpu_over_the_window_is_divided_only_into_approximate_cpu_per_request() {
+    use crate::role::RoleKind;
+    use crate::runner::RoleEntry;
+    let plan = plan(
+        Path::new("/work.sh"),
+        &[],
+        &[("baseline", ArtifactRole::Baseline)],
+        Path::new("/lock"),
+    );
+    let window = |metric: Metric| metric.with_phase(Phase::Window);
+    let mut sample = entry(
+        "baseline",
+        1,
+        vec![wall(1000)],
+        vec![Metric::total("cycles", Unit::Count, 500).with_phase(Phase::Process)],
+    );
+    sample.roles = vec![RoleEntry {
+        role: "server".to_owned(),
+        kind: RoleKind::Service,
+        host: None,
+        command: Vec::new(),
+        cpus: Vec::new(),
+        stack_padding: None,
+        executable_sha256: String::new(),
+        started: true,
+        ready_line: None,
+        captures: Default::default(),
+        exit_code: Some(0),
+        signal: None,
+        killed_after_grace: false,
+        stdout: String::new(),
+        stderr: String::new(),
+        window: vec![
+            window(Metric::total("cpu_time", Unit::Nanoseconds, 1000).with_source(Source::Rusage)),
+            window(
+                Metric::unavailable("user_cpu_time", Unit::Nanoseconds, "gone")
+                    .with_source(Source::Rusage),
+            ),
+            window(Metric::total("elapsed", Unit::Nanoseconds, 7000).with_source(Source::Wall)),
+        ],
+    }];
+    let summary = summarize(&plan, &[sample]);
+    let subject = &summary.subjects[0];
+    let metric = |name: &str| {
+        subject
+            .metrics
+            .iter()
+            .find(|metric| metric.name == name)
+            .unwrap_or_else(|| panic!("{name}"))
+    };
+    let total = metric("server/cpu_time");
+    assert_eq!(
+        (total.phase, total.statistic, total.direction),
+        (Phase::Window, Statistic::Total, Direction::Neutral)
+    );
+    assert_eq!(total.distribution.unwrap().median, 1000.0);
+    // The driver's record has 10 operations.
+    let per_request = metric("server/cpu_time_per_operation");
+    assert_eq!(
+        (per_request.statistic, per_request.direction),
+        (Statistic::ApproximatePerOperation, Direction::LowerIsBetter)
+    );
+    assert_eq!(per_request.distribution.unwrap().median, 100.0);
+    assert_eq!(metric("server/user_cpu_time_per_operation").unavailable, 1);
+    // Only CPU times are divided, and process totals never are.
+    assert_eq!(metric("server/elapsed").statistic, Statistic::Total);
+    assert!(
+        subject
+            .metrics
+            .iter()
+            .all(|metric| metric.name != "server/elapsed_per_operation")
+    );
+    assert_eq!(metric("cycles").statistic, Statistic::Total);
+    assert!(
+        summary
+            .report()
+            .contains("server/cpu_time_per_operation    100.000 ns/op, approximate"),
+        "{}",
+        summary.report()
+    );
 }

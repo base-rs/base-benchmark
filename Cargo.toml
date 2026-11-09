@@ -19,7 +19,7 @@ reviewers = ["base-rs/maintainers"]
 [features]
 default = ["runner"]
 # Preparation, collection, summaries, and the `base-benchmark` command. Workloads need only records and `Interval`: depend with `default-features = false`.
-runner = ["dep:sha2", "dep:signal-hook", "dep:toml", "nix/fs", "nix/process", "nix/sched", "nix/signal"]
+runner = ["dep:sha2", "dep:signal-hook", "dep:toml", "nix/feature", "nix/fs", "nix/process", "nix/sched", "nix/signal", "nix/time"]
 
 [[bin]]
 name = "base-benchmark"

@@ -334,6 +334,28 @@ fn exits_are_observed_without_reaping() {
 }
 
 #[test]
+fn cpu_time_is_read_from_outside_the_process() {
+    let own = cpu_time(i32::try_from(std::process::id()).unwrap()).unwrap();
+    assert!(own.total_ns > 0);
+    assert_eq!(cpu_time(i32::MAX), None, "a process that does not exist");
+    // Fields are numbered from 1, so after the command, the 2nd, come the state, the 3rd, and 10 more before the user time, the 14th.
+    assert_eq!(
+        stat_times("1 (a) b) S 4 5 6 7 8 9 10 11 12 13 14 15 16"),
+        Some((14, 15))
+    );
+    for malformed in [
+        "1 a S 4",
+        "1 (a) S 4 5 6 7 8 9 10 11 12 13",
+        "1 (a) S 4 5 6 7 8 9 10 11 12 13 x 15",
+        "1 (a) S 4 5 6 7 8 9 10 11 12 13 14",
+        "1 (a) S 4 5 6 7 8 9 10 11 12 13 14 y",
+    ] {
+        assert_eq!(stat_times(malformed), None, "{malformed}");
+    }
+    assert!(ticks_per_second() > 0);
+}
+
+#[test]
 fn workloads_start_with_the_stop_signals_at_their_defaults_and_unblocked() {
     use crate::test_support::{mask_of, signal_mask};
     let this_thread = || std::fs::read_to_string("/proc/thread-self/status").unwrap();

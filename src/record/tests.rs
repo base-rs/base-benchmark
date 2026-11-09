@@ -68,6 +68,17 @@ fn negative_zero_quantiles_are_the_minimum() {
 }
 
 #[test]
+fn records_cannot_report_window_metrics() {
+    rejects(
+        ProcessRecord::new("fixture", json!({})).with_sample(
+            Sample::new(1)
+                .with(Metric::total("cpu_time", Unit::Nanoseconds, 1).with_phase(Phase::Window)),
+        ),
+        "cpu_time: window metrics are measured by the runner",
+    );
+}
+
+#[test]
 fn structural_errors_are_rejected() {
     rejects(
         ProcessRecord {
@@ -165,7 +176,15 @@ fn only_measured_totals_are_normalized_by_operations() {
         measured.clone().with_phase(Phase::Process).per_operation(4),
         None
     );
-    assert_eq!(measured.with_phase(Phase::Attached).per_operation(4), None);
+    assert_eq!(
+        measured
+            .clone()
+            .with_phase(Phase::Attached)
+            .per_operation(4),
+        None
+    );
+    // A service's totals over the driver's window are never normalized by a record's own operations.
+    assert_eq!(measured.with_phase(Phase::Window).per_operation(4), None);
     assert_eq!(
         Metric::mean("b", Unit::Nanoseconds, 3.0)
             .with_phase(Phase::Process)

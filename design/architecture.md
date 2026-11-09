@@ -40,7 +40,7 @@ Tests cover:
 - journal failure reporting;
 - recorded prerequisites, including path-dependency state and build settings;
 - layout replica preparation, exclusive creation, and cleanup after a failed build, and cancellation between builds;
-- normalization only of measured-phase totals, except, once delivered, the approximate service CPU per request over the driver's window that [multi-process roles](roles.md) requirement 9 adds;
+- normalization only of measured-phase totals, except the approximate service CPU per request over the driver's window that [multi-process roles](roles.md) requirement 9 adds;
 - all-or-nothing resolution-aware ratios, ties below the quantum, and the exact sign test;
 - incompatible and missing metrics between subjects;
 - empty smoke pairs;

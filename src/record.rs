@@ -251,6 +251,12 @@ impl Metric {
         if self.name.trim().is_empty() {
             return Err(invalid("metric name is empty"));
         }
+        if self.phase == Phase::Window {
+            return Err(invalid(format!(
+                "{}: window metrics are measured by the runner, not reported in records",
+                self.name
+            )));
+        }
         if self.resolution == Some(0) {
             return Err(invalid(format!(
                 "{}: resolution must be positive",
@@ -320,6 +326,8 @@ pub enum Phase {
     Attached,
     /// The whole process lifetime, including startup, preparation, warmup, and shutdown.
     Process,
+    /// A service of a multi-process scenario, measured by the runner between the driver's window markers. Only the runner records these, never a workload's record.
+    Window,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
