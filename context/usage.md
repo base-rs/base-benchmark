@@ -160,6 +160,7 @@ base-benchmark summarize target/base-benchmark/periodic-screening-TIME
 - **The command on the host.** By default the host runs the crates.io release of this version, installed with `cargo install --locked` under `DIRECTORY/tool` when it is missing; an unreleased build needs `--remote-program PATH`, a path on the host, such as a build of the same revision there. Remote scripts run with `sh` from standard input, whatever the remote user's login shell.
 - **Other arguments** pass unchanged and are checked by the host's command. `--lock` and `--program` name files on the host; a relative one is relative to the remote user's home.
 - **Requirements.** `ssh`, and `rsync` 3.2.3 or later, on both machines, and a POSIX shell and Cargo on the host. `BASE_BENCHMARK_SSH` and `BASE_BENCHMARK_RSYNC` name other local programs. The host lock, CPU placement, and the idle-host declaration all apply to the host. Preparation does not take the host lock, so prepare before measuring rather than during another campaign.
+- **Host documents.** The hosts that Base projects measure on are each described once, in base-benchmark's [hosts](https://github.com/base-rs/base-benchmark/blob/main/hosts/readme.md): hardware, settings, how to measure there, and the commands that gathered them. Link to a host's document rather than repeat it, and record each benchmark's CPU placement on it, with the measurements behind it, with the benchmark.
 
 ## How samples are launched
 
