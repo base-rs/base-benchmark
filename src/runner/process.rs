@@ -392,6 +392,36 @@ pub(crate) fn reap(
     child.wait().expect("an exited child can be reaped")
 }
 
+/// A started workload, killed and reaped when dropped before [`Unreaped::reap`] has been called, as when [`execute`] unwinds from a panic or a thread that fails to spawn, so that it never outlives the host lock, which outlives it.
+#[cfg(target_os = "linux")]
+struct Unreaped<'a> {
+    child: std::process::Child,
+    group: i32,
+    cancellation: &'a Cancellation,
+    reaped: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Unreaped<'_> {
+    /// Kill what remains of the exited leader's group, then reap the leader.
+    fn reap(&mut self) -> std::process::ExitStatus {
+        // Marked first: a workload whose reaping panicked is not reaped again, nor its group, which may then be another's, killed again.
+        self.reaped = true;
+        reap(&mut self.child, self.group, self.cancellation)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Unreaped<'_> {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // The leader is still unreaped, so its group is still this workload's.
+            self.cancellation.finish(self.group);
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// Run one workload process to completion with bounded output, a deadline, CPU placement, and process-group cleanup.
 #[cfg(target_os = "linux")]
 pub(crate) fn execute(
@@ -400,11 +430,17 @@ pub(crate) fn execute(
     cancellation: &Cancellation,
 ) -> io::Result<Execution> {
     let started = Instant::now();
-    let (mut child, group) = start(launch, Stdio::null(), cancellation)?;
+    let (child, group) = start(launch, Stdio::null(), cancellation)?;
+    let mut workload = Unreaped {
+        child,
+        group,
+        cancellation,
+        reaped: false,
+    };
 
     let (sender, outputs) = mpsc::channel();
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
+    let stdout = workload.child.stdout.take().expect("stdout is piped");
+    let stderr = workload.child.stderr.take().expect("stderr is piped");
     let stdout_sender = sender.clone();
     std::thread::spawn(move || stdout_sender.send(Output::Stdout(read_head(stdout, STDOUT_LIMIT))));
     std::thread::spawn(move || sender.send(Output::Stderr(read_tail(stderr, STDERR_LIMIT))));
@@ -424,7 +460,7 @@ pub(crate) fn execute(
     wait_exit(group);
     drop(done);
     watchdog.join().expect("the watchdog does not panic");
-    let status = reap(&mut child, group, cancellation);
+    let status = workload.reap();
     // A descendant that left the group survives cleanup and may hold the pipes open. Stop waiting for it rather than hold the lock indefinitely.
     let deadline = Instant::now() + OUTPUT_GRACE;
     let (mut stdout, mut stderr) = (None, None);

@@ -361,3 +361,36 @@ fn workloads_start_with_the_stop_signals_at_their_defaults_and_unblocked() {
         },
     );
 }
+
+#[test]
+fn a_workload_dropped_before_it_is_reaped_is_killed_and_reaped() {
+    let arguments = vec!["-c".to_owned(), "sleep 30".to_owned()];
+    let environment = environment();
+    let launch = Launch {
+        program: Path::new(SHELL),
+        arguments: &arguments,
+        environment: &environment,
+        directory: Path::new("/"),
+        cpus: &[],
+    };
+    let cancellation = Cancellation::new();
+    let (child, group) = start(&launch, Stdio::null(), &cancellation).unwrap();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _workload = Unreaped {
+            child,
+            group,
+            cancellation: &cancellation,
+            reaped: false,
+        };
+        panic!("a defect while the workload runs");
+    }));
+    assert!(unwound.is_err());
+    assert!(
+        !Path::new(&format!("/proc/{group}")).exists(),
+        "the workload was killed and reaped"
+    );
+    assert!(
+        cancellation.0.active.lock().unwrap().is_empty(),
+        "the workload's group is no longer registered"
+    );
+}
