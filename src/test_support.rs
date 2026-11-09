@@ -215,6 +215,7 @@ pub fn service(name: &str, program: RoleProgram, arguments: &[&str], pattern: &s
             signal: "SIGTERM".to_owned(),
             grace_ms: 20_000,
         }),
+        invalid_responses: None,
     }
 }
 
@@ -238,6 +239,7 @@ pub fn roles_suite(service_script: &Path, driver: &Path, variants: &[&str]) -> S
             measure_arguments: vec!["measure".to_owned()],
             ready: None,
             stop: None,
+            invalid_responses: None,
         },
         service("server", RoleProgram::Subject, &[], "ready {address}"),
     ];

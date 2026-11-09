@@ -14,6 +14,7 @@ fn role(name: &str, cpus: &[usize]) -> PlannedRole {
         ready: None,
         stop: None,
         environment: Default::default(),
+        invalid_responses: None,
     }
 }
 

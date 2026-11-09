@@ -203,6 +203,9 @@ pub struct PlannedRole {
     /// Variables it receives in addition to the plan's environment: for the driver, `BASE_BENCHMARK_CONTROL`, which tells it how to send its window markers.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
+    /// The driver's total of invalid responses, when the scenario declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_responses: Option<String>,
 }
 
 /// A program outside the workspace that a role runs, identified on the measuring host. Its hash is verified before every sample, so a program changed during the campaign fails it.
@@ -619,6 +622,7 @@ fn plan_roles(
                     crate::window::CONTROL_STDIO.to_owned(),
                 )]),
             },
+            invalid_responses: role.invalid_responses.clone(),
         });
     }
     Ok((roles, programs))

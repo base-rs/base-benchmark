@@ -87,6 +87,9 @@ pub struct Role {
     /// Services only.
     #[serde(default)]
     pub stop: Option<Stop>,
+    /// The driver only: the total in its record that counts responses which failed its validation. Any makes comparisons of the sample's subject invalid in screening, and fails a recorded campaign.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_responses: Option<String>,
 }
 
 /// `[[package.metadata.base-benchmark.scenario.role]]`.
@@ -111,6 +114,7 @@ pub(crate) struct RoleConfiguration {
     ready_timeout_seconds: Option<f64>,
     stop: Option<String>,
     stop_grace_seconds: Option<f64>,
+    invalid_responses: Option<String>,
 }
 
 impl RoleConfiguration {
@@ -160,6 +164,11 @@ impl RoleConfiguration {
         };
         let (ready, stop) = match self.kind {
             RoleKind::Service => {
+                if self.invalid_responses.is_some() {
+                    return Err(role(
+                        "only the driver's record counts invalid responses".to_owned(),
+                    ));
+                }
                 let pattern = self.ready.ok_or_else(|| {
                     role("a service needs `ready`, the line it prints once it is ready".to_owned())
                 })?;
@@ -200,6 +209,13 @@ impl RoleConfiguration {
                 (Some(ready), Some(stop))
             }
             RoleKind::Driver => {
+                if self
+                    .invalid_responses
+                    .as_ref()
+                    .is_some_and(|metric| metric.trim().is_empty())
+                {
+                    return Err(role("invalid-responses names no metric".to_owned()));
+                }
                 if self.ready.is_some()
                     || self.ready_timeout_seconds.is_some()
                     || self.stop.is_some()
@@ -230,8 +246,27 @@ impl RoleConfiguration {
             measure_arguments: self.measure_arguments,
             ready,
             stop,
+            invalid_responses: self.invalid_responses,
         })
     }
+}
+
+/// The total of `metric` over every sample of a driver's record: the invalid responses it counted. Every sample must report it as a total.
+pub(crate) fn invalid_responses(
+    record: &crate::record::ProcessRecord,
+    metric: &str,
+) -> Result<u64, String> {
+    record.samples.iter().try_fold(0, |total: u64, sample| {
+        match sample.metric(metric).map(|metric| &metric.measurement) {
+            Some(crate::record::Measurement::Total { value }) => Ok(total.saturating_add(*value)),
+            Some(_) => Err(format!(
+                "reports {metric}, which the scenario declares counts invalid responses, as other than a total"
+            )),
+            None => Err(format!(
+                "reports no {metric}, which the scenario declares counts invalid responses"
+            )),
+        }
+    })
 }
 
 /// Check a scenario's roles together: names, one driver, one subject, that every brace in an argument is doubled or part of a `{ROLE.NAME}` reference, and that every reference names a value captured by a service that starts before the role using it. `subject_arguments` are every argument the subject may receive.
