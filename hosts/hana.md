@@ -35,7 +35,9 @@ Each benchmark records which CPUs its roles use on hana, and the measurements be
 
 ## Measuring
 
-- Take the host lock for every measurement, `flock /tmp/base-benchmark-host.lock`, as base-benchmark does, and check for another session's run, such as with `pgrep -af 'base-benchmark|wrk|hello-benchmark'`, waiting for it rather than interfering.
+- Take the host lock for every measurement, as base-benchmark does, by running each command as `( flock 9 && COMMAND ) 9</tmp/base-benchmark-host.lock` in `sh` or `bash`, or `begin; flock 9; and COMMAND; end 9</tmp/base-benchmark-host.lock` in `fish`, hana's login shell. The redirection opens the existing lock read-only without `O_CREAT`, as base-benchmark does. Don't use `flock /tmp/base-benchmark-host.lock COMMAND`: `flock` opens its file with `O_CREAT`, which hana's `fs.protected_regular = 1` refuses in the sticky, world-writable `/tmp` for a lock another user owns, so it fails with "cannot open lock file" for everyone but the lock's owner.
+- If the lock is missing, the redirection fails without running `COMMAND`. base-benchmark creates it, mode 0666, on its first campaign; to create it without base-benchmark, run `(umask 0 && set -C && : > /tmp/base-benchmark-host.lock)` in `sh` or `bash`, which also creates it exclusively and never replaces another user's lock.
+- Check for another session's run, such as with `pgrep -af 'base-benchmark|wrk|hello-benchmark'`, and wait for it rather than interfering.
 - Build and prepare before a campaign, not during one, and run nothing else while measuring.
 - The host is quiet, not idle: single rounds of base-http's [client layout screen](https://github.com/base-rs/base-http/blob/main/benchmarks/hello/results/client-layout-20261109/readme.md) still ran up to 9% below their cohort's median, so interleave rounds and read ranges as well as medians.
 
@@ -57,6 +59,7 @@ free -h; grep MemTotal /proc/meminfo; ls /sys/devices/system/node/
 dmidecode -t memory    # needs root: not readable
 ip -br link; ip link show lo
 cat /proc/sys/net/core/{default_qdisc,somaxconn,busy_poll,busy_read} /proc/sys/net/ipv4/tcp_congestion_control
+sysctl fs.protected_regular; stat -c '%A %U' /tmp
 awk 'NR == 1 || /eno|enp|ahci/' /proc/interrupts; cat /proc/irq/default_smp_affinity
 systemctl list-units --type=service --state=running
 rustc --version; cargo --version
